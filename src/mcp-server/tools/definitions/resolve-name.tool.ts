@@ -20,6 +20,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       ),
     query: z
       .string()
+      .min(1)
       .describe(
         'Name or partial name to resolve. Also accepts IDs directly (DOI, ORCID, ROR) for quick lookup.',
       ),

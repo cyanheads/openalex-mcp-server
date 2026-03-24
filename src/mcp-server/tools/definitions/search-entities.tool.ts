@@ -9,7 +9,7 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. For works, use the `select` parameter to reduce payload size — full records are ~70KB each.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Use the `select` parameter to reduce payload size — works (~70KB) and institutions (~20KB) are especially large without it.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
@@ -47,7 +47,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'Fields to return (reduces payload). Top-level fields only. STRONGLY RECOMMENDED for works — full records are ~70KB each. Example: ["id", "doi", "display_name", "publication_year", "cited_by_count", "primary_topic"].',
+        'Fields to return (reduces payload). Top-level fields only. STRONGLY RECOMMENDED for works and institutions — full records are 20-70KB each. Example: ["id", "doi", "display_name", "publication_year", "cited_by_count", "primary_topic"].',
       ),
     per_page: z
       .number()

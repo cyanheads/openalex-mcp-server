@@ -134,7 +134,7 @@ class OpenAlexService {
     ctx: Context,
   ): Promise<unknown> {
     const url = new URL(`${this.baseUrl}${path}`);
-    url.searchParams.set('api_key', this.apiKey);
+    url.searchParams.set('mailto', this.apiKey);
     for (const [key, value] of Object.entries(params)) {
       if (value) url.searchParams.set(key, value);
     }
@@ -148,11 +148,17 @@ class OpenAlexService {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw serviceUnavailable(`OpenAlex API error: ${response.status} ${response.statusText}`, {
-        path,
-        status: response.status,
-        body,
-      });
+      let detail = '';
+      try {
+        const parsed = JSON.parse(body);
+        detail = parsed.message ?? '';
+      } catch {
+        detail = body;
+      }
+      const message = detail
+        ? `OpenAlex API error (${response.status}): ${detail}`
+        : `OpenAlex API error: ${response.status} ${response.statusText}`;
+      throw serviceUnavailable(message, { path, status: response.status });
     }
 
     return response.json();
@@ -199,7 +205,8 @@ class OpenAlexService {
     }
 
     if (params.sort) {
-      queryParams.sort = params.sort;
+      // Translate "-field" prefix to "field:desc" (OpenAlex API syntax)
+      queryParams.sort = params.sort.startsWith('-') ? `${params.sort.slice(1)}:desc` : params.sort;
     }
 
     if (params.select?.length) {
@@ -208,7 +215,10 @@ class OpenAlexService {
 
     queryParams.per_page = String(params.perPage ?? 25);
 
-    queryParams.cursor = params.cursor ?? '*';
+    // Semantic search doesn't support cursor pagination — use page/per_page only
+    if (params.searchMode !== 'semantic') {
+      queryParams.cursor = params.cursor ?? '*';
+    }
 
     const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
       meta: SearchResult['meta'];
@@ -238,7 +248,7 @@ class OpenAlexService {
     }
 
     const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
-      meta: { count: number; groups_count?: number | null };
+      meta: { count: number; groups_count?: number | null; next_cursor?: string | null };
       group_by: AnalyzeResult['groups'];
     };
 
@@ -246,7 +256,7 @@ class OpenAlexService {
       meta: {
         count: data.meta.count,
         groups_count: data.meta.groups_count ?? data.group_by?.length ?? null,
-        next_cursor: null,
+        next_cursor: data.meta.next_cursor ?? null,
       },
       groups: data.group_by ?? [],
     };
