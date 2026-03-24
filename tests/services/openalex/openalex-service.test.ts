@@ -347,7 +347,7 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
       await expect(service.search({ entityType: 'works' }, createMockContext())).rejects.toThrow(
-        /OpenAlex API error: 429/,
+        /OpenAlex API error \(429\)/,
       );
     });
 

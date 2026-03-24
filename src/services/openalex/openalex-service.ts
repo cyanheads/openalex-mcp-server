@@ -4,7 +4,7 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
   AnalyzeParams,
@@ -148,7 +148,7 @@ class OpenAlexService {
 
     if (!response.ok) {
       if (response.status === 404) {
-        throw serviceUnavailable(`Entity not found at ${path}`, { path, status: 404 });
+        throw notFound(`Entity not found at ${path}`, { path, status: 404 });
       }
       const body = await response.text().catch(() => '');
       let detail = '';
@@ -157,7 +157,10 @@ class OpenAlexService {
         detail = parsed.message ?? '';
       } catch {
         // Strip HTML or truncate non-JSON responses
-        detail = body.replace(/<[^>]*>/g, '').trim().slice(0, 200);
+        detail = body
+          .replace(/<[^>]*>/g, '')
+          .trim()
+          .slice(0, 200);
       }
       const message = detail
         ? `OpenAlex API error (${response.status}): ${detail}`
@@ -250,9 +253,7 @@ class OpenAlexService {
       queryParams.filter = buildFilterString(params.filters);
     }
 
-    if (params.cursor) {
-      queryParams.cursor = params.cursor;
-    }
+    queryParams.cursor = params.cursor ?? '*';
 
     const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
       meta: { count: number; groups_count?: number | null; next_cursor?: string | null };
