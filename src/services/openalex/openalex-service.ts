@@ -147,13 +147,17 @@ class OpenAlexService {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        throw serviceUnavailable(`Entity not found at ${path}`, { path, status: 404 });
+      }
       const body = await response.text().catch(() => '');
       let detail = '';
       try {
         const parsed = JSON.parse(body);
         detail = parsed.message ?? '';
       } catch {
-        detail = body;
+        // Strip HTML or truncate non-JSON responses
+        detail = body.replace(/<[^>]*>/g, '').trim().slice(0, 200);
       }
       const message = detail
         ? `OpenAlex API error (${response.status}): ${detail}`
@@ -226,7 +230,10 @@ class OpenAlexService {
     };
 
     return {
-      meta: data.meta,
+      meta: {
+        ...data.meta,
+        next_cursor: data.meta.next_cursor ?? null,
+      },
       results: processResults(data.results),
     };
   }
