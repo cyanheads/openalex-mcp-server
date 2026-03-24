@@ -30,9 +30,13 @@
     "model-context-protocol",
     "openalex",
     "academic-research",
-    "scholarly-data",
+    "academic-search",
     "bibliometrics",
-    "literature-search"
+    "citation-analysis",
+    "literature-search",
+    "scholarly-data",
+    "scholarly-research",
+    "typescript"
   ],
   "author": "cyanheads (https://github.com/cyanheads)",
   "homepage": "https://github.com/cyanheads/openalex-mcp-server#readme",
