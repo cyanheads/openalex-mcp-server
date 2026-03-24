@@ -120,6 +120,13 @@ function processResults(results: EntityRecord[]): EntityRecord[] {
   return results;
 }
 
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class OpenAlexService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -130,7 +137,7 @@ class OpenAlexService {
     this.apiKey = config.apiKey;
   }
 
-  /** Execute an HTTP request against the OpenAlex API. */
+  /** Execute an HTTP request against the OpenAlex API with retry on transient failures. */
   private async request(
     path: string,
     params: Record<string, string>,
@@ -144,22 +151,31 @@ class OpenAlexService {
 
     ctx.log.debug('OpenAlex request', { path, params: Object.keys(params) });
 
-    const response = await fetch(url.toString(), {
-      headers: { Accept: 'application/json' },
-      signal: ctx.signal,
-    });
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const response = await fetch(url.toString(), {
+        headers: { Accept: 'application/json' },
+        signal: ctx.signal,
+      });
 
-    if (!response.ok) {
+      if (response.ok) return response.json();
+
       if (response.status === 404) {
         throw notFound(`Entity not found at ${path}`, { path, status: 404 });
       }
+
+      const retryable = response.status === 429 || response.status === 500 ||
+        response.status === 502 || response.status === 503 || response.status === 504;
+      if (retryable && attempt < MAX_RETRIES - 1) {
+        await sleep(BASE_BACKOFF_MS * 2 ** attempt);
+        continue;
+      }
+
       const body = await response.text().catch(() => '');
       let detail = '';
       try {
         const parsed = JSON.parse(body);
         detail = parsed.message ?? '';
       } catch {
-        // Strip HTML or truncate non-JSON responses
         detail = body
           .replace(/<[^>]*>/g, '')
           .trim()
@@ -171,7 +187,7 @@ class OpenAlexService {
       throw serviceUnavailable(message, { path, status: response.status });
     }
 
-    return response.json();
+    throw serviceUnavailable(`OpenAlex API request failed after ${MAX_RETRIES} attempts`, { path });
   }
 
   /** Search/filter/sort entities, or retrieve a single entity by ID. */
