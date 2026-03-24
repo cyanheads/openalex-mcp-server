@@ -5,15 +5,18 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+
 import { getServerConfig } from '@/config/server-config.js';
-import type {
-  AnalyzeParams,
-  AnalyzeResult,
-  AutocompleteParams,
-  AutocompleteResult,
-  EntityRecord,
-  SearchParams,
-  SearchResult,
+
+import {
+  type AnalyzeParams,
+  type AnalyzeResult,
+  type AutocompleteParams,
+  type AutocompleteResult,
+  ENTITY_TYPES,
+  type EntityRecord,
+  type SearchParams,
+  type SearchResult,
 } from './types.js';
 
 /**
@@ -253,7 +256,11 @@ class OpenAlexService {
       queryParams.filter = buildFilterString(params.filters);
     }
 
-    queryParams.cursor = params.cursor ?? '*';
+    // Only send cursor when explicitly provided — boolean group_by fields
+    // (is_retracted, has_orcid, etc.) reject cursor pagination entirely.
+    if (params.cursor) {
+      queryParams.cursor = params.cursor;
+    }
 
     const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
       meta: { count: number; groups_count?: number | null; next_cursor?: string | null };
@@ -286,7 +293,14 @@ class OpenAlexService {
       results: AutocompleteResult['results'];
     };
 
-    return { results: data.results };
+    // Cross-entity autocomplete can return types not in our enum (country, license, etc.).
+    // Filter to known entity types so callers can use results in other tools directly.
+    const knownTypes = new Set<string>(ENTITY_TYPES.map((t) => t.replace(/s$/, '')));
+    const results = params.entityType
+      ? data.results
+      : data.results.filter((r) => knownTypes.has(r.entity_type));
+
+    return { results };
   }
 }
 

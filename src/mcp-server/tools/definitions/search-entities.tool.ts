@@ -29,7 +29,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .enum(['keyword', 'exact', 'semantic'])
       .default('keyword')
       .describe(
-        'Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, literal match. "semantic": AI embedding similarity (max 50 results, 1 req/sec).',
+        'Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity (max 50 results, 1 req/sec).',
       ),
     filters: z
       .record(z.string(), z.string())
