@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.3] — 2026-03-24
+
+### Improved
+
+- `openalex_analyze_trends` format output now sorts groups by count descending and caps display at 50 with a truncation note
+- `openalex_search_entities` exact search mode description clarified — notes quoted phrases for multi-word exact match
+- `openalex_resolve_name` description narrowed to DOI-only direct lookup (removed incorrect ORCID/ROR claims)
+
+### Fixed
+
+- Cursor pagination only sent when explicitly provided — boolean `group_by` fields (`is_retracted`, `has_orcid`, etc.) reject cursor entirely
+- Cross-entity autocomplete now filters results to known entity types — prevents unusable types (`country`, `license`, etc.) from reaching callers
+
 ## [0.2.2] — 2026-03-24
 
 ### Improved
