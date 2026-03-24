@@ -38,7 +38,7 @@ ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="openalex-mcp-server"
-LABEL org.opencontainers.image.description="MCP server for the OpenAlex academic research catalog"
+LABEL org.opencontainers.image.description="Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP."
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/openalex-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 

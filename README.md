@@ -1,6 +1,6 @@
 <div align="center">
   <h1>@cyanheads/openalex-mcp-server</h1>
-  <p><b>MCP server for the OpenAlex academic research catalog. Search 270M+ works, 90M+ authors, 100K+ sources. Analyze trends, resolve entities, review literature. STDIO & Streamable HTTP.</b></p>
+  <p><b>Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.</b></p>
   <p><b>3 Tools &middot; 2 Prompts</b></p>
 </div>
 
