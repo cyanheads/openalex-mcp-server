@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] — 2026-03-24
+
+### Fixed
+
+- Explicit 404 handling in API client — throws `serviceUnavailable` with path context instead of a generic error
+- Sanitize non-JSON error response bodies — strip HTML tags and truncate to 200 chars
+- Normalize `next_cursor` to `null` when missing from search results (prevents `undefined` leaking to callers)
+
 ## [0.2.0] — 2026-03-24
 
 ### Added
