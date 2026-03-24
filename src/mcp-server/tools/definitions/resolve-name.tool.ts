@@ -10,7 +10,7 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 export const resolveNameTool = tool('openalex_resolve_name', {
   description:
     'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. Also accepts DOIs directly for quick lookup. Response time ~200ms.',
-  annotations: { readOnlyHint: true, openWorldHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     entity_type: z
       .enum(ENTITY_TYPES)

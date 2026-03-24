@@ -10,7 +10,7 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
     'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Use the `select` parameter to reduce payload size — works (~70KB) and institutions (~20KB) are especially large without it.',
-  annotations: { readOnlyHint: true, openWorldHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
     id: z
