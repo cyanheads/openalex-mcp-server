@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/openalex-mcp-server",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "MCP server for the OpenAlex academic research catalog — search 270M+ works, analyze trends, resolve entities.",
   "mcpName": "io.github.cyanheads/openalex-mcp-server",
   "type": "module",

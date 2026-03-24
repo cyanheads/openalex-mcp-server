@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.5] — 2026-03-24
+
+### Changed
+
+- Clarified README storage backend description — notes framework capability without implying server usage
+- Removed unused `STORAGE_PROVIDER_TYPE` env var from README configuration table
+- Reformatted retryable status code condition in API client for readability
+
 ## [0.2.4] — 2026-03-24
 
 ### Improved
