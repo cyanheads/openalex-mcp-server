@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.27.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+[![Version](https://img.shields.io/badge/Version-0.2.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.27.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
 
 </div>
 
@@ -59,8 +59,8 @@ Name-to-ID resolution via autocomplete. **Always use this before filtering by en
 
 | Prompt | Description |
 |:-------|:------------|
-| `openalex_literature_review` | Guided systematic literature search: entity resolution, multi-strategy search, citation tracing, landscape analysis, and synthesis. |
-| `openalex_research_landscape` | Quantitative research landscape analysis: volume trends, top contributors, open access rates, funding sources, and emerging fronts. |
+| `openalex_literature_review` | Guides a systematic literature search: formulate query, search, filter, analyze citation network, synthesize findings. |
+| `openalex_research_landscape` | Analyzes the research landscape for a topic: volume trends, top authors/institutions, open access rates, funding sources. |
 
 ## Features
 
@@ -91,18 +91,18 @@ Add to your MCP client config (e.g., `claude_desktop_config.json`):
       "command": "npx",
       "args": ["-y", "@cyanheads/openalex-mcp-server"],
       "env": {
-        "OPENALEX_API_KEY": "your-api-key"
+        "OPENALEX_API_KEY": "your-email@example.com"
       }
     }
   }
 }
 ```
 
-Get an API key (free) at [openalex.org](https://openalex.org).
+No API key needed — just provide your email to access the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool) (10x faster rate limits).
 
 ### Prerequisites
 
-- [Bun v1.2.0](https://bun.sh/) or higher (for development)
+- [Bun v1.3.0](https://bun.sh/) or higher (for development)
 
 ### Installation
 
@@ -125,12 +125,12 @@ bun install
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `OPENALEX_API_KEY` | **Required.** API key from [openalex.org](https://openalex.org). | — |
+| `OPENALEX_API_KEY` | **Required.** Email address for the OpenAlex [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool) (faster rate limits). | — |
 | `OPENALEX_BASE_URL` | OpenAlex API base URL. | `https://api.openalex.org` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
-| `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
+| `MCP_LOG_LEVEL` | Log level (RFC 5424). | `debug` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend. | `in-memory` |
 | `OTEL_ENABLED` | Enable OpenTelemetry. | `false` |
 
@@ -165,6 +165,7 @@ docker run -e OPENALEX_API_KEY=your-key -p 3010:3010 openalex-mcp-server
 | `src/mcp-server/prompts/definitions/` | Prompt definitions (`*.prompt.ts`). |
 | `src/services/openalex/` | OpenAlex API client service and domain types. |
 | `src/config/` | Environment variable parsing and validation with Zod. |
+| `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 
 ## Development Guide
 

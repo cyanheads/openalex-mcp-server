@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.4] — 2026-03-24
+
+### Improved
+
+- API client retries transient failures (429, 500, 502, 503, 504) with exponential backoff — up to 3 attempts before surfacing the error
+
 ## [0.2.3] — 2026-03-24
 
 ### Improved
