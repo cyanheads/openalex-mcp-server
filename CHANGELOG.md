@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.7] — 2026-03-24
+
+### Changed
+
+- Unified package description across README, package.json, server.json, and Dockerfile to a shorter, consistent form
+
 ## [0.2.6] — 2026-03-24
 
 ### Changed

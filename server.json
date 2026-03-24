@@ -1,19 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/openalex-mcp-server",
-  "description": "MCP server for the OpenAlex academic research catalog — search 270M+ works, analyze trends, resolve entities.",
+  "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "repository": {
     "url": "https://github.com/cyanheads/openalex-mcp-server",
     "source": "github"
   },
-  "version": "0.2.6",
+  "version": "0.2.7",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "packageArguments": [
         {
           "type": "positional",
@@ -55,7 +55,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "packageArguments": [
         {
           "type": "positional",
