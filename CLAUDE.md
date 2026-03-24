@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.2.5
+**Version:** 0.2.6
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -238,6 +238,23 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run dev:http` | Dev mode (HTTP) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
+
+---
+
+## Publishing
+
+After a version bump and final commit, publish to both npm and GHCR:
+
+```bash
+bun publish --access public
+
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/cyanheads/openalex-mcp-server:<version> \
+  -t ghcr.io/cyanheads/openalex-mcp-server:latest \
+  --push .
+```
+
+Remind the user to run these after completing a release flow.
 
 ---
 

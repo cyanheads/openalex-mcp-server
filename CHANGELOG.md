@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6] — 2026-03-24
+
+### Changed
+
+- Added `idempotentHint: true` annotation to all three tools — signals to clients that repeated calls with the same input produce the same result
+- Added publishing section to CLAUDE.md with npm and GHCR release commands
+
 ## [0.2.5] — 2026-03-24
 
 ### Changed
