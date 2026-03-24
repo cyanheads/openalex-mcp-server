@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>openalex-mcp-server</h1>
+  <h1>@cyanheads/openalex-mcp-server</h1>
   <p><b>MCP server for the OpenAlex academic research catalog. Search 270M+ works, 90M+ authors, 100K+ sources. Analyze trends, resolve entities, review literature. STDIO & Streamable HTTP.</b></p>
   <p><b>3 Tools &middot; 2 Prompts</b></p>
 </div>
@@ -89,7 +89,7 @@ Add to your MCP client config (e.g., `claude_desktop_config.json`):
     "openalex": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "openalex-mcp-server"],
+      "args": ["-y", "@cyanheads/openalex-mcp-server"],
       "env": {
         "OPENALEX_API_KEY": "your-api-key"
       }
