@@ -1,0 +1,51 @@
+{
+  "name": "openalex-mcp-server",
+  "version": "0.1.0",
+  "description": "",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "openalex-mcp-server": "dist/index.js"
+  },
+  "files": ["dist/", "README.md", "LICENSE", "CLAUDE.md", "Dockerfile", "server.json"],
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "rebuild": "bun scripts/clean.ts && bun scripts/build.ts",
+    "clean": "bun scripts/clean.ts",
+    "devcheck": "bun scripts/devcheck.ts",
+    "tree": "bun scripts/tree.ts",
+    "format": "biome check --write --unsafe .",
+    "lint:mcp": "bun scripts/lint-mcp.ts",
+    "test": "vitest run",
+    "dev:stdio": "MCP_TRANSPORT_TYPE=stdio bun --watch src/index.ts",
+    "dev:http": "MCP_TRANSPORT_TYPE=http bun --watch src/index.ts",
+    "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
+    "start:http": "MCP_TRANSPORT_TYPE=http node dist/index.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@cyanheads/mcp-ts-core": "^0.1.28",
+    "pino-pretty": "^13.1.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.7",
+    "@types/node": "^25.5.0",
+    "ignore": "^7.0.5",
+    "tsc-alias": "^1.8.16",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  }
+}

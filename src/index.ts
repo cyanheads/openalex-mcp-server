@@ -1,0 +1,21 @@
+#!/usr/bin/env node
+/**
+ * @fileoverview openalex-mcp-server MCP server entry point.
+ * @module index
+ */
+
+import { createApp } from '@cyanheads/mcp-ts-core';
+import { literatureReviewPrompt } from '@/mcp-server/prompts/definitions/literature-review.prompt.js';
+import { researchLandscapePrompt } from '@/mcp-server/prompts/definitions/research-landscape.prompt.js';
+import { analyzeTrendsTool } from '@/mcp-server/tools/definitions/analyze-trends.tool.js';
+import { resolveNameTool } from '@/mcp-server/tools/definitions/resolve-name.tool.js';
+import { searchEntitiesTool } from '@/mcp-server/tools/definitions/search-entities.tool.js';
+import { initOpenAlexService } from '@/services/openalex/openalex-service.js';
+
+await createApp({
+  tools: [resolveNameTool, searchEntitiesTool, analyzeTrendsTool],
+  prompts: [literatureReviewPrompt, researchLandscapePrompt],
+  setup() {
+    initOpenAlexService();
+  },
+});
