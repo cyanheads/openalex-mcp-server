@@ -9,7 +9,7 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Use the `select` parameter to reduce payload size — works (~70KB) and institutions (~20KB) are especially large without it.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches return a curated set of fields by default; pass `select` to override with specific fields.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
@@ -47,7 +47,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'Fields to return (reduces payload). Top-level fields only. STRONGLY RECOMMENDED for works and institutions — full records are 20-70KB each. Example: ["id", "doi", "display_name", "publication_year", "cited_by_count", "primary_topic"].',
+        'Fields to return. Top-level fields only. Searches apply sensible defaults per entity type; pass this to override. Single-entity lookups (by `id`) return the full record unless `select` is specified. Example: ["id", "doi", "display_name", "publication_year", "cited_by_count", "primary_topic"].',
       ),
     per_page: z
       .number()
@@ -123,6 +123,8 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       if (rec.publication_year) parts.push(String(rec.publication_year));
       if (typeof rec.cited_by_count === 'number')
         parts.push(`${rec.cited_by_count.toLocaleString()} citations`);
+      const loc = rec.primary_location as { source?: { display_name?: string } } | undefined;
+      if (loc?.source?.display_name) parts.push(loc.source.display_name);
       if (rec.doi) parts.push(String(rec.doi));
       return `- ${parts[0]} (${r.id})${parts.length > 1 ? ` — ${parts.slice(1).join(', ')}` : ''}`;
     });

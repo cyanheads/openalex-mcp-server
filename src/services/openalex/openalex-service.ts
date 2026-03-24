@@ -13,6 +13,7 @@ import {
   type AnalyzeResult,
   type AutocompleteParams,
   type AutocompleteResult,
+  DEFAULT_SELECT,
   ENTITY_TYPES,
   type EntityRecord,
   type SearchParams,
@@ -239,8 +240,9 @@ class OpenAlexService {
       queryParams.sort = params.sort.startsWith('-') ? `${params.sort.slice(1)}:desc` : params.sort;
     }
 
-    if (params.select?.length) {
-      queryParams.select = params.select.join(',');
+    const select = params.select?.length ? params.select : DEFAULT_SELECT[params.entityType];
+    if (select?.length) {
+      queryParams.select = select.join(',');
     }
 
     queryParams.per_page = String(params.perPage ?? 25);
