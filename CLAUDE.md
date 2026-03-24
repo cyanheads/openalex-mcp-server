@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.2.1
+**Version:** 0.2.2
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -233,7 +233,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting |
 | `bun run lint:mcp` | Validate MCP tool/prompt definitions |
-| `bun test` | Run tests |
+| `bun run test` | Run tests |
 | `bun run dev:stdio` | Dev mode (stdio) |
 | `bun run dev:http` | Dev mode (HTTP) |
 | `bun run start:stdio` | Production mode (stdio) |
