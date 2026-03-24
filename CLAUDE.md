@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.1.0
+**Version:** 0.1.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -67,28 +67,35 @@ When the user asks what to do next, what's left, or needs direction, suggest rel
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
+import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const resolveNameTool = tool('openalex_resolve_name', {
+  description: 'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints.',
+  annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    entity_type: z.enum(ENTITY_TYPES).optional().describe('Entity type to search. Omit for cross-entity search.'),
+    query: z.string().describe('Name or partial name to resolve.'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    results: z.array(z.object({
+      id: z.string().describe('OpenAlex ID.'),
+      display_name: z.string().describe('Human-readable name.'),
+      entity_type: z.string().describe('Entity type.'),
+    })).describe('Autocomplete matches, up to 10.'),
   }),
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const service = getOpenAlexService();
+    const result = await service.autocomplete({ entityType: input.entity_type, query: input.query }, ctx);
+    ctx.log.info('Name resolved', { query: input.query, matchCount: result.results.length });
+    return result;
   },
 
-  format: (result) => [{ type: 'text', text: `Found ${result.items.length} items` }],
+  format: (result) => {
+    const lines = result.results.map((r) => `${r.display_name} (${r.entity_type}) — ${r.id}`);
+    return [{ type: 'text', text: lines.join('\n') }];
+  },
 });
 ```
 
@@ -97,34 +104,15 @@ export const searchItems = tool('search_items', {
 ```ts
 import { prompt, z } from '@cyanheads/mcp-ts-core';
 
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
+export const researchLandscapePrompt = prompt('openalex_research_landscape', {
+  description: 'Analyzes the research landscape for a topic: volume trends, top authors/institutions, open access rates.',
   args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
+    topic: z.string().describe('Research area to analyze.'),
   }),
   generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
+    { role: 'user', content: { type: 'text', text: `Analyze the research landscape for: "${args.topic}"\n\nUse the OpenAlex tools to build a quantitative profile...` } },
   ],
 });
-```
-
-### Server config
-
-```ts
-// src/config/server-config.ts — lazy-parsed, separate from framework config
-const ServerConfigSchema = z.object({
-  myApiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-});
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
-  _config ??= ServerConfigSchema.parse({
-    myApiKey: process.env.MY_API_KEY,
-    maxResults: process.env.MY_MAX_RESULTS,
-  });
-  return _config;
-}
 ```
 
 ---
@@ -136,11 +124,8 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
-| `ctx.elicit` | Ask user for structured input. **Check for presence first:** `if (ctx.elicit) { ... }` |
-| `ctx.sample` | Request LLM completion from the client. **Check for presence first:** `if (ctx.sample) { ... }` |
-| `ctx.signal` | `AbortSignal` for cancellation. |
-| `ctx.progress` | Task progress (present when `task: true`) — `.setTotal(n)`, `.increment()`, `.update(message)`. |
+| `ctx.signal` | `AbortSignal` for cancellation. Passed to `fetch()` in the OpenAlex service. |
+| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.list(prefix, { cursor, limit })`. Not currently used but available. |
 | `ctx.requestId` | Unique request ID. |
 | `ctx.tenantId` | Tenant ID from JWT or `'default'` for stdio. |
 
@@ -247,6 +232,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run devcheck` | Lint + format + typecheck + security |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting |
+| `bun run lint:mcp` | Validate MCP tool/prompt definitions |
 | `bun test` | Run tests |
 | `bun run dev:stdio` | Dev mode (stdio) |
 | `bun run dev:http` | Dev mode (HTTP) |
