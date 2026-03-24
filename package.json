@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/openalex-mcp-server",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "mcpName": "io.github.cyanheads/openalex-mcp-server",
   "type": "module",

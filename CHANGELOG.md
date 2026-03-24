@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.8] — 2026-03-24
+
+### Added
+
+- Default `select` fields per entity type — search queries now return a curated subset of fields automatically, preventing 20-70KB-per-record responses from overwhelming context windows
+- Source journal name (`primary_location.source.display_name`) included in `openalex_search_entities` formatted text output
+
+### Changed
+
+- `select` parameter description updated — searches apply sensible defaults; pass `select` to override. Single-entity lookups by ID still return full records unless `select` is specified.
+
 ## [0.2.7] — 2026-03-24
 
 ### Changed
