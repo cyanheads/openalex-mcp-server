@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/openalex-mcp-server",
-  "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
+  "description": "Access the OpenAlex academic research catalog - 270M+ publications via MCP. STDIO & HTTP.",
   "repository": {
     "url": "https://github.com/cyanheads/openalex-mcp-server",
     "source": "github"
