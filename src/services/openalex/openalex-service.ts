@@ -163,8 +163,12 @@ class OpenAlexService {
         throw notFound(`Entity not found at ${path}`, { path, status: 404 });
       }
 
-      const retryable = response.status === 429 || response.status === 500 ||
-        response.status === 502 || response.status === 503 || response.status === 504;
+      const retryable =
+        response.status === 429 ||
+        response.status === 500 ||
+        response.status === 502 ||
+        response.status === 503 ||
+        response.status === 504;
       if (retryable && attempt < MAX_RETRIES - 1) {
         await sleep(BASE_BACKOFF_MS * 2 ** attempt);
         continue;
