@@ -10,6 +10,12 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://openalex.caseyjhand.com/mcp](https://openalex.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Tools
@@ -81,12 +87,29 @@ OpenAlex-specific:
 
 ## Getting Started
 
+### Public Hosted Instance
+
+A public instance is available at `https://openalex.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "openalex-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://openalex.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
+
 Add to your MCP client config (e.g., `claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "openalex": {
+    "openalex-mcp-server": {
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@cyanheads/openalex-mcp-server"],
