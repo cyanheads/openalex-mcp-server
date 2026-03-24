@@ -117,7 +117,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     if (result.results.length === 0) {
       return [{ type: 'text', text: header }];
     }
-    const lines = result.results.map((r) => `- ${r.display_name} (${r.id})`);
+    const lines = result.results.map((r) => {
+      const parts = [r.display_name];
+      const rec = r as Record<string, unknown>;
+      if (rec.publication_year) parts.push(String(rec.publication_year));
+      if (typeof rec.cited_by_count === 'number')
+        parts.push(`${rec.cited_by_count.toLocaleString()} citations`);
+      if (rec.doi) parts.push(String(rec.doi));
+      return `- ${parts[0]} (${r.id})${parts.length > 1 ? ` — ${parts.slice(1).join(', ')}` : ''}`;
+    });
     const footer = result.meta.next_cursor
       ? `\n[More results available — pass cursor to paginate]`
       : '';

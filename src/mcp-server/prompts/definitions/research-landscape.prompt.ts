@@ -31,7 +31,7 @@ Use the OpenAlex tools to build a quantitative profile:
 
 4. **Open access** — Group by oa_status. What fraction is freely available?
 
-5. **Funding** — Group by awards.funder_id to identify major funders.
+5. **Funding** — Group by awards.funder_id to identify major funders. The group keys are OpenAlex IDs — resolve the top funder IDs with openalex_resolve_name to get human-readable names.
 
 6. **Impact** — Search for the most-cited works (sort by -cited_by_count). Get details on the top 5.
 

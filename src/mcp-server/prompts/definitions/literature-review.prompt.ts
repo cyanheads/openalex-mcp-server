@@ -28,10 +28,17 @@ Follow this workflow using the OpenAlex tools:
 
 1. **Resolve entities** — Use openalex_resolve_name to identify key authors, institutions, or topics related to "${args.topic}". Collect their OpenAlex IDs.
 
-2. **Search literature** — Use openalex_search_entities to find relevant works. Try multiple queries:
-   - Keyword search for the topic
-   - Semantic search for conceptually related work
-   - Filter by resolved topic/author/institution IDs
+2. **Search literature** — Use openalex_search_entities to find relevant works.${
+          args.scope === 'narrow'
+            ? `
+   - Use exact search mode with specific phrases
+   - Filter tightly by resolved topic IDs
+   - Focus on a single topic cluster`
+            : `
+   - Try keyword search for the topic
+   - Use semantic search for conceptually related work across subfields
+   - Search with multiple related topic IDs to capture adjacent areas`
+        }
    Use select to keep payloads manageable.
 
 3. **Identify key papers** — Sort by cited_by_count to find landmark works. Use openalex_search_entities with id to get full details on the most important ones.

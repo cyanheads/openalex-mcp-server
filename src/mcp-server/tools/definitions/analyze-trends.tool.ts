@@ -34,7 +34,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Pagination cursor from a previous response. Group-by returns max 200 groups per page. Pass cursor to get the next page of groups.',
+        'Pagination cursor from a previous response. Group-by returns max 200 groups per page. Pass cursor to get the next page. Note: paginated groups are sorted by key, not by count.',
       ),
   }),
   output: z.object({
