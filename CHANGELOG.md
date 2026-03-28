@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.9] — 2026-03-28
+
+### Added
+
+- Rich structured markdown format output for `openalex_search_entities` — renders identifiers, metrics, open access status, topics, authors, abstracts, and institution affiliations in organized sections
+- Rich structured format output for `openalex_resolve_name` — renders citations, works count, external IDs, and disambiguation hints
+- `report-issue-framework` and `report-issue-local` skills for filing issues against the framework and server repos
+- `LOGS_DIR` env var documented in README configuration table
+
+### Changed
+
+- `openalex_analyze_trends` format now shows key alongside display_name when they differ
+- `polish-docs-meta` skill updated with GitHub repo metadata sync steps and description propagation guidance
+- Bumped `@cyanheads/mcp-ts-core` ^0.1.28 → ^0.2.3
+- Bumped `@biomejs/biome` ^2.4.8 → ^2.4.9, `vitest` ^4.1.1 → ^4.1.2
+- Updated CLAUDE.md example code to reflect new format pattern with content-complete comments
+
 ## [0.2.8] — 2026-03-24
 
 ### Added

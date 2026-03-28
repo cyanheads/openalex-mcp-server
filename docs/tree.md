@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-03-24 10:31:06
+Generated on: 2026-03-28 11:34:30
 
 ```text
 openalex-mcp-server/
@@ -68,6 +68,10 @@ openalex-mcp-server/
 │   │   │   ├── package-meta.md
 │   │   │   ├── readme.md
 │   │   │   └── server-json.md
+│   │   └── SKILL.md
+│   ├── report-issue-framework/
+│   │   └── SKILL.md
+│   ├── report-issue-local/
 │   │   └── SKILL.md
 │   └── setup/
 │       └── SKILL.md

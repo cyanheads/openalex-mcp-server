@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.2.8
+**Version:** 0.2.9
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -92,9 +92,25 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     return result;
   },
 
+  // format() populates the MCP content[] array — this is what LLM clients inject into the
+  // model's context. structuredContent (from output) is for programmatic use and is NOT
+  // reliably forwarded to the model by most clients. Make format() content-complete.
   format: (result) => {
-    const lines = result.results.map((r) => `${r.display_name} (${r.entity_type}) — ${r.id}`);
-    return [{ type: 'text', text: lines.join('\n') }];
+    if (result.results.length === 0) {
+      return [{ type: 'text', text: 'No matches found.' }];
+    }
+    const lines: string[] = [];
+    for (const r of result.results) {
+      lines.push(`**${r.display_name}** (${r.entity_type})`);
+      const details: string[] = [r.id];
+      if (r.external_id) details.push(r.external_id);
+      details.push(`${r.cited_by_count.toLocaleString()} citations`);
+      if (r.works_count !== null) details.push(`${r.works_count.toLocaleString()} works`);
+      if (r.hint) details.push(r.hint);
+      lines.push(details.join(' | '));
+      lines.push('');
+    }
+    return [{ type: 'text', text: lines.join('\n').trimEnd() }];
   },
 });
 ```
