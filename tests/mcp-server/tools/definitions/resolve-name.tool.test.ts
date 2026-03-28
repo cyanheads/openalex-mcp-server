@@ -102,7 +102,7 @@ describe('resolveNameTool', () => {
     it('formats results with hints', () => {
       const output = text(sampleResults);
       expect(output).toContain('Harvard University');
-      expect(output).toContain('[Cambridge, Massachusetts, USA]');
+      expect(output).toContain('Cambridge, Massachusetts, USA');
     });
 
     it('formats results without hints', () => {

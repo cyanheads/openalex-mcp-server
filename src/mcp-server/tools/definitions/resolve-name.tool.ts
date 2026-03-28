@@ -84,9 +84,17 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     if (result.results.length === 0) {
       return [{ type: 'text', text: 'No matches found.' }];
     }
-    const lines = result.results.map(
-      (r) => `${r.display_name} (${r.entity_type}) — ${r.id}${r.hint ? ` [${r.hint}]` : ''}`,
-    );
-    return [{ type: 'text', text: lines.join('\n') }];
+    const lines: string[] = [];
+    for (const r of result.results) {
+      lines.push(`**${r.display_name}** (${r.entity_type})`);
+      const details: string[] = [r.id];
+      if (r.external_id) details.push(r.external_id);
+      details.push(`${r.cited_by_count.toLocaleString()} citations`);
+      if (r.works_count !== null) details.push(`${r.works_count.toLocaleString()} works`);
+      if (r.hint) details.push(r.hint);
+      lines.push(details.join(' | '));
+      lines.push('');
+    }
+    return [{ type: 'text', text: lines.join('\n').trimEnd() }];
   },
 });

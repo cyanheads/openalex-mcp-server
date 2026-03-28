@@ -124,9 +124,9 @@ describe('searchEntitiesTool', () => {
 
     it('formats results with count header', () => {
       const output = text(sampleResult);
-      expect(output).toContain('Found 2 result(s)');
-      expect(output).toContain('Paper Alpha (W001)');
-      expect(output).toContain('Paper Beta (W002)');
+      expect(output).toContain('**2 result(s)**');
+      expect(output).toContain('## Paper Alpha');
+      expect(output).toContain('## Paper Beta');
     });
 
     it('shows pagination hint when next_cursor exists', () => {
@@ -139,7 +139,7 @@ describe('searchEntitiesTool', () => {
 
     it('formats empty results', () => {
       expect(text({ meta: { count: 0, per_page: 25, next_cursor: null }, results: [] })).toBe(
-        'Found 0 result(s).',
+        'No results found.',
       );
     });
   });

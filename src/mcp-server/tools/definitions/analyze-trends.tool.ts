@@ -89,7 +89,13 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     const sorted = [...result.groups].sort((a, b) => b.count - a.count);
     const MAX_DISPLAY = 50;
     const display = sorted.slice(0, MAX_DISPLAY);
-    const lines = display.map((g) => `${g.key_display_name}: ${g.count.toLocaleString()}`);
+    const lines = display.map((g) => {
+      const label =
+        g.key === g.key_display_name
+          ? g.key_display_name
+          : `${g.key_display_name} (${g.key})`;
+      return `${label}: ${g.count.toLocaleString()}`;
+    });
     const truncated =
       sorted.length > MAX_DISPLAY ? `\n\n...and ${sorted.length - MAX_DISPLAY} more groups` : '';
     return [
