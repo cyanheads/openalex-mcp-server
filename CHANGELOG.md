@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1] — 2026-03-30
+
+### Changed
+
+- Bumped `@cyanheads/mcp-ts-core` ^0.2.8 → ^0.2.10
+- Bumped `@biomejs/biome` ^2.4.9 → ^2.4.10
+- Added author email and funding links to package.json
+- Added `remotes` array with public hosted server URL to server.json
+- Updated `add-tool` skill (v1.1): expanded `format()` guidance, added Tool Response Design section (batch input, partial success, empty results, error classification, context budget)
+- Updated `add-resource` skill (v1.1): added tool coverage guidance for resource-only data
+- Updated `design-mcp-server` skill (v2.1): live API probing, tool-first design philosophy, batch input design, error design, convenience shortcuts, resilience planning
+- Minor formatting fixes in `analyze-trends.tool.ts` and `search-entities.tool.ts`
+
 ## [0.3.0] — 2026-03-28
 
 ### Changed
