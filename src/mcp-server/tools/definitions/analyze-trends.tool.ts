@@ -91,9 +91,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     const display = sorted.slice(0, MAX_DISPLAY);
     const lines = display.map((g) => {
       const label =
-        g.key === g.key_display_name
-          ? g.key_display_name
-          : `${g.key_display_name} (${g.key})`;
+        g.key === g.key_display_name ? g.key_display_name : `${g.key_display_name} (${g.key})`;
       return `${label}: ${g.count.toLocaleString()}`;
     });
     const truncated =

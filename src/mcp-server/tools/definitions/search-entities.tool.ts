@@ -153,7 +153,8 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         if (oa.oa_url) parts.push(String(oa.oa_url));
         if (parts.length) lines.push(`**Open Access:** ${parts.join(' — ')}`);
       }
-      if (typeof rec.is_oa === 'boolean') lines.push(`**Open Access:** ${rec.is_oa ? 'Yes' : 'No'}`);
+      if (typeof rec.is_oa === 'boolean')
+        lines.push(`**Open Access:** ${rec.is_oa ? 'Yes' : 'No'}`);
 
       // Location / source
       if (rec.primary_location && typeof rec.primary_location === 'object') {

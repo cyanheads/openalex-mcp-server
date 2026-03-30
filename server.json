@@ -6,14 +6,20 @@
     "url": "https://github.com/cyanheads/openalex-mcp-server",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://openalex.caseyjhand.com/mcp"
+    }
+  ],
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -55,7 +61,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "packageArguments": [
         {
           "type": "positional",
