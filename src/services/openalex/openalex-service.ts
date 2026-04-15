@@ -4,7 +4,17 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  conflict,
+  forbidden,
+  invalidParams,
+  McpError,
+  notFound,
+  rateLimited,
+  serviceUnavailable,
+  timeout,
+  unauthorized,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
@@ -92,6 +102,8 @@ function normalizeId(id: string): string {
 /**
  * Reconstruct abstract text from OpenAlex's inverted index format.
  * The API stores abstracts as { word: [position, ...] } — we reverse this to plaintext.
+ * Inverted indices are ~2x the token cost of plaintext for the same information, so
+ * we collapse them when present and drop the raw index to keep responses lean.
  */
 function reconstructAbstract(invertedIndex: Record<string, number[]>): string {
   const words: [number, string][] = [];
@@ -104,23 +116,28 @@ function reconstructAbstract(invertedIndex: Record<string, number[]>): string {
   return words.map(([, word]) => word).join(' ');
 }
 
-/**
- * Post-process entity records: reconstruct abstracts from inverted indices.
- */
-function processResults(results: EntityRecord[]): EntityRecord[] {
-  for (const record of results) {
-    if (
-      record.abstract_inverted_index &&
-      typeof record.abstract_inverted_index === 'object' &&
-      !Array.isArray(record.abstract_inverted_index)
-    ) {
-      record.abstract = reconstructAbstract(
-        record.abstract_inverted_index as Record<string, number[]>,
-      );
-      delete record.abstract_inverted_index;
-    }
-  }
-  return results;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasAbstractInvertedIndex(
+  record: EntityRecord,
+): record is EntityRecord & { abstract_inverted_index: Record<string, number[]> } {
+  return isRecord(record.abstract_inverted_index);
+}
+
+function normalizeEntityRecord(record: EntityRecord): EntityRecord {
+  if (!hasAbstractInvertedIndex(record)) return record;
+
+  const { abstract_inverted_index, ...rest } = record;
+  return {
+    ...rest,
+    abstract: reconstructAbstract(abstract_inverted_index),
+  };
+}
+
+function normalizeEntityRecords(results: EntityRecord[]): EntityRecord[] {
+  return results.map(normalizeEntityRecord);
 }
 
 const MAX_ATTEMPTS = 3;
@@ -130,6 +147,24 @@ const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace
 
 function hasEntries(record?: Record<string, string>): record is Record<string, string> {
   return record !== undefined && Object.keys(record).length > 0;
+}
+
+function parseOpenAlexErrorBody(
+  responseBody: unknown,
+): { error?: string | undefined; message?: string | undefined } | null {
+  if (typeof responseBody !== 'string') return null;
+
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (!isRecord(parsed)) return null;
+
+    return {
+      error: typeof parsed.error === 'string' ? parsed.error : undefined,
+      message: typeof parsed.message === 'string' ? parsed.message : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
@@ -206,10 +241,45 @@ class OpenAlexService {
   }
 
   private throwNormalizedRequestError(error: unknown, path: string): never {
-    if (error instanceof McpError && error.data?.statusCode === 404) {
-      throw notFound(`Entity not found at ${path}`, { path, status: 404 }, { cause: error });
+    if (!(error instanceof McpError) || typeof error.data?.statusCode !== 'number') {
+      throw error;
     }
-    throw error;
+
+    const statusCode = error.data.statusCode;
+    const upstream = parseOpenAlexErrorBody(error.data.responseBody);
+    const message = upstream?.message ?? error.message;
+    const data = {
+      ...error.data,
+      path,
+      ...(upstream?.error ? { upstreamError: upstream.error } : {}),
+      ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
+    };
+    const rethrow = (factory: typeof invalidParams, nextMessage = message): never => {
+      throw factory(nextMessage, data, { cause: error });
+    };
+
+    switch (statusCode) {
+      case 400:
+      case 422:
+        return rethrow(invalidParams);
+      case 401:
+        return rethrow(unauthorized);
+      case 403:
+        return rethrow(forbidden);
+      case 404:
+        return rethrow(notFound, upstream?.message ?? `Entity not found at ${path}`);
+      case 408:
+        return rethrow(timeout);
+      case 409:
+        return rethrow(conflict);
+      case 429:
+        return rethrow(rateLimited);
+      default:
+        if (statusCode >= 400 && statusCode < 500) {
+          return rethrow(invalidParams);
+        }
+        throw error;
+    }
   }
 
   private parseResponse<T>(text: string, path: string): T {
@@ -246,10 +316,7 @@ class OpenAlexService {
     // Singleton lookup by ID
     if (params.id) {
       const normalizedId = normalizeId(params.id);
-      const queryParams: Record<string, string> = {};
-      if (params.select?.length) {
-        queryParams.select = params.select.join(',');
-      }
+      const queryParams = params.select?.length ? { select: params.select.join(',') } : {};
 
       const data = (await this.request(
         `/${params.entityType}/${normalizedId}`,
@@ -257,10 +324,9 @@ class OpenAlexService {
         ctx,
       )) as EntityRecord;
 
-      const results = processResults([data]);
       return {
         meta: { count: 1, per_page: 1, next_cursor: null },
-        results,
+        results: normalizeEntityRecords([data]),
       };
     }
 
@@ -303,7 +369,7 @@ class OpenAlexService {
         ...data.meta,
         next_cursor: data.meta.next_cursor ?? null,
       },
-      results: processResults(data.results),
+      results: normalizeEntityRecords(data.results),
     };
   }
 

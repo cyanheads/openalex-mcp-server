@@ -7,30 +7,11 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
-type ScalarValue = string | number | boolean | null;
+type Scalar = string | number | boolean;
 type SearchEntityRecord = {
   display_name: string;
   id: string;
 } & Record<string, unknown>;
-
-const IDENTIFIER_FIELDS = [
-  ['doi', 'DOI'],
-  ['orcid', 'ORCID'],
-  ['ror', 'ROR'],
-  ['issn_l', 'ISSN'],
-] as const;
-
-const SUMMARY_FIELDS = [
-  ['publication_year', 'Year'],
-  ['type', 'Type'],
-  ['country_code', 'Country'],
-] as const;
-
-const TOPIC_FIELDS = [
-  ['domain', 'Domain'],
-  ['field', 'Field'],
-  ['subfield', 'Subfield'],
-] as const;
 
 function toFieldLabel(field: string): string {
   return field
@@ -40,230 +21,45 @@ function toFieldLabel(field: string): string {
     .join(' ');
 }
 
-function hasValue(value: unknown): boolean {
-  return value !== null && value !== undefined && value !== '';
+function isScalar(value: unknown): value is Scalar {
+  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
 }
 
-function isScalarValue(value: unknown): value is ScalarValue {
-  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+function isScalarOrNull(value: unknown): value is Scalar | null {
+  return value === null || isScalar(value);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+function formatScalar(value: Scalar): string {
+  return typeof value === 'number' && Number.isInteger(value)
+    ? value.toLocaleString()
+    : String(value);
 }
 
-function markConsumed(consumed: Set<string>, ...fields: string[]): void {
-  for (const field of fields) {
-    consumed.add(field);
-  }
+function renderJsonField(label: string, value: unknown): string {
+  return `**${label}:**\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
-function pushConsumedLine(
-  lines: string[],
-  consumed: Set<string>,
-  field: string,
-  content: string | null,
-): void {
-  if (!content) return;
-  consumed.add(field);
-  lines.push(content);
-}
-
-function formatScalarValue(value: string | number | boolean | null): string {
-  if (value === null) return 'Not available';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  return String(value);
-}
-
-function formatGenericValue(value: unknown): string {
-  if (value === undefined) return 'Not available';
-
-  if (isScalarValue(value)) {
-    return formatScalarValue(value);
-  }
+function renderField(field: string, value: unknown): string {
+  const label = toFieldLabel(field);
+  if (value == null) return `**${label}:** —`;
+  if (isScalar(value)) return `**${label}:** ${formatScalar(value)}`;
 
   if (Array.isArray(value)) {
-    if (value.length === 0) return '[]';
-    if (value.every(isScalarValue)) {
-      return value.map((item) => formatScalarValue(item)).join(', ');
+    if (value.length === 0) return `**${label}:** (empty)`;
+    if (value.every(isScalarOrNull)) {
+      return `**${label}:** ${value.map((item) => (item === null ? '—' : formatScalar(item))).join(', ')}`;
     }
   }
 
-  return `\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+  return renderJsonField(label, value);
 }
 
-function renderGenericField(field: string, value: unknown): string {
-  const formatted = formatGenericValue(value);
-  return formatted.startsWith('\n')
-    ? `**${toFieldLabel(field)}:**${formatted}`
-    : `**${toFieldLabel(field)}:** ${formatted}`;
-}
+function renderRecord(record: SearchEntityRecord): string[] {
+  const { id, display_name, ...rest } = record;
+  const lines = ['', `### ${display_name || id}`, `**ID:** ${id}`];
 
-function formatRecord(record: SearchEntityRecord): string[] {
-  const lines = [`## ${record.display_name}`, `**ID:** ${record.id}`];
-  const consumed = new Set<string>(['id', 'display_name']);
-
-  for (const [field, label] of IDENTIFIER_FIELDS) {
-    const value = record[field];
-    pushConsumedLine(lines, consumed, field, hasValue(value) ? `**${label}:** ${value}` : null);
-  }
-
-  for (const [field, label] of SUMMARY_FIELDS) {
-    const value = record[field];
-    pushConsumedLine(lines, consumed, field, hasValue(value) ? `**${label}:** ${value}` : null);
-  }
-
-  if (Array.isArray(record.country_codes) && record.country_codes.length > 0) {
-    markConsumed(consumed, 'country_codes');
-    lines.push(`**Countries:** ${(record.country_codes as string[]).join(', ')}`);
-  }
-
-  const metrics: string[] = [];
-  if (typeof record.cited_by_count === 'number') {
-    consumed.add('cited_by_count');
-    metrics.push(`Citations: ${record.cited_by_count.toLocaleString()}`);
-  }
-  if (typeof record.works_count === 'number') {
-    consumed.add('works_count');
-    metrics.push(`Works: ${record.works_count.toLocaleString()}`);
-  }
-  if (metrics.length > 0) {
-    lines.push(`**Metrics:** ${metrics.join(' | ')}`);
-  }
-
-  if (isRecord(record.open_access)) {
-    consumed.add('open_access');
-    const parts: string[] = [];
-    if (hasValue(record.open_access.oa_status)) parts.push(String(record.open_access.oa_status));
-    else if (typeof record.open_access.is_oa === 'boolean') {
-      parts.push(record.open_access.is_oa ? 'open' : 'closed');
-    }
-    if (hasValue(record.open_access.oa_url)) parts.push(String(record.open_access.oa_url));
-    if (parts.length > 0) lines.push(`**Open Access:** ${parts.join(' — ')}`);
-  }
-  if (typeof record.is_oa === 'boolean') {
-    consumed.add('is_oa');
-    lines.push(`**Open Access:** ${record.is_oa ? 'Yes' : 'No'}`);
-  }
-
-  if (isRecord(record.primary_location)) {
-    consumed.add('primary_location');
-    const source = isRecord(record.primary_location.source) ? record.primary_location.source : null;
-    const sourceName = source?.display_name;
-    if (hasValue(sourceName)) {
-      lines.push(`**Source:** ${sourceName}`);
-    }
-  }
-  pushConsumedLine(
-    lines,
-    consumed,
-    'host_organization_name',
-    hasValue(record.host_organization_name)
-      ? `**Publisher:** ${record.host_organization_name}`
-      : null,
-  );
-
-  if (isRecord(record.primary_topic)) {
-    consumed.add('primary_topic');
-    const hierarchy = [
-      isRecord(record.primary_topic.domain) ? record.primary_topic.domain.display_name : undefined,
-      isRecord(record.primary_topic.field) ? record.primary_topic.field.display_name : undefined,
-      isRecord(record.primary_topic.subfield)
-        ? record.primary_topic.subfield.display_name
-        : undefined,
-      record.primary_topic.display_name,
-    ].filter(hasValue);
-    if (hierarchy.length > 0) {
-      lines.push(`**Topic:** ${hierarchy.join(' > ')}`);
-    }
-  }
-
-  for (const [field, label] of TOPIC_FIELDS) {
-    const value = record[field];
-    if (!isRecord(value) || !hasValue(value.display_name)) continue;
-    consumed.add(field);
-    lines.push(`**${label}:** ${value.display_name}`);
-  }
-
-  pushConsumedLine(
-    lines,
-    consumed,
-    'description',
-    typeof record.description === 'string' ? `**Description:** ${record.description}` : null,
-  );
-
-  if (Array.isArray(record.keywords) && record.keywords.length > 0) {
-    consumed.add('keywords');
-    const keywords = (record.keywords as Array<Record<string, unknown> | string>)
-      .map((keyword) => (typeof keyword === 'string' ? keyword : keyword.display_name))
-      .filter(hasValue);
-    if (keywords.length > 0) {
-      lines.push(`**Keywords:** ${keywords.join(', ')}`);
-    }
-  }
-
-  if (Array.isArray(record.last_known_institutions) && record.last_known_institutions.length > 0) {
-    consumed.add('last_known_institutions');
-    const institutions = (record.last_known_institutions as Array<Record<string, unknown>>)
-      .map((institution) => institution.display_name)
-      .filter(hasValue);
-    if (institutions.length > 0) {
-      lines.push(`**Institution(s):** ${institutions.join(', ')}`);
-    }
-  }
-
-  if (isRecord(record.summary_stats)) {
-    consumed.add('summary_stats');
-    const parts: string[] = [];
-    if (typeof record.summary_stats.h_index === 'number') {
-      parts.push(`h-index: ${record.summary_stats.h_index}`);
-    }
-    if (typeof record.summary_stats.i10_index === 'number') {
-      parts.push(`i10-index: ${record.summary_stats.i10_index}`);
-    }
-    if (typeof record.summary_stats['2yr_mean_citedness'] === 'number') {
-      parts.push(`2yr mean citedness: ${record.summary_stats['2yr_mean_citedness'].toFixed(2)}`);
-    }
-    if (parts.length > 0) {
-      lines.push(`**Stats:** ${parts.join(' | ')}`);
-    }
-  }
-
-  if (Array.isArray(record.topics) && record.topics.length > 0) {
-    consumed.add('topics');
-    const topTopics = (record.topics as Array<Record<string, unknown>>)
-      .slice(0, 5)
-      .map((topic) => topic.display_name)
-      .filter(hasValue);
-    if (topTopics.length > 0) {
-      lines.push(`**Top Topics:** ${topTopics.join(', ')}`);
-    }
-  }
-
-  pushConsumedLine(
-    lines,
-    consumed,
-    'abstract',
-    typeof record.abstract === 'string' ? `**Abstract:** ${record.abstract}` : null,
-  );
-
-  if (Array.isArray(record.authorships) && record.authorships.length > 0) {
-    consumed.add('authorships');
-    const authors = (record.authorships as Array<Record<string, unknown>>).map((authorship) => {
-      const author = isRecord(authorship.author) ? authorship.author : null;
-      const institutions = Array.isArray(authorship.institutions)
-        ? (authorship.institutions as Array<Record<string, unknown>>)
-        : [];
-      const institution = institutions[0]?.display_name;
-      const name = author?.display_name ?? 'Unknown';
-      return hasValue(institution) ? `${name} (${institution})` : String(name);
-    });
-    lines.push(`**Authors:** ${authors.join('; ')}`);
-  }
-
-  for (const [field, value] of Object.entries(record)) {
-    if (consumed.has(field)) continue;
-    lines.push(renderGenericField(field, value));
+  for (const [field, value] of Object.entries(rest)) {
+    lines.push(renderField(field, value));
   }
 
   return lines;
@@ -309,7 +105,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'Fields to return. Top-level fields only. Searches apply sensible defaults per entity type; pass this to override. Single-entity lookups (by `id`) return the full record unless `select` is specified. Example: ["id", "doi", "display_name", "publication_year", "cited_by_count", "primary_topic"].',
+        'OpenAlex top-level field names to return. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error listing the valid ones. Example: ["id", "doi", "display_name", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()
@@ -343,7 +139,9 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           })
           .passthrough(),
       )
-      .describe('Entity objects. Additional fields depend on entity_type and select.'),
+      .describe(
+        'OpenAlex entity objects passed through unchanged. Additional fields depend on entity_type and select.',
+      ),
   }),
 
   async handler(input, ctx) {
@@ -375,20 +173,23 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   },
 
   format: (result) => {
+    const lines: string[] = [];
+    const countLabel = `${result.meta.count.toLocaleString()} result(s)`;
+    lines.push(
+      result.meta.next_cursor
+        ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
+        : `**${countLabel}**`,
+    );
+
     if (result.results.length === 0) {
-      return [{ type: 'text', text: 'No results found.' }];
-    }
-    const lines: string[] = [`**${result.meta.count.toLocaleString()} result(s)**`, ''];
-
-    for (const r of result.results) {
-      lines.push(...formatRecord(r as SearchEntityRecord));
-      lines.push('');
+      lines.push('', 'No matches.');
+      return [{ type: 'text', text: lines.join('\n') }];
     }
 
-    if (result.meta.next_cursor) {
-      lines.push('*More results available — pass cursor to paginate.*');
+    for (const record of result.results) {
+      lines.push(...renderRecord(record as SearchEntityRecord));
     }
 
-    return [{ type: 'text', text: lines.join('\n').trimEnd() }];
+    return [{ type: 'text', text: lines.join('\n') }];
   },
 });

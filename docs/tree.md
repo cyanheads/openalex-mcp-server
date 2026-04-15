@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-04-14 19:23:58
+Generated on: 2026-04-15 12:33:21
 
 ```text
 openalex-mcp-server/
@@ -11,7 +11,6 @@ openalex-mcp-server/
 │   └── settings.json
 ├── claude-plans/
 ├── docs/
-│   └── openalex-mcp-design.md
 ├── scripts/
 │   ├── build.ts
 │   ├── clean.ts

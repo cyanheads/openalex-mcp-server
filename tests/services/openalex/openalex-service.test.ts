@@ -4,6 +4,7 @@
  * @module services/openalex/openalex-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -142,7 +143,7 @@ describe('OpenAlexService', () => {
   // --- Abstract reconstruction ---
 
   describe('reconstructAbstract', () => {
-    it('reconstructs abstract from inverted index', async () => {
+    it('reconstructs abstract from inverted index and drops the raw index', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(
           JSON.stringify({
@@ -342,14 +343,84 @@ describe('OpenAlexService', () => {
   // --- Error handling ---
 
   describe('error handling', () => {
-    it('throws serviceUnavailable on non-OK response', async () => {
+    it('surfaces OpenAlex 400 messages as invalid params without retrying', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'Invalid query parameters error.',
+            message:
+              'abstract is not a valid select field. Valid fields for select are: id, doi, title, abstract_inverted_index.',
+          }),
+          { status: 400, statusText: 'Bad Request' },
+        ),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message:
+          'abstract is not a valid select field. Valid fields for select are: id, doi, title, abstract_inverted_index.',
+      });
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('maps 429 responses to rateLimited and retries them', async () => {
+      vi.useFakeTimers();
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response('Rate limited', { status: 429, statusText: 'Too Many Requests' }),
       );
       const service = await getService();
-      await expect(service.search({ entityType: 'works' }, createMockContext())).rejects.toThrow(
-        /Status: 429/,
+      const promise = service.search({ entityType: 'works' }, createMockContext());
+      const rejection = expect(promise).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        message: expect.stringMatching(/Status: 429/),
+      });
+
+      await vi.runAllTimersAsync();
+
+      await rejection;
+      expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('maps 404 responses to notFound without retrying', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ message: 'No entity found for W404.' }), {
+          status: 404,
+          statusText: 'Not Found',
+        }),
       );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works', id: 'W404' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: 'No entity found for W404.',
+      });
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('maps other 4xx responses to invalidParams without retrying', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ message: 'Payload too large for this endpoint.' }), {
+          status: 413,
+          statusText: 'Payload Too Large',
+        }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: 'Payload too large for this endpoint.',
+      });
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
 
     it('includes mailto in request URL', async () => {

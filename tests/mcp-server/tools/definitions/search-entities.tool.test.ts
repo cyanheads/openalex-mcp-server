@@ -122,46 +122,77 @@ describe('searchEntitiesTool', () => {
       return (blocks[0] as { type: 'text'; text: string }).text;
     };
 
-    it('formats results with count header', () => {
+    it('renders a count header and per-result sections', () => {
       const output = text(sampleResult);
       expect(output).toContain('**2 result(s)**');
-      expect(output).toContain('## Paper Alpha');
-      expect(output).toContain('## Paper Beta');
+      expect(output).toContain('### Paper Alpha');
+      expect(output).toContain('### Paper Beta');
+      expect(output).toContain('**ID:** W001');
+      expect(output).toContain('**ID:** W002');
     });
 
-    it('renders selected fields that are not in the hard-coded summary set', () => {
+    it('renders scalar fields with humanized labels', () => {
       const output = text({
         meta: { count: 1, per_page: 1, next_cursor: null },
         results: [
           {
             id: 'W001',
             display_name: 'Paper Alpha',
-            ids: {
-              openalex: 'https://openalex.org/W001',
-              pmid: '12345678',
-            },
+            publication_year: 2023,
+            cited_by_count: 1234,
             is_retracted: false,
           },
         ],
       });
-
-      expect(output).toContain('**Ids:**');
-      expect(output).toContain('"pmid": "12345678"');
+      expect(output).toContain('**Publication Year:** 2,023');
+      expect(output).toContain('**Cited By Count:** 1,234');
       expect(output).toContain('**Is Retracted:** false');
     });
 
-    it('shows pagination hint when next_cursor exists', () => {
+    it('joins arrays of scalars and json-blocks arrays of objects', () => {
+      const output = text({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [
+          {
+            id: 'W001',
+            display_name: 'Paper Alpha',
+            country_codes: ['us', 'gb'],
+            authorships: [{ author: { display_name: 'Alice' } }],
+          },
+        ],
+      });
+      expect(output).toContain('**Country Codes:** us, gb');
+      expect(output).toMatch(/\*\*Authorships:\*\*\n```json\n/);
+      expect(output).toContain('"display_name": "Alice"');
+    });
+
+    it('json-blocks nested objects', () => {
+      const output = text({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [
+          {
+            id: 'W001',
+            display_name: 'Paper Alpha',
+            ids: { openalex: 'https://openalex.org/W001', pmid: '12345678' },
+          },
+        ],
+      });
+      expect(output).toMatch(/\*\*Ids:\*\*\n```json\n/);
+      expect(output).toContain('"pmid": "12345678"');
+    });
+
+    it('surfaces next_cursor in the header when present', () => {
       const output = text({
         meta: { count: 100, per_page: 25, next_cursor: 'next123' },
         results: [{ id: 'W001', display_name: 'Paper' }],
       });
-      expect(output).toContain('More results available');
+      expect(output).toContain('next cursor: `next123`');
     });
 
-    it('formats empty results', () => {
-      expect(text({ meta: { count: 0, per_page: 25, next_cursor: null }, results: [] })).toBe(
-        'No results found.',
-      );
+    it('renders empty responses with a no-match line', () => {
+      const output = text({ meta: { count: 0, per_page: 25, next_cursor: null }, results: [] });
+      expect(output).toContain('**0 result(s)**');
+      expect(output).toContain('No matches.');
     });
   });
 });
