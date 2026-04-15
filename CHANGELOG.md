@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `add-app-tool` skill for scaffolding MCP App tool/resource pairs with interactive UI guidance
+
+### Changed
+
+- Synced the project `skills/` directory with the latest framework and maintenance-skill guidance
+- Refreshed scaffolding, testing, workers, field-test, docs-polish, and migration skills to match current `@cyanheads/mcp-ts-core` patterns
+- Expanded skill guidance around content-complete `format()` output, MCP App UI packaging, and updated verification workflows
+
 ## [0.3.1] — 2026-03-30
 
 ### Changed
