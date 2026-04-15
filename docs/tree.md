@@ -1,9 +1,10 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-03-28 11:34:30
+Generated on: 2026-04-14 19:23:58
 
 ```text
 openalex-mcp-server/
+├── .agents/
 ├── .claude/
 ├── .vscode/
 │   ├── extensions.json
@@ -18,6 +19,8 @@ openalex-mcp-server/
 │   ├── lint-mcp.ts
 │   └── tree.ts
 ├── skills/
+│   ├── add-app-tool/
+│   │   └── SKILL.md
 │   ├── add-prompt/
 │   │   └── SKILL.md
 │   ├── add-resource/
@@ -106,6 +109,7 @@ openalex-mcp-server/
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
+├── AGENTS.md
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml

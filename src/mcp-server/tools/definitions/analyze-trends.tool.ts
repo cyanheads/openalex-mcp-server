@@ -86,20 +86,18 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     if (result.groups.length === 0) {
       return [{ type: 'text', text: 'No groups found.' }];
     }
-    const sorted = [...result.groups].sort((a, b) => b.count - a.count);
-    const MAX_DISPLAY = 50;
-    const display = sorted.slice(0, MAX_DISPLAY);
-    const lines = display.map((g) => {
+    const lines = result.groups.map((g) => {
       const label =
         g.key === g.key_display_name ? g.key_display_name : `${g.key_display_name} (${g.key})`;
       return `${label}: ${g.count.toLocaleString()}`;
     });
-    const truncated =
-      sorted.length > MAX_DISPLAY ? `\n\n...and ${sorted.length - MAX_DISPLAY} more groups` : '';
+    const footer = result.meta.next_cursor
+      ? '\n\n*More groups available — pass cursor to paginate.*'
+      : '';
     return [
       {
         type: 'text',
-        text: `${result.meta.count.toLocaleString()} total entities across ${result.groups.length} groups:\n\n${lines.join('\n')}${truncated}`,
+        text: `${result.meta.count.toLocaleString()} total entities across ${result.groups.length} groups on this page:\n\n${lines.join('\n')}${footer}`,
       },
     ];
   },

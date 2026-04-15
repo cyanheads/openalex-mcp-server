@@ -7,6 +7,268 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
+type ScalarValue = string | number | boolean | null;
+type SearchEntityRecord = {
+  display_name: string;
+  id: string;
+} & Record<string, unknown>;
+
+const IDENTIFIER_FIELDS = [
+  ['doi', 'DOI'],
+  ['orcid', 'ORCID'],
+  ['ror', 'ROR'],
+  ['issn_l', 'ISSN'],
+] as const;
+
+const SUMMARY_FIELDS = [
+  ['publication_year', 'Year'],
+  ['type', 'Type'],
+  ['country_code', 'Country'],
+] as const;
+
+const TOPIC_FIELDS = [
+  ['domain', 'Domain'],
+  ['field', 'Field'],
+  ['subfield', 'Subfield'],
+] as const;
+
+function toFieldLabel(field: string): string {
+  return field
+    .split(/[_\-.]/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function hasValue(value: unknown): boolean {
+  return value !== null && value !== undefined && value !== '';
+}
+
+function isScalarValue(value: unknown): value is ScalarValue {
+  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function markConsumed(consumed: Set<string>, ...fields: string[]): void {
+  for (const field of fields) {
+    consumed.add(field);
+  }
+}
+
+function pushConsumedLine(
+  lines: string[],
+  consumed: Set<string>,
+  field: string,
+  content: string | null,
+): void {
+  if (!content) return;
+  consumed.add(field);
+  lines.push(content);
+}
+
+function formatScalarValue(value: string | number | boolean | null): string {
+  if (value === null) return 'Not available';
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return String(value);
+}
+
+function formatGenericValue(value: unknown): string {
+  if (value === undefined) return 'Not available';
+
+  if (isScalarValue(value)) {
+    return formatScalarValue(value);
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '[]';
+    if (value.every(isScalarValue)) {
+      return value.map((item) => formatScalarValue(item)).join(', ');
+    }
+  }
+
+  return `\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+}
+
+function renderGenericField(field: string, value: unknown): string {
+  const formatted = formatGenericValue(value);
+  return formatted.startsWith('\n')
+    ? `**${toFieldLabel(field)}:**${formatted}`
+    : `**${toFieldLabel(field)}:** ${formatted}`;
+}
+
+function formatRecord(record: SearchEntityRecord): string[] {
+  const lines = [`## ${record.display_name}`, `**ID:** ${record.id}`];
+  const consumed = new Set<string>(['id', 'display_name']);
+
+  for (const [field, label] of IDENTIFIER_FIELDS) {
+    const value = record[field];
+    pushConsumedLine(lines, consumed, field, hasValue(value) ? `**${label}:** ${value}` : null);
+  }
+
+  for (const [field, label] of SUMMARY_FIELDS) {
+    const value = record[field];
+    pushConsumedLine(lines, consumed, field, hasValue(value) ? `**${label}:** ${value}` : null);
+  }
+
+  if (Array.isArray(record.country_codes) && record.country_codes.length > 0) {
+    markConsumed(consumed, 'country_codes');
+    lines.push(`**Countries:** ${(record.country_codes as string[]).join(', ')}`);
+  }
+
+  const metrics: string[] = [];
+  if (typeof record.cited_by_count === 'number') {
+    consumed.add('cited_by_count');
+    metrics.push(`Citations: ${record.cited_by_count.toLocaleString()}`);
+  }
+  if (typeof record.works_count === 'number') {
+    consumed.add('works_count');
+    metrics.push(`Works: ${record.works_count.toLocaleString()}`);
+  }
+  if (metrics.length > 0) {
+    lines.push(`**Metrics:** ${metrics.join(' | ')}`);
+  }
+
+  if (isRecord(record.open_access)) {
+    consumed.add('open_access');
+    const parts: string[] = [];
+    if (hasValue(record.open_access.oa_status)) parts.push(String(record.open_access.oa_status));
+    else if (typeof record.open_access.is_oa === 'boolean') {
+      parts.push(record.open_access.is_oa ? 'open' : 'closed');
+    }
+    if (hasValue(record.open_access.oa_url)) parts.push(String(record.open_access.oa_url));
+    if (parts.length > 0) lines.push(`**Open Access:** ${parts.join(' — ')}`);
+  }
+  if (typeof record.is_oa === 'boolean') {
+    consumed.add('is_oa');
+    lines.push(`**Open Access:** ${record.is_oa ? 'Yes' : 'No'}`);
+  }
+
+  if (isRecord(record.primary_location)) {
+    consumed.add('primary_location');
+    const source = isRecord(record.primary_location.source) ? record.primary_location.source : null;
+    const sourceName = source?.display_name;
+    if (hasValue(sourceName)) {
+      lines.push(`**Source:** ${sourceName}`);
+    }
+  }
+  pushConsumedLine(
+    lines,
+    consumed,
+    'host_organization_name',
+    hasValue(record.host_organization_name)
+      ? `**Publisher:** ${record.host_organization_name}`
+      : null,
+  );
+
+  if (isRecord(record.primary_topic)) {
+    consumed.add('primary_topic');
+    const hierarchy = [
+      isRecord(record.primary_topic.domain) ? record.primary_topic.domain.display_name : undefined,
+      isRecord(record.primary_topic.field) ? record.primary_topic.field.display_name : undefined,
+      isRecord(record.primary_topic.subfield)
+        ? record.primary_topic.subfield.display_name
+        : undefined,
+      record.primary_topic.display_name,
+    ].filter(hasValue);
+    if (hierarchy.length > 0) {
+      lines.push(`**Topic:** ${hierarchy.join(' > ')}`);
+    }
+  }
+
+  for (const [field, label] of TOPIC_FIELDS) {
+    const value = record[field];
+    if (!isRecord(value) || !hasValue(value.display_name)) continue;
+    consumed.add(field);
+    lines.push(`**${label}:** ${value.display_name}`);
+  }
+
+  pushConsumedLine(
+    lines,
+    consumed,
+    'description',
+    typeof record.description === 'string' ? `**Description:** ${record.description}` : null,
+  );
+
+  if (Array.isArray(record.keywords) && record.keywords.length > 0) {
+    consumed.add('keywords');
+    const keywords = (record.keywords as Array<Record<string, unknown> | string>)
+      .map((keyword) => (typeof keyword === 'string' ? keyword : keyword.display_name))
+      .filter(hasValue);
+    if (keywords.length > 0) {
+      lines.push(`**Keywords:** ${keywords.join(', ')}`);
+    }
+  }
+
+  if (Array.isArray(record.last_known_institutions) && record.last_known_institutions.length > 0) {
+    consumed.add('last_known_institutions');
+    const institutions = (record.last_known_institutions as Array<Record<string, unknown>>)
+      .map((institution) => institution.display_name)
+      .filter(hasValue);
+    if (institutions.length > 0) {
+      lines.push(`**Institution(s):** ${institutions.join(', ')}`);
+    }
+  }
+
+  if (isRecord(record.summary_stats)) {
+    consumed.add('summary_stats');
+    const parts: string[] = [];
+    if (typeof record.summary_stats.h_index === 'number') {
+      parts.push(`h-index: ${record.summary_stats.h_index}`);
+    }
+    if (typeof record.summary_stats.i10_index === 'number') {
+      parts.push(`i10-index: ${record.summary_stats.i10_index}`);
+    }
+    if (typeof record.summary_stats['2yr_mean_citedness'] === 'number') {
+      parts.push(`2yr mean citedness: ${record.summary_stats['2yr_mean_citedness'].toFixed(2)}`);
+    }
+    if (parts.length > 0) {
+      lines.push(`**Stats:** ${parts.join(' | ')}`);
+    }
+  }
+
+  if (Array.isArray(record.topics) && record.topics.length > 0) {
+    consumed.add('topics');
+    const topTopics = (record.topics as Array<Record<string, unknown>>)
+      .slice(0, 5)
+      .map((topic) => topic.display_name)
+      .filter(hasValue);
+    if (topTopics.length > 0) {
+      lines.push(`**Top Topics:** ${topTopics.join(', ')}`);
+    }
+  }
+
+  pushConsumedLine(
+    lines,
+    consumed,
+    'abstract',
+    typeof record.abstract === 'string' ? `**Abstract:** ${record.abstract}` : null,
+  );
+
+  if (Array.isArray(record.authorships) && record.authorships.length > 0) {
+    consumed.add('authorships');
+    const authors = (record.authorships as Array<Record<string, unknown>>).map((authorship) => {
+      const author = isRecord(authorship.author) ? authorship.author : null;
+      const institutions = Array.isArray(authorship.institutions)
+        ? (authorship.institutions as Array<Record<string, unknown>>)
+        : [];
+      const institution = institutions[0]?.display_name;
+      const name = author?.display_name ?? 'Unknown';
+      return hasValue(institution) ? `${name} (${institution})` : String(name);
+    });
+    lines.push(`**Authors:** ${authors.join('; ')}`);
+  }
+
+  for (const [field, value] of Object.entries(record)) {
+    if (consumed.has(field)) continue;
+    lines.push(renderGenericField(field, value));
+  }
+
+  return lines;
+}
+
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
     'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches return a curated set of fields by default; pass `select` to override with specific fields.',
@@ -119,125 +381,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     const lines: string[] = [`**${result.meta.count.toLocaleString()} result(s)**`, ''];
 
     for (const r of result.results) {
-      const rec = r as Record<string, unknown>;
-      lines.push(`## ${r.display_name}`);
-      lines.push(`**ID:** ${r.id}`);
-
-      // Identifiers
-      if (rec.doi) lines.push(`**DOI:** ${rec.doi}`);
-      if (rec.orcid) lines.push(`**ORCID:** ${rec.orcid}`);
-      if (rec.ror) lines.push(`**ROR:** ${rec.ror}`);
-      if (rec.issn_l) lines.push(`**ISSN:** ${rec.issn_l}`);
-
-      // Classification
-      if (rec.publication_year) lines.push(`**Year:** ${rec.publication_year}`);
-      if (rec.type) lines.push(`**Type:** ${rec.type}`);
-      if (rec.country_code) lines.push(`**Country:** ${rec.country_code}`);
-      if (Array.isArray(rec.country_codes) && rec.country_codes.length)
-        lines.push(`**Countries:** ${(rec.country_codes as string[]).join(', ')}`);
-
-      // Metrics
-      const metrics: string[] = [];
-      if (typeof rec.cited_by_count === 'number')
-        metrics.push(`Citations: ${rec.cited_by_count.toLocaleString()}`);
-      if (typeof rec.works_count === 'number')
-        metrics.push(`Works: ${rec.works_count.toLocaleString()}`);
-      if (metrics.length) lines.push(`**Metrics:** ${metrics.join(' | ')}`);
-
-      // Open access
-      if (rec.open_access && typeof rec.open_access === 'object') {
-        const oa = rec.open_access as Record<string, unknown>;
-        const parts: string[] = [];
-        if (oa.oa_status) parts.push(String(oa.oa_status));
-        else if (typeof oa.is_oa === 'boolean') parts.push(oa.is_oa ? 'open' : 'closed');
-        if (oa.oa_url) parts.push(String(oa.oa_url));
-        if (parts.length) lines.push(`**Open Access:** ${parts.join(' — ')}`);
-      }
-      if (typeof rec.is_oa === 'boolean')
-        lines.push(`**Open Access:** ${rec.is_oa ? 'Yes' : 'No'}`);
-
-      // Location / source
-      if (rec.primary_location && typeof rec.primary_location === 'object') {
-        const loc = rec.primary_location as Record<string, unknown>;
-        const source = loc.source as Record<string, unknown> | undefined;
-        if (source?.display_name) lines.push(`**Source:** ${source.display_name}`);
-      }
-      if (rec.host_organization_name) lines.push(`**Publisher:** ${rec.host_organization_name}`);
-
-      // Topic hierarchy (works)
-      if (rec.primary_topic && typeof rec.primary_topic === 'object') {
-        const t = rec.primary_topic as Record<string, unknown>;
-        const hierarchy = [
-          (t.domain as Record<string, unknown> | undefined)?.display_name,
-          (t.field as Record<string, unknown> | undefined)?.display_name,
-          (t.subfield as Record<string, unknown> | undefined)?.display_name,
-          t.display_name,
-        ].filter(Boolean);
-        if (hierarchy.length) lines.push(`**Topic:** ${hierarchy.join(' > ')}`);
-      }
-
-      // Topic entity fields (domain/field/subfield at top level)
-      if (rec.domain && typeof rec.domain === 'object') {
-        const d = rec.domain as Record<string, unknown>;
-        if (d.display_name) lines.push(`**Domain:** ${d.display_name}`);
-      }
-      if (rec.field && typeof rec.field === 'object') {
-        const f = rec.field as Record<string, unknown>;
-        if (f.display_name) lines.push(`**Field:** ${f.display_name}`);
-      }
-      if (rec.subfield && typeof rec.subfield === 'object') {
-        const s = rec.subfield as Record<string, unknown>;
-        if (s.display_name) lines.push(`**Subfield:** ${s.display_name}`);
-      }
-      if (typeof rec.description === 'string') lines.push(`**Description:** ${rec.description}`);
-      if (Array.isArray(rec.keywords) && rec.keywords.length > 0) {
-        const kws = (rec.keywords as Array<Record<string, unknown> | string>)
-          .map((k) => (typeof k === 'string' ? k : k.display_name))
-          .filter(Boolean);
-        if (kws.length) lines.push(`**Keywords:** ${kws.join(', ')}`);
-      }
-
-      // Author affiliations
-      if (Array.isArray(rec.last_known_institutions) && rec.last_known_institutions.length > 0) {
-        const insts = (rec.last_known_institutions as Array<Record<string, unknown>>)
-          .map((i) => i.display_name)
-          .filter(Boolean);
-        if (insts.length) lines.push(`**Institution(s):** ${insts.join(', ')}`);
-      }
-
-      // Author summary stats
-      if (rec.summary_stats && typeof rec.summary_stats === 'object') {
-        const stats = rec.summary_stats as Record<string, unknown>;
-        const parts: string[] = [];
-        if (typeof stats.h_index === 'number') parts.push(`h-index: ${stats.h_index}`);
-        if (typeof stats.i10_index === 'number') parts.push(`i10-index: ${stats.i10_index}`);
-        if (typeof stats['2yr_mean_citedness'] === 'number')
-          parts.push(`2yr mean citedness: ${(stats['2yr_mean_citedness'] as number).toFixed(2)}`);
-        if (parts.length) lines.push(`**Stats:** ${parts.join(' | ')}`);
-      }
-
-      // Author top topics
-      if (Array.isArray(rec.topics) && rec.topics.length > 0) {
-        const topTopics = (rec.topics as Array<Record<string, unknown>>)
-          .slice(0, 5)
-          .map((t) => t.display_name)
-          .filter(Boolean);
-        if (topTopics.length) lines.push(`**Top Topics:** ${topTopics.join(', ')}`);
-      }
-
-      // Full-record fields (single entity lookups)
-      if (typeof rec.abstract === 'string') lines.push(`**Abstract:** ${rec.abstract}`);
-      if (Array.isArray(rec.authorships) && rec.authorships.length > 0) {
-        const authors = (rec.authorships as Array<Record<string, unknown>>).map((a) => {
-          const author = a.author as Record<string, unknown> | undefined;
-          const name = author?.display_name ?? 'Unknown';
-          const insts = a.institutions as Array<Record<string, unknown>> | undefined;
-          const inst = insts?.[0]?.display_name;
-          return inst ? `${name} (${inst})` : String(name);
-        });
-        lines.push(`**Authors:** ${authors.join('; ')}`);
-      }
-
+      lines.push(...formatRecord(r as SearchEntityRecord));
       lines.push('');
     }
 

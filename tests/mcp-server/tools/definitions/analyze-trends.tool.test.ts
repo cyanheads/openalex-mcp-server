@@ -105,9 +105,24 @@ describe('analyzeTrendsTool', () => {
 
     it('formats groups with total count', () => {
       const output = text(sampleResult);
-      expect(output).toContain('50,000 total entities across 3 groups');
+      expect(output).toContain('50,000 total entities across 3 groups on this page');
       expect(output).toContain('2024: 20,000');
       expect(output).toContain('2023: 18,000');
+    });
+
+    it('renders every group returned on the page', () => {
+      const groups = Array.from({ length: 60 }, (_, index) => ({
+        key: `group-${index + 1}`,
+        key_display_name: `Group ${index + 1}`,
+        count: 60 - index,
+      }));
+      const output = text({
+        meta: { count: 600, groups_count: groups.length, next_cursor: null },
+        groups,
+      });
+
+      expect(output).toContain('Group 1 (group-1): 60');
+      expect(output).toContain('Group 60 (group-60): 1');
     });
 
     it('returns "No groups" for empty results', () => {

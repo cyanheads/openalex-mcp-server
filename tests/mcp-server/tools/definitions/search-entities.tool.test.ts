@@ -129,6 +129,27 @@ describe('searchEntitiesTool', () => {
       expect(output).toContain('## Paper Beta');
     });
 
+    it('renders selected fields that are not in the hard-coded summary set', () => {
+      const output = text({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [
+          {
+            id: 'W001',
+            display_name: 'Paper Alpha',
+            ids: {
+              openalex: 'https://openalex.org/W001',
+              pmid: '12345678',
+            },
+            is_retracted: false,
+          },
+        ],
+      });
+
+      expect(output).toContain('**Ids:**');
+      expect(output).toContain('"pmid": "12345678"');
+      expect(output).toContain('**Is Retracted:** false');
+    });
+
     it('shows pagination hint when next_cursor exists', () => {
       const output = text({
         meta: { count: 100, per_page: 25, next_cursor: 'next123' },

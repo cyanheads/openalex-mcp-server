@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.3.1
+**Version:** 0.3.2
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/AGENTS.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -16,7 +16,7 @@
 
 **Critical workflow:** Names are ambiguous, IDs are not. Always resolve names to IDs first via `openalex_resolve_name` before using them in filters.
 
-**Design doc:** `docs/openalex-mcp-design.md` — full tool schemas, API reference, workflow examples.
+**Reference docs:** `README.md` covers the current tool and prompt surface; `docs/tree.md` shows the current repository layout.
 
 ### MCP Surface
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.2] — 2026-04-14
 
 ### Added
 
@@ -8,9 +8,21 @@
 
 ### Changed
 
+- Bumped `@cyanheads/mcp-ts-core` ^0.2.10 → ^0.3.5
+- Bumped dev dependencies: `@biomejs/biome` ^2.4.10 → ^2.4.12, `@types/node` ^25.5.0 → ^25.6.0, `vitest` ^4.1.2 → ^4.1.4
+- Refreshed `bun.lock` for the framework and toolchain update
 - Synced the project `skills/` directory with the latest framework and maintenance-skill guidance
 - Refreshed scaffolding, testing, workers, field-test, docs-polish, and migration skills to match current `@cyanheads/mcp-ts-core` patterns
 - Expanded skill guidance around content-complete `format()` output, MCP App UI packaging, and updated verification workflows
+- `openalex_search_entities` now formats unexpected selected fields generically, including structured JSON values, instead of dropping them from the MCP text output
+- `openalex_analyze_trends` now renders every group on the current page and adds an explicit pagination hint when more groups are available
+- The OpenAlex service now uses framework request utilities for timeout-aware retries and normalized request context
+
+### Fixed
+
+- Empty, HTML, and malformed JSON responses from the OpenAlex API are now treated as upstream failures and retried before surfacing an error
+- Upstream 404s wrapped by the framework now normalize back to `notFound()` responses
+- Expanded tests for retry handling, abort behavior during backoff, generic field rendering, and paginated trend formatting
 
 ## [0.3.1] — 2026-03-30
 

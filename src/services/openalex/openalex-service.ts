@@ -4,7 +4,9 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -121,11 +123,41 @@ function processResults(results: EntityRecord[]): EntityRecord[] {
   return results;
 }
 
-const MAX_RETRIES = 3;
+const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1000;
+const REQUEST_TIMEOUT_MS = 10_000;
+const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace(/s$/, '')));
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function hasEntries(record?: Record<string, string>): record is Record<string, string> {
+  return record !== undefined && Object.keys(record).length > 0;
+}
+
+function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
+  switch (searchMode) {
+    case 'exact':
+      return 'search.exact';
+    case 'semantic':
+      return 'search.semantic';
+    default:
+      return 'search';
+  }
+}
+
+function normalizeSort(sort?: string): string | undefined {
+  if (!sort) return;
+  return sort.startsWith('-') ? `${sort.slice(1)}:desc` : sort;
+}
+
+function toRequestContext(ctx: Context, operation: string): RequestContext {
+  return {
+    requestId: ctx.requestId,
+    timestamp: ctx.timestamp,
+    operation,
+    ...(ctx.auth !== undefined && { auth: ctx.auth }),
+    ...(ctx.spanId !== undefined && { spanId: ctx.spanId }),
+    ...(ctx.tenantId !== undefined && { tenantId: ctx.tenantId }),
+    ...(ctx.traceId !== undefined && { traceId: ctx.traceId }),
+  };
 }
 
 class OpenAlexService {
@@ -139,11 +171,9 @@ class OpenAlexService {
   }
 
   /** Execute an HTTP request against the OpenAlex API with retry on transient failures. */
-  private async request(
-    path: string,
-    params: Record<string, string>,
-    ctx: Context,
-  ): Promise<unknown> {
+  private request(path: string, params: Record<string, string>, ctx: Context): Promise<unknown> {
+    const operation = `OpenAlex ${path}`;
+    const requestContext = toRequestContext(ctx, operation);
     const url = new URL(`${this.baseUrl}${path}`);
     url.searchParams.set('mailto', this.apiKey);
     for (const [key, value] of Object.entries(params)) {
@@ -152,47 +182,63 @@ class OpenAlexService {
 
     ctx.log.debug('OpenAlex request', { path, params: Object.keys(params) });
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const response = await fetch(url.toString(), {
-        headers: { Accept: 'application/json' },
+    return withRetry(
+      async () => {
+        try {
+          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, requestContext, {
+            headers: { Accept: 'application/json' },
+            signal: ctx.signal,
+          });
+          const text = await response.text();
+          return this.parseResponse(text, path);
+        } catch (error) {
+          this.throwNormalizedRequestError(error, path);
+        }
+      },
+      {
+        operation,
+        context: requestContext,
+        baseDelayMs: BASE_BACKOFF_MS,
+        maxRetries: MAX_ATTEMPTS - 1,
         signal: ctx.signal,
-      });
+      },
+    );
+  }
 
-      if (response.ok) return response.json();
+  private throwNormalizedRequestError(error: unknown, path: string): never {
+    if (error instanceof McpError && error.data?.statusCode === 404) {
+      throw notFound(`Entity not found at ${path}`, { path, status: 404 }, { cause: error });
+    }
+    throw error;
+  }
 
-      if (response.status === 404) {
-        throw notFound(`Entity not found at ${path}`, { path, status: 404 });
-      }
+  private parseResponse<T>(text: string, path: string): T {
+    const trimmed = text.trim();
+    const responsePreview = trimmed.slice(0, 200);
 
-      const retryable =
-        response.status === 429 ||
-        response.status === 500 ||
-        response.status === 502 ||
-        response.status === 503 ||
-        response.status === 504;
-      if (retryable && attempt < MAX_RETRIES - 1) {
-        await sleep(BASE_BACKOFF_MS * 2 ** attempt);
-        continue;
-      }
-
-      const body = await response.text().catch(() => '');
-      let detail = '';
-      try {
-        const parsed = JSON.parse(body);
-        detail = parsed.message ?? '';
-      } catch {
-        detail = body
-          .replace(/<[^>]*>/g, '')
-          .trim()
-          .slice(0, 200);
-      }
-      const message = detail
-        ? `OpenAlex API error (${response.status}): ${detail}`
-        : `OpenAlex API error: ${response.status} ${response.statusText}`;
-      throw serviceUnavailable(message, { path, status: response.status });
+    if (!trimmed) {
+      throw serviceUnavailable(`OpenAlex API returned an empty response for ${path}`, { path });
     }
 
-    throw serviceUnavailable(`OpenAlex API request failed after ${MAX_RETRIES} attempts`, { path });
+    if (/^<(!DOCTYPE\s+html|html[\s>])/i.test(trimmed)) {
+      throw serviceUnavailable(`OpenAlex API returned HTML instead of JSON for ${path}`, {
+        path,
+        responsePreview,
+      });
+    }
+
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch (error) {
+      throw serviceUnavailable(
+        `OpenAlex API returned invalid JSON for ${path}`,
+        {
+          path,
+          responsePreview,
+        },
+        { cause: error },
+      );
+    }
   }
 
   /** Search/filter/sort entities, or retrieve a single entity by ID. */
@@ -222,26 +268,21 @@ class OpenAlexService {
     const queryParams: Record<string, string> = {};
 
     if (params.query) {
-      const searchKey =
-        params.searchMode === 'exact'
-          ? 'search.exact'
-          : params.searchMode === 'semantic'
-            ? 'search.semantic'
-            : 'search';
-      queryParams[searchKey] = params.query;
+      queryParams[getSearchParamKey(params.searchMode)] = params.query;
     }
 
-    if (params.filters && Object.keys(params.filters).length > 0) {
+    if (hasEntries(params.filters)) {
       queryParams.filter = buildFilterString(params.filters);
     }
 
-    if (params.sort) {
+    const sort = normalizeSort(params.sort);
+    if (sort) {
       // Translate "-field" prefix to "field:desc" (OpenAlex API syntax)
-      queryParams.sort = params.sort.startsWith('-') ? `${params.sort.slice(1)}:desc` : params.sort;
+      queryParams.sort = sort;
     }
 
     const select = params.select?.length ? params.select : DEFAULT_SELECT[params.entityType];
-    if (select?.length) {
+    if (select.length > 0) {
       queryParams.select = select.join(',');
     }
 
@@ -274,7 +315,7 @@ class OpenAlexService {
       ? `${params.groupBy}:include_unknown`
       : params.groupBy;
 
-    if (params.filters && Object.keys(params.filters).length > 0) {
+    if (hasEntries(params.filters)) {
       queryParams.filter = buildFilterString(params.filters);
     }
 
@@ -307,7 +348,7 @@ class OpenAlexService {
       q: params.query,
     };
 
-    if (params.filters && Object.keys(params.filters).length > 0) {
+    if (hasEntries(params.filters)) {
       queryParams.filter = buildFilterString(params.filters);
     }
 
@@ -317,10 +358,9 @@ class OpenAlexService {
 
     // Cross-entity autocomplete can return types not in our enum (country, license, etc.).
     // Filter to known entity types so callers can use results in other tools directly.
-    const knownTypes = new Set<string>(ENTITY_TYPES.map((t) => t.replace(/s$/, '')));
     const results = params.entityType
       ? data.results
-      : data.results.filter((r) => knownTypes.has(r.entity_type));
+      : data.results.filter((r) => KNOWN_AUTOCOMPLETE_TYPES.has(r.entity_type));
 
     return { results };
   }

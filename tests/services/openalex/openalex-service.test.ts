@@ -35,6 +35,7 @@ describe('OpenAlexService', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.resetModules();
   });
@@ -347,7 +348,7 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
       await expect(service.search({ entityType: 'works' }, createMockContext())).rejects.toThrow(
-        /OpenAlex API error \(429\)/,
+        /Status: 429/,
       );
     });
 
@@ -357,16 +358,67 @@ describe('OpenAlexService', () => {
       expect(lastFetchUrl().searchParams.get('mailto')).toBe('test-key');
     });
 
-    it('passes ctx.signal to fetch', async () => {
+    it('retries malformed JSON responses before failing', async () => {
+      vi.useFakeTimers();
+      vi.mocked(globalThis.fetch).mockImplementation(() =>
+        Promise.resolve(
+          new Response('{"meta":', {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        ),
+      );
+
+      const service = await getService();
+      const promise = service.search({ entityType: 'works' }, createMockContext());
+      const rejection = expect(promise).rejects.toThrow(/returned invalid JSON/);
+
+      await vi.runAllTimersAsync();
+
+      await rejection;
+      expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('classifies HTML success responses as transient upstream failures', async () => {
+      vi.useFakeTimers();
+      vi.mocked(globalThis.fetch).mockImplementation(() =>
+        Promise.resolve(
+          new Response('<html><body>Rate limited</body></html>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          }),
+        ),
+      );
+
+      const service = await getService();
+      const promise = service.search({ entityType: 'works' }, createMockContext());
+      const rejection = expect(promise).rejects.toThrow(/returned HTML instead of JSON/);
+
+      await vi.runAllTimersAsync();
+
+      await rejection;
+      expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('stops retrying when ctx.signal aborts during backoff', async () => {
+      vi.useFakeTimers();
       const controller = new AbortController();
       const ctx = createMockContext({ signal: controller.signal });
-      const service = await getService();
-      await service.search({ entityType: 'works' }, ctx);
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response('Rate limited', { status: 429, statusText: 'Too Many Requests' }),
+      );
 
-      const fetchCall = vi.mocked(globalThis.fetch).mock.lastCall;
-      expect(fetchCall).toBeDefined();
-      const opts = fetchCall?.[1] as RequestInit;
-      expect(opts.signal).toBe(controller.signal);
+      const service = await getService();
+      const promise = service.search({ entityType: 'works' }, ctx);
+      const rejection = expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+
+      controller.abort(new DOMException('Cancelled', 'AbortError'));
+
+      await rejection;
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
   });
 });
