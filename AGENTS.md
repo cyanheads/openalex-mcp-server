@@ -1,10 +1,10 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.3.3
+**Version:** 0.4.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
-> **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/AGENTS.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
+> **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
 ---
 
@@ -92,25 +92,18 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     return result;
   },
 
-  // format() populates the MCP content[] array — this is what LLM clients inject into the
-  // model's context. structuredContent (from output) is for programmatic use and is NOT
-  // reliably forwarded to the model by most clients. Make format() content-complete.
+  // format() populates content[] — the markdown twin of structuredContent.
+  // Different clients forward different surfaces (Claude Code → structuredContent,
+  // Claude Desktop → content[]); both must carry the same data.
+  // Enforced at lint time: every terminal field in `output` must appear in format()'s
+  // rendered text via sentinel injection. Avoid `.toLocaleString()` on linted numbers —
+  // comma-formatted values (900,000,001) won't match the raw sentinel (900000001).
   format: (result) => {
     if (result.results.length === 0) {
       return [{ type: 'text', text: 'No matches found.' }];
     }
-    const lines: string[] = [];
-    for (const r of result.results) {
-      lines.push(`**${r.display_name}** (${r.entity_type})`);
-      const details: string[] = [r.id];
-      if (r.external_id) details.push(r.external_id);
-      details.push(`${r.cited_by_count.toLocaleString()} citations`);
-      if (r.works_count !== null) details.push(`${r.works_count.toLocaleString()} works`);
-      if (r.hint) details.push(r.hint);
-      lines.push(details.join(' | '));
-      lines.push('');
-    }
-    return [{ type: 'text', text: lines.join('\n').trimEnd() }];
+    const lines = result.results.map((r) => `**${r.display_name}** (${r.entity_type}) — ${r.id}`);
+    return [{ type: 'text', text: lines.join('\n') }];
   },
 });
 ```
@@ -166,7 +159,7 @@ import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 throw new McpError(JsonRpcErrorCode.DatabaseError, 'Connection failed', { pool: 'primary' });
 ```
 
-Plain `Error` is fine for most cases. Use factories when the error code matters. See framework AGENTS.md for the full auto-classification table and all available factories.
+Plain `Error` is fine for most cases. Use factories when the error code matters. See framework CLAUDE.md for the full auto-classification table and all available factories.
 
 ---
 
@@ -208,7 +201,7 @@ src/
 
 Skills are modular instructions in `skills/` at the project root. Read them directly when a task matches — e.g., `skills/add-tool/SKILL.md` when adding a tool.
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Codex: `.Codex/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, re-copy to pick up changes.
+**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, re-copy to pick up changes.
 
 Available skills:
 
@@ -217,6 +210,7 @@ Available skills:
 | `setup` | Post-init project orientation |
 | `design-mcp-server` | Design tool surface, resources, and services for a new server |
 | `add-tool` | Scaffold a new tool definition |
+| `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
 | `add-service` | Scaffold a new service integration |
@@ -224,7 +218,9 @@ Available skills:
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
 | `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
-| `maintenance` | Sync skills and dependencies after updates |
+| `maintenance` | Investigate changelogs, adopt upstream changes, sync skills |
+| `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` |
+| `report-issue-local` | File a bug or feature request against this server's own repo |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, logger, state, progress |
@@ -290,9 +286,14 @@ import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 ## Checklist
 
 - [ ] Zod schemas: all fields have `.describe()`, only JSON-Schema-serializable types (no `z.custom()`, `z.date()`, `z.transform()`, etc.)
+- [ ] Optional nested objects: handler guards for empty inner values from form-based clients (`if (input.obj?.field && ...)`, not just `if (input.obj)`)
+- [ ] `format()` renders every terminal field in `output` — enforced by `format-parity` linter via sentinel injection; avoid `.toLocaleString()` on linted numbers
 - [ ] JSDoc `@fileoverview` + `@module` on every file
 - [ ] `ctx.log` for logging, `ctx.state` for storage
 - [ ] Handlers throw on failure — error factories or plain `Error`, no try/catch
+- [ ] OpenAlex wrapping: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
+- [ ] OpenAlex wrapping: normalization and `format()` preserve uncertainty — do not fabricate facts from missing upstream data
+- [ ] OpenAlex wrapping: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `bun run devcheck` passes
