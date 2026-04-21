@@ -89,8 +89,8 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       lines.push(`**${r.display_name}** (${r.entity_type})`);
       const details: string[] = [r.id];
       if (r.external_id) details.push(r.external_id);
-      details.push(`${r.cited_by_count.toLocaleString()} citations`);
-      if (r.works_count !== null) details.push(`${r.works_count.toLocaleString()} works`);
+      details.push(`${r.cited_by_count} citations`);
+      details.push(r.works_count === null ? 'n/a works' : `${r.works_count} works`);
       if (r.hint) details.push(r.hint);
       lines.push(details.join(' | '));
       lines.push('');

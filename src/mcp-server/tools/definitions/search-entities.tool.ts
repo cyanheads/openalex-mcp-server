@@ -174,7 +174,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
 
   format: (result) => {
     const lines: string[] = [];
-    const countLabel = `${result.meta.count.toLocaleString()} result(s)`;
+    const countLabel = `${result.meta.count} result(s) — ${result.meta.per_page} per page`;
     lines.push(
       result.meta.next_cursor
         ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``

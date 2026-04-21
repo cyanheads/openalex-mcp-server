@@ -124,7 +124,7 @@ describe('searchEntitiesTool', () => {
 
     it('renders a count header and per-result sections', () => {
       const output = text(sampleResult);
-      expect(output).toContain('**2 result(s)**');
+      expect(output).toContain('**2 result(s) — 25 per page**');
       expect(output).toContain('### Paper Alpha');
       expect(output).toContain('### Paper Beta');
       expect(output).toContain('**ID:** W001');
@@ -191,7 +191,7 @@ describe('searchEntitiesTool', () => {
 
     it('renders empty responses with a no-match line', () => {
       const output = text({ meta: { count: 0, per_page: 25, next_cursor: null }, results: [] });
-      expect(output).toContain('**0 result(s)**');
+      expect(output).toContain('**0 result(s) — 25 per page**');
       expect(output).toContain('No matches.');
     });
   });

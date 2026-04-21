@@ -105,9 +105,9 @@ describe('analyzeTrendsTool', () => {
 
     it('formats groups with total count', () => {
       const output = text(sampleResult);
-      expect(output).toContain('50,000 total entities across 3 groups on this page');
-      expect(output).toContain('2024: 20,000');
-      expect(output).toContain('2023: 18,000');
+      expect(output).toContain('50000 total entities across 3 groups on this page');
+      expect(output).toContain('2024: 20000');
+      expect(output).toContain('2023: 18000');
     });
 
     it('renders every group returned on the page', () => {
@@ -126,9 +126,22 @@ describe('analyzeTrendsTool', () => {
     });
 
     it('returns "No groups" for empty results', () => {
-      expect(text({ meta: { count: 0, groups_count: 0, next_cursor: null }, groups: [] })).toBe(
-        'No groups found.',
-      );
+      const output = text({
+        meta: { count: 0, groups_count: 0, next_cursor: null },
+        groups: [],
+      });
+      expect(output).toContain('No groups found.');
+      expect(output).toContain('count=0');
+      expect(output).toContain('groups_count=0');
+    });
+
+    it('surfaces next_cursor when present', () => {
+      const output = text({
+        meta: { count: 500, groups_count: 200, next_cursor: 'nxt-abc' },
+        groups: [{ key: 'k', key_display_name: 'K', count: 1 }],
+      });
+      expect(output).toContain('nxt-abc');
+      expect(output).toContain('200 groups on this page');
     });
   });
 });
