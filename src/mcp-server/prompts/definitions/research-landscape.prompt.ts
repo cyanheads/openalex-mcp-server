@@ -8,6 +8,8 @@ import { prompt, z } from '@cyanheads/mcp-ts-core';
 export const researchLandscapePrompt = prompt('openalex_research_landscape', {
   description:
     'Analyzes the research landscape for a topic: volume trends, top authors/institutions, open access rates, funding sources.',
+  sourceUrl:
+    'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/prompts/definitions/research-landscape.prompt.ts',
   args: z.object({
     topic: z.string().describe('Research area to analyze.'),
   }),

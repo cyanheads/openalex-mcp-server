@@ -15,6 +15,17 @@ import { initOpenAlexService } from '@/services/openalex/openalex-service.js';
 await createApp({
   tools: [resolveNameTool, searchEntitiesTool, analyzeTrendsTool],
   prompts: [literatureReviewPrompt, researchLandscapePrompt],
+  landing: {
+    tagline: 'Search the OpenAlex catalog — 270M+ works, 90M+ authors, 100K+ sources.',
+    repoRoot: 'https://github.com/cyanheads/openalex-mcp-server',
+    envExample: {
+      OPENALEX_API_KEY: 'your-openalex-api-key',
+    },
+    links: [
+      { label: 'OpenAlex', href: 'https://openalex.org' },
+      { label: 'API Docs', href: 'https://docs.openalex.org' },
+    ],
+  },
   setup() {
     initOpenAlexService();
   },

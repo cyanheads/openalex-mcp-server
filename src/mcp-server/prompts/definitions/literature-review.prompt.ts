@@ -8,6 +8,8 @@ import { prompt, z } from '@cyanheads/mcp-ts-core';
 export const literatureReviewPrompt = prompt('openalex_literature_review', {
   description:
     'Guides a systematic literature search: formulate query, search, filter, analyze citation network, synthesize findings.',
+  sourceUrl:
+    'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/prompts/definitions/literature-review.prompt.ts',
   args: z.object({
     topic: z.string().describe('Research topic or question to review.'),
     scope: z

@@ -10,6 +10,8 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 export const analyzeTrendsTool = tool('openalex_analyze_trends', {
   description:
     'Aggregate OpenAlex entities into groups and count them. Use for trend analysis (group works by publication_year), distribution analysis (group by oa_status, type, country), and comparative analysis (group by institution or topic). Combine with filters to scope the analysis. Returns up to 200 groups per page — use cursor pagination for fields with many distinct values.',
+  sourceUrl:
+    'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/analyze-trends.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Entity type to aggregate.'),
