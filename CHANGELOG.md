@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0] — 2026-04-23
+
+### Added
+
+- HTTP landing page at `/` and SEP-1649 Server Card at `/.well-known/mcp.json` — both surfaces ship automatically via `@cyanheads/mcp-ts-core` 0.6.x and are configured through a new `landing` block in `createApp()`
+- `landing.envExample` surfaces `OPENALEX_API_KEY` in the STDIO JSON connect snippet and Claude CLI `--env` flags
+- `landing.repoRoot` enables the auto-derived GitHub footer cluster (Changelog · release · Issues · Source · npm)
+- `landing.links` for OpenAlex and OpenAlex API Docs
+- `sourceUrl` override on all 3 tools and 2 prompts so each landing-page card links to the actual definition file (filenames drop the `openalex-` prefix, so the framework's snake→kebab auto-derivation would 404)
+- `MCP_PUBLIC_URL` documented in `.env.example` for TLS-terminating reverse-proxy deployments
+
+### Changed
+
+- Bumped `@cyanheads/mcp-ts-core` ^0.5.3 → ^0.6.10, `@biomejs/biome` ^2.4.12 → ^2.4.13, `vitest` ^4.1.4 → ^4.1.5
+- Regenerated `bun.lock` against current caret ranges
+- Synced `skills/` from the framework: `add-tool` 1.6 → 1.8, `design-mcp-server` 2.4 → 2.7, `polish-docs-meta` 1.4 → 1.7, `setup` 1.3 → 1.5, `maintenance` 1.3 → 1.4, plus `add-app-tool`, `add-prompt`, `add-resource`, `add-service`, `api-context`, `api-services`, `api-utils`, `field-test` to their current versions
+- Added new `api-linter` (1.0) and `release-and-publish` (2.0) skills and refreshed `.claude/skills/` + `.agents/skills/` agent directories
+- `CLAUDE.md`: added `api-linter` and `release-and-publish` to the skills table; Publishing section now points at the `release-and-publish` skill; note that the `maintenance` skill auto-syncs agent skill directories (Phase B)
+
 ## [0.4.0] — 2026-04-20
 
 ### Changed
