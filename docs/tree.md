@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-04-23 17:01:49
+Generated on: 2026-04-24 15:00:47
 
 ```text
 openalex-mcp-server/
@@ -9,10 +9,21 @@ openalex-mcp-server/
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
+├── changelog/
+│   ├── 0.1.x/
+│   ├── 0.2.x/
+│   ├── 0.3.x/
+│   ├── 0.4.x/
+│   ├── 0.5.x/
+│   ├── 0.6.x/
+│   └── template.md
 ├── claude-plans/
 ├── docs/
 ├── scripts/
+│   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-docs-sync.ts
+│   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
@@ -78,6 +89,8 @@ openalex-mcp-server/
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
 │   ├── report-issue-local/
+│   │   └── SKILL.md
+│   ├── security-pass/
 │   │   └── SKILL.md
 │   └── setup/
 │       └── SKILL.md

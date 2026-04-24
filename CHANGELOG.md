@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-04-24
+
+Framework bump to ^0.6.17, directory-based changelog, cleaner field rendering in search_entities (no comma-years, uppercased acronyms), security-pass skill surfaced
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-04-23
 
 Adds HTTP landing page and SEP-1649 Server Card via @cyanheads/mcp-ts-core 0.6.x, plus sourceUrl overrides; syncs skills and adds api-linter + release-and-publish
