@@ -13,11 +13,29 @@ type SearchEntityRecord = {
   id: string;
 } & Record<string, unknown>;
 
+const ACRONYMS = new Set([
+  'apc',
+  'doi',
+  'fwci',
+  'id',
+  'issn',
+  'oa',
+  'orcid',
+  'pmcid',
+  'pmid',
+  'ror',
+  'url',
+]);
+
 function toFieldLabel(field: string): string {
   return field
     .split(/[_\-.]/g)
     .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .map((part) =>
+      ACRONYMS.has(part.toLowerCase())
+        ? part.toUpperCase()
+        : part.charAt(0).toUpperCase() + part.slice(1),
+    )
     .join(' ');
 }
 
@@ -30,9 +48,7 @@ function isScalarOrNull(value: unknown): value is Scalar | null {
 }
 
 function formatScalar(value: Scalar): string {
-  return typeof value === 'number' && Number.isInteger(value)
-    ? value.toLocaleString()
-    : String(value);
+  return String(value);
 }
 
 function renderJsonField(label: string, value: unknown): string {

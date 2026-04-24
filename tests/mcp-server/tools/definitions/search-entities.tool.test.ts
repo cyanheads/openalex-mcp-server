@@ -144,8 +144,8 @@ describe('searchEntitiesTool', () => {
           },
         ],
       });
-      expect(output).toContain('**Publication Year:** 2,023');
-      expect(output).toContain('**Cited By Count:** 1,234');
+      expect(output).toContain('**Publication Year:** 2023');
+      expect(output).toContain('**Cited By Count:** 1234');
       expect(output).toContain('**Is Retracted:** false');
     });
 
