@@ -46,8 +46,9 @@ When the user asks what to do next, what's left, or needs direction, suggest rel
 1. **Add tests** — scaffold tests for existing definitions using the `add-test` skill
 2. **Field-test definitions** — exercise tools/resources/prompts with real inputs using the `field-test` skill
 3. **Run `devcheck`** — lint, format, typecheck, and security audit
-4. **Run the `polish-docs-meta` skill** — finalize README, CHANGELOG, metadata, and agent protocol for shipping
-5. **Run the `maintenance` skill** — sync skills and dependencies after framework updates
+4. **Run the `security-pass` skill** — audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation
+5. **Run the `polish-docs-meta` skill** — finalize README, CHANGELOG, metadata, and agent protocol for shipping
+6. **Run the `maintenance` skill** — sync skills and dependencies after framework updates
 
 ---
 
@@ -201,7 +202,7 @@ src/
 
 Skills are modular instructions in `skills/` at the project root. Read them directly when a task matches — e.g., `skills/add-tool/SKILL.md` when adding a tool.
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, re-copy to pick up changes.
+**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, run the `maintenance` skill — it re-syncs the agent directory automatically (Phase B).
 
 Available skills:
 
@@ -216,6 +217,7 @@ Available skills:
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
+| `security-pass` | Audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills |
@@ -229,6 +231,8 @@ Available skills:
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling |
 | `api-workers` | Cloudflare Workers runtime |
+| `api-linter` | MCP definition lint rules reference (rule IDs, severities, fixes) |
+| `release-and-publish` | End-to-end ship workflow (npm + MCP Registry + GHCR) |
 
 When you complete a skill's checklist, check the boxes and add a completion timestamp at the end (e.g., `Completed: 2026-03-11`).
 
@@ -255,7 +259,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Publishing
 
-After a version bump and final commit, publish to both npm and GHCR:
+Run the `release-and-publish` skill — it runs the verification gate (`devcheck`, `rebuild`, `test`), pushes commits and tags, then publishes to every applicable destination. The full reference:
 
 ```bash
 bun publish --access public
@@ -265,8 +269,6 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t ghcr.io/cyanheads/openalex-mcp-server:latest \
   --push .
 ```
-
-Remind the user to run these after completing a release flow.
 
 ---
 

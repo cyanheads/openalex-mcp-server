@@ -139,7 +139,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
             id: z.string().describe('OpenAlex ID (e.g., "W2741809807", "A1234567890").'),
             display_name: z.string().describe('Entity name or work title.'),
           })
-          .passthrough(),
+          .passthrough()
+          .describe(
+            'A single OpenAlex entity record. Core `id` and `display_name` are guaranteed; additional fields vary by entity_type and `select`.',
+          ),
       )
       .describe(
         'OpenAlex entity objects passed through unchanged. Additional fields depend on entity_type and select.',

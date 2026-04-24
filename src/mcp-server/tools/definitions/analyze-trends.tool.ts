@@ -52,11 +52,13 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .describe('Aggregation metadata.'),
     groups: z
       .array(
-        z.object({
-          key: z.string().describe('Group key (OpenAlex ID or raw value).'),
-          key_display_name: z.string().describe('Human-readable group label.'),
-          count: z.number().describe('Number of entities in this group.'),
-        }),
+        z
+          .object({
+            key: z.string().describe('Group key (OpenAlex ID or raw value).'),
+            key_display_name: z.string().describe('Human-readable group label.'),
+            count: z.number().describe('Number of entities in this group.'),
+          })
+          .describe('A single aggregation group with its key, display label, and entity count.'),
       )
       .describe('Aggregation groups with counts.'),
   }),

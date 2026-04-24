@@ -34,30 +34,34 @@ export const resolveNameTool = tool('openalex_resolve_name', {
   output: z.object({
     results: z
       .array(
-        z.object({
-          id: z.string().describe('OpenAlex ID.'),
-          external_id: z
-            .string()
-            .nullable()
-            .describe('Canonical external ID (DOI, ORCID, ROR, ISSN).'),
-          display_name: z.string().describe('Human-readable name.'),
-          entity_type: z
-            .string()
-            .describe('Entity type (work, author, source, institution, etc.).'),
-          cited_by_count: z
-            .number()
-            .describe('Citation count (direct for works, aggregate for others).'),
-          works_count: z
-            .number()
-            .nullable()
-            .describe('Associated works. null for works themselves.'),
-          hint: z
-            .string()
-            .nullable()
-            .describe(
-              'Disambiguation context: author names (works), last institution (authors), host org (sources), location (institutions).',
-            ),
-        }),
+        z
+          .object({
+            id: z.string().describe('OpenAlex ID.'),
+            external_id: z
+              .string()
+              .nullable()
+              .describe('Canonical external ID (DOI, ORCID, ROR, ISSN).'),
+            display_name: z.string().describe('Human-readable name.'),
+            entity_type: z
+              .string()
+              .describe('Entity type (work, author, source, institution, etc.).'),
+            cited_by_count: z
+              .number()
+              .describe('Citation count (direct for works, aggregate for others).'),
+            works_count: z
+              .number()
+              .nullable()
+              .describe('Associated works. null for works themselves.'),
+            hint: z
+              .string()
+              .nullable()
+              .describe(
+                'Disambiguation context: author names (works), last institution (authors), host org (sources), location (institutions).',
+              ),
+          })
+          .describe(
+            'A single autocomplete match with its ID, name, entity type, activity stats, and a disambiguation hint.',
+          ),
       )
       .describe('Autocomplete matches, up to 10.'),
   }),
