@@ -18,6 +18,8 @@
     "tree": "bun scripts/tree.ts",
     "format": "biome check --write --unsafe .",
     "lint:mcp": "bun scripts/lint-mcp.ts",
+    "changelog:build": "bun scripts/build-changelog.ts",
+    "changelog:check": "bun scripts/build-changelog.ts --check",
     "test": "vitest run",
     "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "dev:stdio": "MCP_TRANSPORT_TYPE=stdio bun --watch src/index.ts",

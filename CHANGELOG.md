@@ -1,253 +1,75 @@
 # Changelog
 
-## [0.5.0] — 2026-04-23
+All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
-### Added
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-04-23
 
-- HTTP landing page at `/` and SEP-1649 Server Card at `/.well-known/mcp.json` — both surfaces ship automatically via `@cyanheads/mcp-ts-core` 0.6.x and are configured through a new `landing` block in `createApp()`
-- `landing.envExample` surfaces `OPENALEX_API_KEY` in the STDIO JSON connect snippet and Claude CLI `--env` flags
-- `landing.repoRoot` enables the auto-derived GitHub footer cluster (Changelog · release · Issues · Source · npm)
-- `landing.links` for OpenAlex and OpenAlex API Docs
-- `sourceUrl` override on all 3 tools and 2 prompts so each landing-page card links to the actual definition file (filenames drop the `openalex-` prefix, so the framework's snake→kebab auto-derivation would 404)
-- `MCP_PUBLIC_URL` documented in `.env.example` for TLS-terminating reverse-proxy deployments
+Adds HTTP landing page and SEP-1649 Server Card via @cyanheads/mcp-ts-core 0.6.x, plus sourceUrl overrides; syncs skills and adds api-linter + release-and-publish
 
-### Changed
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-04-20
 
-- Bumped `@cyanheads/mcp-ts-core` ^0.5.3 → ^0.6.10, `@biomejs/biome` ^2.4.12 → ^2.4.13, `vitest` ^4.1.4 → ^4.1.5
-- Regenerated `bun.lock` against current caret ranges
-- Synced `skills/` from the framework: `add-tool` 1.6 → 1.8, `design-mcp-server` 2.4 → 2.7, `polish-docs-meta` 1.4 → 1.7, `setup` 1.3 → 1.5, `maintenance` 1.3 → 1.4, plus `add-app-tool`, `add-prompt`, `add-resource`, `add-service`, `api-context`, `api-services`, `api-utils`, `field-test` to their current versions
-- Added new `api-linter` (1.0) and `release-and-publish` (2.0) skills and refreshed `.claude/skills/` + `.agents/skills/` agent directories
-- `CLAUDE.md`: added `api-linter` and `release-and-publish` to the skills table; Publishing section now points at the `release-and-publish` skill; note that the `maintenance` skill auto-syncs agent skill directories (Phase B)
+Framework bump to ^0.5.3; rewrites tool format() bodies to satisfy the new format-parity linter so content[] now carries every output-schema field
 
-## [0.4.0] — 2026-04-20
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-04-15
 
-### Changed
+Generic field rendering in openalex_search_entities; abstracts returned as plaintext; OpenAlex 4xx responses now map to specific MCP error classes
 
-- Bumped `@cyanheads/mcp-ts-core` ^0.3.5 → ^0.5.3 and `typescript` ^6.0.2 → ^6.0.3
-- Regenerated `bun.lock` from scratch against current caret ranges
-- Rewrote tool `format()` bodies to satisfy the new framework `format-parity` linter: every terminal field in each tool's `output` schema now appears in the rendered `content[]` text
-  - `openalex_analyze_trends` now surfaces `meta.count`, `meta.groups_count`, and the `next_cursor` value
-  - `openalex_search_entities` header now includes `per_page` alongside the total count
-  - `openalex_resolve_name` always renders `works_count` (including a `n/a works` branch for null)
-- Replaced `.toLocaleString()` on linted numeric fields with raw digits so the linter's sentinel-injection matcher passes
-- Synced `skills/` from the framework: `add-tool` 1.3 → 1.6, `design-mcp-server` 2.2 → 2.4, `maintenance` 1.2 → 1.3, `setup` 1.2 → 1.3, `polish-docs-meta` 1.3 → 1.4, `field-test` 1.1 → 1.2, `api-config` 1.1 → 1.2
-- Expanded the `CLAUDE.md` / `AGENTS.md` checklist with the upstream additions (form-client guards, `format()` parity, OpenAlex-wrapping invariants); added `add-app-tool`, `report-issue-framework`, and `report-issue-local` to the skills table
-- `AGENTS.md` now mirrors `CLAUDE.md` verbatim so both agent entry points stay in lockstep
+## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-04-14
 
-### Fixed
+Framework bump to ^0.3.5; retries empty/HTML/malformed JSON responses; analyze_trends paginates cleanly; adds add-app-tool skill
 
-- Tool output no longer diverges between `structuredContent` (programmatic) and `content[]` (LLM-visible) surfaces — both carry the full payload the output schema declares
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-03-30
 
-## [0.3.3] — 2026-04-15
+Framework bump to ^0.2.10; adds funding links and public hosted server URL; refreshes add-tool, add-resource, and design-mcp-server skills
 
-### Changed
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-03-28
 
-- `openalex_search_entities` now renders every returned field generically in MCP text output, humanizes field labels, and surfaces `next_cursor` directly in the results header
-- Abstracts reconstructed from `abstract_inverted_index` are now returned as plaintext while dropping the raw inverted index to keep responses smaller
-- Refreshed README feature notes and regenerated `docs/tree.md` to match the current repository state
+Framework bump @cyanheads/mcp-ts-core ^0.2.3 → ^0.2.8
 
-### Fixed
+## [0.2.9](changelog/0.2.x/0.2.9.md) — 2026-03-28
 
-- Invalid `select` field requests now surface OpenAlex's validation message, including the list of valid fields for that entity type
-- OpenAlex 4xx responses now map to specific MCP error classes (`invalidParams`, `notFound`, `rateLimited`, etc.) while preserving upstream messages
-- Expanded tests for generic field rendering, cursor formatting, abstract normalization, and upstream error handling behavior
+Rich structured markdown output for openalex_search_entities and openalex_resolve_name; adds report-issue-framework and report-issue-local skills; framework bump to ^0.2.3
 
-## [0.3.2] — 2026-04-14
+## [0.2.8](changelog/0.2.x/0.2.8.md) — 2026-03-24
 
-### Added
+Default select fields per entity type — searches now return curated subsets, preventing 20-70KB-per-record payloads from overwhelming context windows
 
-- `add-app-tool` skill for scaffolding MCP App tool/resource pairs with interactive UI guidance
+## [0.2.7](changelog/0.2.x/0.2.7.md) — 2026-03-24
 
-### Changed
+Unifies package description across README, package.json, server.json, and Dockerfile to a shorter consistent form
 
-- Bumped `@cyanheads/mcp-ts-core` ^0.2.10 → ^0.3.5
-- Bumped dev dependencies: `@biomejs/biome` ^2.4.10 → ^2.4.12, `@types/node` ^25.5.0 → ^25.6.0, `vitest` ^4.1.2 → ^4.1.4
-- Refreshed `bun.lock` for the framework and toolchain update
-- Synced the project `skills/` directory with the latest framework and maintenance-skill guidance
-- Refreshed scaffolding, testing, workers, field-test, docs-polish, and migration skills to match current `@cyanheads/mcp-ts-core` patterns
-- Expanded skill guidance around content-complete `format()` output, MCP App UI packaging, and updated verification workflows
-- `openalex_search_entities` now formats unexpected selected fields generically, including structured JSON values, instead of dropping them from the MCP text output
-- `openalex_analyze_trends` now renders every group on the current page and adds an explicit pagination hint when more groups are available
-- The OpenAlex service now uses framework request utilities for timeout-aware retries and normalized request context
+## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-03-24
 
-### Fixed
+Adds idempotentHint: true to all three tools; adds publishing section to CLAUDE.md with npm and GHCR release commands
 
-- Empty, HTML, and malformed JSON responses from the OpenAlex API are now treated as upstream failures and retried before surfacing an error
-- Upstream 404s wrapped by the framework now normalize back to `notFound()` responses
-- Expanded tests for retry handling, abort behavior during backoff, generic field rendering, and paginated trend formatting
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-03-24
 
-## [0.3.1] — 2026-03-30
+Clarifies README storage backend description; removes unused STORAGE_PROVIDER_TYPE env var; reformats retryable status code condition for readability
 
-### Changed
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-03-24
 
-- Bumped `@cyanheads/mcp-ts-core` ^0.2.8 → ^0.2.10
-- Bumped `@biomejs/biome` ^2.4.9 → ^2.4.10
-- Added author email and funding links to package.json
-- Added `remotes` array with public hosted server URL to server.json
-- Updated `add-tool` skill (v1.1): expanded `format()` guidance, added Tool Response Design section (batch input, partial success, empty results, error classification, context budget)
-- Updated `add-resource` skill (v1.1): added tool coverage guidance for resource-only data
-- Updated `design-mcp-server` skill (v2.1): live API probing, tool-first design philosophy, batch input design, error design, convenience shortcuts, resilience planning
-- Minor formatting fixes in `analyze-trends.tool.ts` and `search-entities.tool.ts`
+API client retries transient failures (429, 500, 502, 503, 504) with exponential backoff — up to 3 attempts before surfacing the error
 
-## [0.3.0] — 2026-03-28
+## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-03-24
 
-### Changed
+openalex_analyze_trends sorts groups by count descending and caps display at 50; cursor pagination only sent when explicitly provided; cross-entity autocomplete filters to known entity types
 
-- Bumped `@cyanheads/mcp-ts-core` ^0.2.3 → ^0.2.8
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-03-24
 
-## [0.2.9] — 2026-03-28
+Literature review prompt adapts strategy to scope; 404s throw notFound() instead of serviceUnavailable(); group-by queries always send cursor (defaults to * for first page)
 
-### Added
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-03-24
 
-- Rich structured markdown format output for `openalex_search_entities` — renders identifiers, metrics, open access status, topics, authors, abstracts, and institution affiliations in organized sections
-- Rich structured format output for `openalex_resolve_name` — renders citations, works count, external IDs, and disambiguation hints
-- `report-issue-framework` and `report-issue-local` skills for filing issues against the framework and server repos
-- `LOGS_DIR` env var documented in README configuration table
+Explicit 404 handling in API client; non-JSON error response bodies sanitized (HTML stripped, truncated to 200 chars); next_cursor normalized to null when missing
 
-### Changed
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-03-24
 
-- `openalex_analyze_trends` format now shows key alongside display_name when they differ
-- `polish-docs-meta` skill updated with GitHub repo metadata sync steps and description propagation guidance
-- Bumped `@cyanheads/mcp-ts-core` ^0.1.28 → ^0.2.3
-- Bumped `@biomejs/biome` ^2.4.8 → ^2.4.9, `vitest` ^4.1.1 → ^4.1.2
-- Updated CLAUDE.md example code to reflect new format pattern with content-complete comments
+Full unit test suite for all three tools and the OpenAlex service; API auth changed from api_key to mailto (polite pool convention); sort direction syntax fixed
 
-## [0.2.8] — 2026-03-24
+## [0.1.1](changelog/0.1.x/0.1.1.md) — 2026-03-24
 
-### Added
+README, LICENSE, docs/tree.md; package.json metadata filled in; server.json OpenAlex env vars declared; Dockerfile OCI labels; echo placeholder tests removed
 
-- Default `select` fields per entity type — search queries now return a curated subset of fields automatically, preventing 20-70KB-per-record responses from overwhelming context windows
-- Source journal name (`primary_location.source.display_name`) included in `openalex_search_entities` formatted text output
+## [0.1.0](changelog/0.1.x/0.1.0.md) — 2026-03-24
 
-### Changed
-
-- `select` parameter description updated — searches apply sensible defaults; pass `select` to override. Single-entity lookups by ID still return full records unless `select` is specified.
-
-## [0.2.7] — 2026-03-24
-
-### Changed
-
-- Unified package description across README, package.json, server.json, and Dockerfile to a shorter, consistent form
-
-## [0.2.6] — 2026-03-24
-
-### Changed
-
-- Added `idempotentHint: true` annotation to all three tools — signals to clients that repeated calls with the same input produce the same result
-- Added publishing section to CLAUDE.md with npm and GHCR release commands
-
-## [0.2.5] — 2026-03-24
-
-### Changed
-
-- Clarified README storage backend description — notes framework capability without implying server usage
-- Removed unused `STORAGE_PROVIDER_TYPE` env var from README configuration table
-- Reformatted retryable status code condition in API client for readability
-
-## [0.2.4] — 2026-03-24
-
-### Improved
-
-- API client retries transient failures (429, 500, 502, 503, 504) with exponential backoff — up to 3 attempts before surfacing the error
-
-## [0.2.3] — 2026-03-24
-
-### Improved
-
-- `openalex_analyze_trends` format output now sorts groups by count descending and caps display at 50 with a truncation note
-- `openalex_search_entities` exact search mode description clarified — notes quoted phrases for multi-word exact match
-- `openalex_resolve_name` description narrowed to DOI-only direct lookup (removed incorrect ORCID/ROR claims)
-
-### Fixed
-
-- Cursor pagination only sent when explicitly provided — boolean `group_by` fields (`is_retracted`, `has_orcid`, etc.) reject cursor entirely
-- Cross-entity autocomplete now filters results to known entity types — prevents unusable types (`country`, `license`, etc.) from reaching callers
-
-## [0.2.2] — 2026-03-24
-
-### Improved
-
-- Literature review prompt now adapts search strategy based on scope (narrow vs broad)
-- Research landscape prompt instructs agents to resolve funder IDs to human-readable names
-- `openalex_analyze_trends` cursor description now notes that paginated groups are sorted by key, not by count
-- `openalex_search_entities` format output includes publication year, citation count, and DOI when available
-
-### Fixed
-
-- 404 errors now throw `notFound()` instead of `serviceUnavailable()` — correct HTTP semantics
-- Group-by queries always send cursor (defaults to `*` for first page) — fixes missing first-page results
-- Updated test assertion to match revised error message format
-
-### Changed
-
-- Bumped dev dependencies: `@biomejs/biome` 2.4.8, `tsx` 4.21, `typescript` 6.0.2, `vitest` 4.1.1
-- Fixed `bun test` → `bun run test` in CLAUDE.md commands table
-- Updated `docs/tree.md` to reflect test file structure
-
-## [0.2.1] — 2026-03-24
-
-### Fixed
-
-- Explicit 404 handling in API client — throws `serviceUnavailable` with path context instead of a generic error
-- Sanitize non-JSON error response bodies — strip HTML tags and truncate to 200 chars
-- Normalize `next_cursor` to `null` when missing from search results (prevents `undefined` leaking to callers)
-
-## [0.2.0] — 2026-03-24
-
-### Added
-
-- Full test suite: unit tests for all 3 tools (`search-entities`, `analyze-trends`, `resolve-name`) and the OpenAlex service (ID normalization, filter building, abstract reconstruction, search modes, error handling)
-- `OPENALEX_BASE_URL` env var declaration in `server.json` for both stdio and HTTP transports
-- `.min(1)` validation on `openalex_resolve_name` query parameter
-
-### Fixed
-
-- Changed API auth parameter from `api_key` to `mailto` (OpenAlex polite pool convention)
-- Sort direction translation: `-field` prefix now correctly maps to `field:desc` (OpenAlex API syntax)
-- Semantic search no longer sends cursor pagination params (unsupported by the API)
-- `openalex_analyze_trends` now surfaces `next_cursor` from the API response
-
-### Changed
-
-- Improved API error messages: parses JSON error bodies to surface the `message` field instead of raw status text
-- Updated `openalex_search_entities` description and `select` guidance to call out institutions (~20KB) alongside works (~70KB) as large entities
-
-## [0.1.1] — 2026-03-24
-
-### Added
-
-- README with full tool/prompt documentation, configuration reference, and getting started guide
-- Apache 2.0 LICENSE file
-- `bunfig.toml` for Bun runtime configuration
-- `docs/tree.md` directory structure documentation
-
-### Changed
-
-- Filled in package.json metadata: description, mcpName, keywords, author, homepage, bugs, repository URL, bun engine requirement, packageManager field
-- Updated server.json with name (`io.github.cyanheads/openalex-mcp-server`), description, repository URL, and `OPENALEX_API_KEY` env var declarations
-- Updated CLAUDE.md examples to use real OpenAlex tool/prompt patterns instead of generic placeholders
-- Updated Dockerfile OCI labels with description and source URL
-- Updated `.env.example` with OpenAlex-specific environment variables
-- Expanded devcheck.config.json ignore list (`tsx`, `depcheck`)
-- Added `depcheck` to devDependencies
-
-### Removed
-
-- Placeholder echo test files (`echo.tool.test.ts`, `echo.prompt.test.ts`, `echo.resource.test.ts`)
-
-## [0.1.0] — 2026-03-24
-
-Initial release. MCP server for querying the [OpenAlex](https://openalex.org) academic research catalog (270M+ works, 90M+ authors, 100K+ sources).
-
-### Added
-
-- **`openalex_search_entities` tool** — Search, filter, sort, or retrieve by ID across all 8 entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Supports keyword, exact, and semantic search modes with boolean operators, wildcards, and cursor pagination. Field selection via `select` for payload control.
-- **`openalex_analyze_trends` tool** — Group-by aggregation for trend and distribution analysis. Supports grouping by publication year, open access status, institution, country, topic, and other fields with optional filters.
-- **`openalex_resolve_name` tool** — Name-to-OpenAlex-ID resolution via autocomplete. Returns up to 10 matches with disambiguation hints. Accepts partial names, DOIs, ORCIDs, and ROR IDs.
-- **`openalex_literature_review` prompt** — Guided systematic literature search workflow: entity resolution, multi-strategy search, citation tracing, landscape analysis, and synthesis.
-- **`openalex_research_landscape` prompt** — Quantitative research landscape analysis: volume trends, top contributors, open access rates, funding sources, and emerging fronts.
-- **OpenAlex API service** — Typed client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex URLs), abstract reconstruction from inverted indices, filter string building, and cancellation support via `AbortSignal`.
-- **Server configuration** — Zod-validated config with `OPENALEX_API_KEY` (required) and `OPENALEX_BASE_URL` (optional, defaults to `https://api.openalex.org`).
-- **Dual transport** — Stdio and streamable HTTP transports via `@cyanheads/mcp-ts-core`.
-- **Docker support** — Multi-stage Dockerfile for containerized deployment.
-- **Agent protocol** — `CLAUDE.md` with domain context, tool surface, patterns, and skills for AI agent integration.
+Initial release. MCP server for the OpenAlex academic research catalog (270M+ works, 90M+ authors, 100K+ sources) with 3 tools, 2 prompts, and dual stdio/HTTP transports
