@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-04-24
+
+Framework bump to ^0.7.0 — flattened ZodError messages, locale-aware format-parity linter, devcheck crash fix on single-file changelog projects
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-04-24
 
 Framework bump to ^0.6.17, directory-based changelog, cleaner field rendering in search_entities (no comma-years, uppercased acronyms), security-pass skill surfaced
