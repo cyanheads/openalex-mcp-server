@@ -1,11 +1,16 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-04-24 15:00:47
+Generated on: 2026-04-26 00:58:00
 
 ```text
 openalex-mcp-server/
 ├── .agents/
 ├── .claude/
+├── .github/
+│   └── ISSUE_TEMPLATE/
+│       ├── bug_report.yml
+│       ├── config.yml
+│       └── feature_request.yml
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -23,6 +28,7 @@ openalex-mcp-server/
 │   ├── build-changelog.ts
 │   ├── build.ts
 │   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
 │   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts

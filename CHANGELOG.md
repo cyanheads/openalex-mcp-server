@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-04-25
+
+Framework bump to ^0.7.4 — fail-closed Origin guard for HTTP, framework-antipattern devcheck step, literal-variant linter exemption, issue templates
+
 ## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-04-24
 
 Framework bump to ^0.7.0 — flattened ZodError messages, locale-aware format-parity linter, devcheck crash fix on single-file changelog projects
