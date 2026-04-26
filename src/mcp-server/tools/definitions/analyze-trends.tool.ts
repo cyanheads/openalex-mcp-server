@@ -36,7 +36,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Pagination cursor from a previous response. Group-by returns max 200 groups per page. Pass cursor to get the next page. Note: paginated groups are sorted by key, not by count.',
+        'Pagination cursor from a previous response. Group-by returns max 200 groups per page. Pass cursor to get the next page. The first page is sorted by count descending; subsequent pages (cursor pages) are sorted by key, not by count.',
       ),
   }),
   output: z.object({
@@ -48,6 +48,11 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
           .string()
           .nullable()
           .describe('Cursor for next page of groups. null if no more groups.'),
+        echo: z
+          .string()
+          .describe(
+            'Compact echo of the input criteria (entity_type, group_by, filters) — useful when no groups are returned so callers see what was actually requested.',
+          ),
       })
       .describe('Aggregation metadata.'),
     groups: z
@@ -83,15 +88,20 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       groupCount: result.groups.length,
     });
 
-    return result;
+    return {
+      meta: { ...result.meta, echo: buildAnalyzeEcho(input) },
+      groups: result.groups,
+    };
   },
 
   format: (result) => {
+    const heading = `${result.meta.count} total entities across ${result.meta.groups_count ?? result.groups.length} groups on this page (${result.meta.echo})`;
+
     if (result.groups.length === 0) {
       return [
         {
           type: 'text',
-          text: `No groups found. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})`,
+          text: `No groups found for ${result.meta.echo}. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})\n\nTry removing filters or grouping by a different field.`,
         },
       ];
     }
@@ -106,8 +116,22 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     return [
       {
         type: 'text',
-        text: `${result.meta.count} total entities across ${result.meta.groups_count ?? result.groups.length} groups on this page:\n\n${lines.join('\n')}${footer}`,
+        text: `${heading}:\n\n${lines.join('\n')}${footer}`,
       },
     ];
   },
 });
+
+function buildAnalyzeEcho(input: {
+  entity_type: string;
+  group_by: string;
+  filters?: Record<string, string> | undefined;
+  include_unknown?: boolean | undefined;
+}): string {
+  const parts = [`entity_type=${input.entity_type}`, `group_by=${input.group_by}`];
+  if (input.filters && Object.keys(input.filters).length > 0) {
+    parts.push(`filters=${JSON.stringify(input.filters)}`);
+  }
+  if (input.include_unknown) parts.push('include_unknown=true');
+  return parts.join(' | ');
+}

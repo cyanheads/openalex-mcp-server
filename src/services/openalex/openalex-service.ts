@@ -116,6 +116,60 @@ function reconstructAbstract(invertedIndex: Record<string, number[]>): string {
   return words.map(([, word]) => word).join(' ');
 }
 
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  amp: '&',
+  apos: "'",
+  gt: '>',
+  lt: '<',
+  nbsp: ' ',
+  quot: '"',
+};
+
+const MAX_UNICODE_CODE_POINT = 0x10ffff;
+
+function codePointToString(code: number, fallback: string): string {
+  return Number.isInteger(code) && code >= 0 && code <= MAX_UNICODE_CODE_POINT
+    ? String.fromCodePoint(code)
+    : fallback;
+}
+
+/**
+ * Decode HTML entities that OpenAlex sometimes returns in `display_name` and similar fields
+ * (e.g. `Nature Clinical Practice Gastroenterology &#38; Hepatology`). Handles numeric
+ * (`&#38;`), hex (`&#x27E9;`), and the common named entities. The trailing semicolon is
+ * optional — upstream sometimes drops it (`&#38 Hepatology`) and HTML5 parsers tolerate
+ * this; matching strictly would leave malformed entities literal in the output. Unknown or
+ * out-of-range entities pass through unchanged so we never silently corrupt data.
+ */
+function decodeHtmlEntities(input: string): string {
+  if (!input.includes('&')) return input;
+
+  return input.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);?/gi, (match, body: string) => {
+    const lower = body.toLowerCase();
+    if (lower.startsWith('#x')) {
+      return codePointToString(Number.parseInt(lower.slice(2), 16), match);
+    }
+    if (lower.startsWith('#')) {
+      return codePointToString(Number.parseInt(lower.slice(1), 10), match);
+    }
+    return NAMED_HTML_ENTITIES[lower] ?? match;
+  });
+}
+
+/** Recursively decode HTML entities in every string leaf of a JSON value. */
+function deepDecodeHtmlEntities<T>(value: T): T {
+  if (typeof value === 'string') return decodeHtmlEntities(value) as T;
+  if (Array.isArray(value)) return value.map(deepDecodeHtmlEntities) as T;
+  if (isRecord(value)) {
+    const next: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      next[k] = deepDecodeHtmlEntities(v);
+    }
+    return next as T;
+  }
+  return value;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -127,17 +181,37 @@ function hasAbstractInvertedIndex(
 }
 
 function normalizeEntityRecord(record: EntityRecord): EntityRecord {
-  if (!hasAbstractInvertedIndex(record)) return record;
+  if (!hasAbstractInvertedIndex(record)) return deepDecodeHtmlEntities(record);
 
   const { abstract_inverted_index, ...rest } = record;
+  // Decode keys via the reconstructed abstract — `deepDecodeHtmlEntities` only walks
+  // values, so entities living in inverted-index word keys (e.g. `"&amp;"`) would
+  // otherwise survive into the plaintext output.
   return {
-    ...rest,
-    abstract: reconstructAbstract(abstract_inverted_index),
+    ...deepDecodeHtmlEntities(rest),
+    abstract: decodeHtmlEntities(reconstructAbstract(abstract_inverted_index)),
   };
 }
 
 function normalizeEntityRecords(results: EntityRecord[]): EntityRecord[] {
   return results.map(normalizeEntityRecord);
+}
+
+function normalizeAutocompleteRecords(
+  results: AutocompleteResult['results'],
+): AutocompleteResult['results'] {
+  return results.map((r) => deepDecodeHtmlEntities(r));
+}
+
+/**
+ * Translate caller-friendly aliases in `select` to the upstream OpenAlex field name.
+ * `abstract` is reconstructed from `abstract_inverted_index` in the response — the API
+ * itself only accepts the latter — so we accept either on input and forward the upstream
+ * name. Keeps tool ergonomics symmetric with the response shape.
+ */
+function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
+  if (entityType !== 'works') return fields;
+  return fields.map((field) => (field === 'abstract' ? 'abstract_inverted_index' : field));
 }
 
 const MAX_ATTEMPTS = 3;
@@ -316,7 +390,9 @@ class OpenAlexService {
     // Singleton lookup by ID
     if (params.id) {
       const normalizedId = normalizeId(params.id);
-      const queryParams = params.select?.length ? { select: params.select.join(',') } : {};
+      const queryParams = params.select?.length
+        ? { select: translateSelect(params.entityType, params.select).join(',') }
+        : {};
 
       const data = (await this.request(
         `/${params.entityType}/${normalizedId}`,
@@ -347,7 +423,10 @@ class OpenAlexService {
       queryParams.sort = sort;
     }
 
-    const select = params.select?.length ? params.select : DEFAULT_SELECT[params.entityType];
+    const select = translateSelect(
+      params.entityType,
+      params.select?.length ? params.select : DEFAULT_SELECT[params.entityType],
+    );
     if (select.length > 0) {
       queryParams.select = select.join(',');
     }
@@ -402,7 +481,7 @@ class OpenAlexService {
         groups_count: data.meta.groups_count ?? data.group_by?.length ?? null,
         next_cursor: data.meta.next_cursor ?? null,
       },
-      groups: data.group_by ?? [],
+      groups: deepDecodeHtmlEntities(data.group_by ?? []),
     };
   }
 
@@ -428,7 +507,7 @@ class OpenAlexService {
       ? data.results
       : data.results.filter((r) => KNOWN_AUTOCOMPLETE_TYPES.has(r.entity_type));
 
-    return { results };
+    return { results: normalizeAutocompleteRecords(results) };
   }
 }
 

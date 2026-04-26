@@ -4,8 +4,11 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { invalidParams } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
+
+const SEMANTIC_PER_PAGE_CAP = 50;
 
 type Scalar = string | number | boolean;
 type SearchEntityRecord = {
@@ -47,12 +50,46 @@ function isScalarOrNull(value: unknown): value is Scalar | null {
   return value === null || isScalar(value);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function formatScalar(value: Scalar): string {
   return String(value);
 }
 
-function renderJsonField(label: string, value: unknown): string {
-  return `**${label}:**\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+/**
+ * Flatten a value to "path: value" strings, one per scalar leaf. Nested objects use dot
+ * notation (`subfield.display_name`); arrays of scalars collapse to a single comma-joined
+ * pair (`countries: us, gb`); arrays of objects produce one entry per element with bracket
+ * indexing (`institutions[0].id`). All terminal values reach the output — `format()` and
+ * `structuredContent` stay in parity.
+ */
+function flattenLeaves(value: unknown, prefix = ''): string[] {
+  if (value === null || value === undefined) {
+    return prefix ? [`${prefix}: —`] : [];
+  }
+  if (isScalar(value)) {
+    return [prefix ? `${prefix}: ${formatScalar(value)}` : formatScalar(value)];
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [`${prefix || 'value'}: (empty)`];
+    if (value.every(isScalarOrNull)) {
+      const joined = value.map((item) => (item === null ? '—' : formatScalar(item))).join(', ');
+      return [prefix ? `${prefix}: ${joined}` : joined];
+    }
+    return value.flatMap((item, i) => flattenLeaves(item, `${prefix}[${i}]`));
+  }
+  if (isPlainObject(value)) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return prefix ? [`${prefix}: (empty)`] : [];
+    return entries.flatMap(([k, v]) => flattenLeaves(v, prefix ? `${prefix}.${k}` : k));
+  }
+  return [prefix ? `${prefix}: ${String(value)}` : String(value)];
+}
+
+function compactPairs(value: Record<string, unknown>): string {
+  return flattenLeaves(value).join(', ');
 }
 
 function renderField(field: string, value: unknown): string {
@@ -65,9 +102,19 @@ function renderField(field: string, value: unknown): string {
     if (value.every(isScalarOrNull)) {
       return `**${label}:** ${value.map((item) => (item === null ? '—' : formatScalar(item))).join(', ')}`;
     }
+    const items = value.map((item, i) =>
+      isPlainObject(item)
+        ? `- [${i}] ${compactPairs(item)}`
+        : `- [${i}] ${flattenLeaves(item).join(', ') || '—'}`,
+    );
+    return `**${label}:**\n${items.join('\n')}`;
   }
 
-  return renderJsonField(label, value);
+  if (isPlainObject(value)) {
+    return `**${label}:** ${compactPairs(value)}`;
+  }
+
+  return `**${label}:** ${String(value)}`;
 }
 
 function renderRecord(record: SearchEntityRecord): string[] {
@@ -79,6 +126,27 @@ function renderRecord(record: SearchEntityRecord): string[] {
   }
 
   return lines;
+}
+
+function buildSearchEcho(input: {
+  entity_type: string;
+  id?: string | undefined;
+  query?: string | undefined;
+  search_mode?: string | undefined;
+  filters?: Record<string, string> | undefined;
+  sort?: string | undefined;
+}): string {
+  const parts = [`entity_type=${input.entity_type}`];
+  if (input.id) parts.push(`id=${input.id}`);
+  if (input.query) parts.push(`query="${input.query}"`);
+  if (input.search_mode && input.search_mode !== 'keyword') {
+    parts.push(`search_mode=${input.search_mode}`);
+  }
+  if (input.filters && Object.keys(input.filters).length > 0) {
+    parts.push(`filters=${JSON.stringify(input.filters)}`);
+  }
+  if (input.sort) parts.push(`sort=${input.sort}`);
+  return parts.join(' | ');
 }
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
@@ -117,7 +185,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date", "relevance_score" (default when query present).',
+        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date", "relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "relevance_score" or omit sort to keep the most relevant results first.',
       ),
     select: z
       .array(z.string())
@@ -131,7 +199,9 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .max(100)
       .default(25)
-      .describe('Results per page (1-100). Default 25.'),
+      .describe(
+        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream).',
+      ),
     cursor: z
       .string()
       .optional()
@@ -146,6 +216,11 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           .string()
           .nullable()
           .describe('Cursor for next page. null if no more results.'),
+        echo: z
+          .string()
+          .describe(
+            'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — useful when results are empty so callers see what was actually searched.',
+          ),
       })
       .describe('Result metadata including pagination.'),
     results: z
@@ -166,6 +241,13 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   }),
 
   async handler(input, ctx) {
+    if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
+      throw invalidParams(
+        `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
+        { searchMode: input.search_mode, perPage: input.per_page, cap: SEMANTIC_PER_PAGE_CAP },
+      );
+    }
+
     const service = getOpenAlexService();
     const result = await service.search(
       {
@@ -190,20 +272,26 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       totalCount: result.meta.count,
     });
 
-    return result;
+    return {
+      meta: { ...result.meta, echo: buildSearchEcho(input) },
+      results: result.results,
+    };
   },
 
   format: (result) => {
     const lines: string[] = [];
     const countLabel = `${result.meta.count} result(s) — ${result.meta.per_page} per page`;
-    lines.push(
-      result.meta.next_cursor
-        ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
-        : `**${countLabel}**`,
-    );
+    const header = result.meta.next_cursor
+      ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
+      : `**${countLabel}**`;
+    lines.push(`${header} | ${result.meta.echo}`);
 
     if (result.results.length === 0) {
-      lines.push('', 'No matches.');
+      lines.push(
+        '',
+        `No matches for ${result.meta.echo}.`,
+        'Try broadening the query, removing filters, or switching search_mode.',
+      );
       return [{ type: 'text', text: lines.join('\n') }];
     }
 

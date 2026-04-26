@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.3](changelog/0.6.x/0.6.3.md) — 2026-04-26
+
+Field-test issue triage — HTML entity decoding, abstract select alias, dense flat format, empty-result echo, semantic per_page guard, framework ^0.7.5
+
 ## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-04-25
 
 Framework bump to ^0.7.4 — fail-closed Origin guard for HTTP, framework-antipattern devcheck step, literal-variant linter exemption, issue templates

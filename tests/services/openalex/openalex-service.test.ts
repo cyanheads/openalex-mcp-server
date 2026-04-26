@@ -204,6 +204,283 @@ describe('OpenAlexService', () => {
     });
   });
 
+  // --- HTML entity decoding ---
+
+  describe('decodeHtmlEntities', () => {
+    it('decodes numeric entities in display_name', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [
+              {
+                id: 'S1',
+                display_name: 'Nature Clinical Practice Gastroenterology &#38; Hepatology',
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'sources' }, createMockContext());
+
+      expect(result.results[0]).toHaveProperty(
+        'display_name',
+        'Nature Clinical Practice Gastroenterology & Hepatology',
+      );
+    });
+
+    it('decodes malformed entities missing the trailing semicolon (real OpenAlex data)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: 'S1',
+                display_name: 'Nature Clinical Practice Gastroenterology &#38 Hepatology',
+                entity_type: 'source',
+                cited_by_count: 0,
+                works_count: 0,
+                external_id: null,
+                hint: null,
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.autocomplete(
+        { entityType: 'sources', query: 'nature' },
+        createMockContext(),
+      );
+
+      expect(result.results[0]?.display_name).toBe(
+        'Nature Clinical Practice Gastroenterology & Hepatology',
+      );
+    });
+
+    it('decodes hex entities in nested string fields', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [
+              {
+                id: 'W1',
+                display_name: 'Test',
+                primary_location: { source: { raw_source_name: 'Foo &#x27E9; Bar' } },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+
+      const location = result.results[0]?.primary_location as {
+        source: { raw_source_name: string };
+      };
+      expect(location.source.raw_source_name).toBe('Foo ⟩ Bar');
+    });
+
+    it('decodes named entities (&amp; &lt; &gt;) in autocomplete results', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: 'A1',
+                display_name: 'Smith &amp; Jones',
+                entity_type: 'author',
+                cited_by_count: 0,
+                works_count: 0,
+                external_id: null,
+                hint: '&lt;hint&gt;',
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.autocomplete(
+        { entityType: 'authors', query: 'smith' },
+        createMockContext(),
+      );
+
+      expect(result.results[0]).toMatchObject({
+        display_name: 'Smith & Jones',
+        hint: '<hint>',
+      });
+    });
+
+    it('passes through strings with no entities unchanged', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'W1', display_name: 'Plain Title' }],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('Plain Title');
+    });
+
+    it('leaves unknown named entities intact', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'W1', display_name: 'Foo &madeupentity; Bar' }],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('Foo &madeupentity; Bar');
+    });
+
+    it('leaves out-of-range numeric code points intact instead of throwing', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'W1', display_name: 'Decimal &#9999999999; Hex &#xFFFFFF; Done' }],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('Decimal &#9999999999; Hex &#xFFFFFF; Done');
+    });
+
+    it('decodes entities that live in abstract_inverted_index word keys', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [
+              {
+                id: 'W1',
+                display_name: 'Test',
+                abstract_inverted_index: {
+                  Apple: [0],
+                  '&amp;': [1],
+                  Friends: [2],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]).toHaveProperty('abstract', 'Apple & Friends');
+    });
+
+    it('decodes entities in analyze group_by labels', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 100 },
+            group_by: [
+              {
+                key: 'https://openalex.org/I1',
+                key_display_name: 'University &#38; Research Inst',
+                count: 50,
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'authorships.institutions.id' },
+        createMockContext(),
+      );
+      expect(result.groups[0]?.key_display_name).toBe('University & Research Inst');
+    });
+  });
+
+  // --- Select translation (abstract → abstract_inverted_index) ---
+
+  describe('translateSelect', () => {
+    it('rewrites select: ["abstract"] to abstract_inverted_index for works', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', select: ['id', 'display_name', 'abstract'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,abstract_inverted_index',
+      );
+    });
+
+    it('translates abstract on singleton id lookup', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', id: 'W1', select: ['id', 'abstract'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,abstract_inverted_index');
+    });
+
+    it('does not translate abstract for non-works entities', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', select: ['id', 'abstract'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,abstract');
+    });
+
+    it('reconstructs abstract end-to-end when select uses the alias', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [
+              {
+                id: 'W1',
+                display_name: 'Test',
+                abstract_inverted_index: { Hello: [0], world: [1] },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['id', 'abstract'] },
+        createMockContext(),
+      );
+      expect(result.results[0]).toHaveProperty('abstract', 'Hello world');
+      expect(result.results[0]).not.toHaveProperty('abstract_inverted_index');
+    });
+  });
+
   // --- Search params ---
 
   describe('search', () => {
