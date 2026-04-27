@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.4](changelog/0.6.x/0.6.4.md) — 2026-04-27
+
+search_entities — caller-supplied select missing id/display_name no longer breaks output validation; framework ^0.7.5 adoption (vitest projects shape)
+
 ## [0.6.3](changelog/0.6.x/0.6.3.md) — 2026-04-26
 
 Field-test issue triage — HTML entity decoding, abstract select alias, dense flat format, empty-result echo, semantic per_page guard, framework ^0.7.5

@@ -191,7 +191,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error listing the valid ones. Example: ["id", "doi", "display_name", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error listing the valid ones. Example: ["doi", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()

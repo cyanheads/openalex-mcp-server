@@ -440,19 +440,21 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
       await service.search(
-        { entityType: 'works', id: 'W1', select: ['id', 'abstract'] },
+        { entityType: 'works', id: 'W1', select: ['id', 'display_name', 'abstract'] },
         createMockContext(),
       );
-      expect(lastFetchUrl().searchParams.get('select')).toBe('id,abstract_inverted_index');
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,abstract_inverted_index',
+      );
     });
 
     it('does not translate abstract for non-works entities', async () => {
       const service = await getService();
       await service.search(
-        { entityType: 'authors', select: ['id', 'abstract'] },
+        { entityType: 'authors', select: ['id', 'display_name', 'abstract'] },
         createMockContext(),
       );
-      expect(lastFetchUrl().searchParams.get('select')).toBe('id,abstract');
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,abstract');
     });
 
     it('reconstructs abstract end-to-end when select uses the alias', async () => {
@@ -473,11 +475,52 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
       const result = await service.search(
-        { entityType: 'works', select: ['id', 'abstract'] },
+        { entityType: 'works', select: ['id', 'display_name', 'abstract'] },
         createMockContext(),
       );
       expect(result.results[0]).toHaveProperty('abstract', 'Hello world');
       expect(result.results[0]).not.toHaveProperty('abstract_inverted_index');
+    });
+  });
+
+  // --- Required-field injection (regression: gh #11) ---
+
+  describe('select required-field injection', () => {
+    it('prepends id and display_name when caller-supplied select omits them (search path)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', query: 'rag', select: ['doi', 'title', 'publication_year'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,doi,title,publication_year',
+      );
+    });
+
+    it('prepends id and display_name on singleton id-lookup path', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test', doi: 'd' }), {
+          status: 200,
+        }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'works', id: 'W1', select: ['doi'] }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,doi');
+    });
+
+    it('does not duplicate id or display_name when caller already includes them', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', select: ['id', 'display_name', 'doi'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,doi');
+    });
+
+    it('injects display_name when caller supplies only id', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'authors', select: ['id', 'orcid'] }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,orcid');
     });
   });
 

@@ -204,14 +204,23 @@ function normalizeAutocompleteRecords(
 }
 
 /**
- * Translate caller-friendly aliases in `select` to the upstream OpenAlex field name.
+ * Fields the output schema declares as required on every result item. Always prepended
+ * to caller-supplied `select` so the upstream projection can't drop them and break
+ * output validation downstream of a successful API call.
+ */
+const REQUIRED_SEARCH_FIELDS = ['id', 'display_name'] as const;
+
+/**
+ * Translate caller-friendly aliases in `select` to the upstream OpenAlex field name and
+ * guarantee the schema-required fields (`id`, `display_name`) are always projected.
  * `abstract` is reconstructed from `abstract_inverted_index` in the response — the API
  * itself only accepts the latter — so we accept either on input and forward the upstream
  * name. Keeps tool ergonomics symmetric with the response shape.
  */
 function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
-  if (entityType !== 'works') return fields;
-  return fields.map((field) => (field === 'abstract' ? 'abstract_inverted_index' : field));
+  const withRequired = Array.from(new Set([...REQUIRED_SEARCH_FIELDS, ...fields]));
+  if (entityType !== 'works') return withRequired;
+  return withRequired.map((field) => (field === 'abstract' ? 'abstract_inverted_index' : field));
 }
 
 const MAX_ATTEMPTS = 3;
