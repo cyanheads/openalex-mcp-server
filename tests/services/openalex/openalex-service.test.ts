@@ -683,6 +683,27 @@ describe('OpenAlexService', () => {
         code: JsonRpcErrorCode.InvalidParams,
         message:
           'abstract is not a valid select field. Valid fields for select are: id, doi, title, abstract_inverted_index.',
+        data: { reason: 'upstream_invalid_params' },
+      });
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('surfaces OpenAlex 422 responses as validation errors', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ message: 'Filter value out of range.' }), {
+          status: 422,
+          statusText: 'Unprocessable Entity',
+        }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: 'Filter value out of range.',
+        data: { reason: 'upstream_validation_failed' },
       });
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
@@ -697,6 +718,7 @@ describe('OpenAlexService', () => {
       const rejection = expect(promise).rejects.toMatchObject({
         code: JsonRpcErrorCode.RateLimited,
         message: expect.stringMatching(/Status: 429/),
+        data: { reason: 'rate_limited' },
       });
 
       await vi.runAllTimersAsync();
@@ -720,11 +742,12 @@ describe('OpenAlexService', () => {
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         message: 'No entity found for W404.',
+        data: { reason: 'entity_not_found' },
       });
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('maps other 4xx responses to invalidParams without retrying', async () => {
+    it('maps other 4xx responses to invalidRequest without retrying', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ message: 'Payload too large for this endpoint.' }), {
           status: 413,
@@ -737,8 +760,9 @@ describe('OpenAlexService', () => {
       await expect(
         service.search({ entityType: 'works' }, createMockContext()),
       ).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
+        code: JsonRpcErrorCode.InvalidRequest,
         message: 'Payload too large for this endpoint.',
+        data: { reason: 'upstream_invalid_request' },
       });
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });

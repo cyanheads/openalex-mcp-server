@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -13,6 +14,44 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/analyze-trends.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  errors: [
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'OpenAlex throttled the request (HTTP 429).',
+      retryable: true,
+      recovery:
+        'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_unauthorized',
+      code: JsonRpcErrorCode.Unauthorized,
+      when: 'OpenAlex rejected the API key (HTTP 401).',
+      recovery:
+        'Check that OPENALEX_API_KEY is set to a valid email-format key registered with OpenAlex.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'OpenAlex denied access to the requested resource (HTTP 403).',
+      recovery:
+        'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+    },
+    {
+      reason: 'upstream_invalid_params',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
+      recovery:
+        'Check that group_by names a valid field and that filter syntax matches the OpenAlex docs.',
+    },
+    {
+      reason: 'upstream_validation_failed',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
+      recovery:
+        'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
+    },
+  ],
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Entity type to aggregate.'),
     group_by: z

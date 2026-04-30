@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { invalidParams } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -155,6 +155,56 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  errors: [
+    {
+      reason: 'semantic_per_page_cap',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: `per_page exceeds the semantic-search cap of ${SEMANTIC_PER_PAGE_CAP}.`,
+      recovery: `Reduce per_page to ${SEMANTIC_PER_PAGE_CAP} or less, or switch search_mode to keyword.`,
+    },
+    {
+      reason: 'entity_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Lookup by id matched no OpenAlex entity.',
+      recovery: 'Verify the ID format or call openalex_resolve_name to find the correct ID.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'OpenAlex throttled the request (HTTP 429).',
+      retryable: true,
+      recovery:
+        'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_unauthorized',
+      code: JsonRpcErrorCode.Unauthorized,
+      when: 'OpenAlex rejected the API key (HTTP 401).',
+      recovery:
+        'Check that OPENALEX_API_KEY is set to a valid email-format key registered with OpenAlex.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'OpenAlex denied access to the requested resource (HTTP 403).',
+      recovery:
+        'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+    },
+    {
+      reason: 'upstream_invalid_params',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected the request as malformed (HTTP 400).',
+      recovery:
+        'Check filter syntax, sort field, and select field names against the OpenAlex documentation.',
+    },
+    {
+      reason: 'upstream_validation_failed',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
+      recovery:
+        'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
+    },
+  ],
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
     id: z
@@ -242,9 +292,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
 
   async handler(input, ctx) {
     if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
-      throw invalidParams(
+      throw ctx.fail(
+        'semantic_per_page_cap',
         `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-        { searchMode: input.search_mode, perPage: input.per_page, cap: SEMANTIC_PER_PAGE_CAP },
+        {
+          ...ctx.recoveryFor('semantic_per_page_cap'),
+          searchMode: input.search_mode,
+          perPage: input.per_page,
+          cap: SEMANTIC_PER_PAGE_CAP,
+        },
       );
     }
 

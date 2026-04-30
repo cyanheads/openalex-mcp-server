@@ -116,7 +116,7 @@ describe('searchEntitiesTool', () => {
   });
 
   it('rejects per_page > 50 with semantic search before calling upstream', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: searchEntitiesTool.errors });
     const input = searchEntitiesTool.input.parse({
       entity_type: 'works',
       query: 'climate',
@@ -126,6 +126,7 @@ describe('searchEntitiesTool', () => {
 
     await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
       message: expect.stringMatching(/at most 50/i),
+      data: expect.objectContaining({ reason: 'semantic_per_page_cap' }),
     });
     expect(mockSearch).not.toHaveBeenCalled();
   });

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.5](changelog/0.6.x/0.6.5.md) — 2026-04-30
+
+Adopt @cyanheads/mcp-ts-core 0.7.5 → 0.8.7: typed error contracts on every tool, service-layer reason carrying via ctx.recoveryFor, httpStatusToErrorCode replaces manual status mapping (fixes 422 → ValidationError, other 4xx → InvalidRequest)
+
 ## [0.6.4](changelog/0.6.x/0.6.4.md) — 2026-04-27
 
 search_entities — caller-supplied select missing id/display_name no longer breaks output validation; framework ^0.7.5 adoption (vitest projects shape)

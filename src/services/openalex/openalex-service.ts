@@ -8,15 +8,18 @@ import {
   conflict,
   forbidden,
   invalidParams,
+  invalidRequest,
+  JsonRpcErrorCode,
   McpError,
   notFound,
   rateLimited,
   serviceUnavailable,
   timeout,
   unauthorized,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -228,6 +231,42 @@ const BASE_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace(/s$/, '')));
 
+type ErrorFactory = (
+  message: string,
+  data?: Record<string, unknown>,
+  options?: ErrorOptions,
+) => McpError;
+
+/**
+ * `JsonRpcErrorCode` → `{ factory, reason }` for shaping normalized OpenAlex throws.
+ * Driven by `httpStatusToErrorCode` so the status-table stays in lockstep with the
+ * framework. `reason` is the literal carried on `data.reason` and matched against
+ * tool contracts via `ctx.recoveryFor`.
+ */
+const NORMALIZED_THROW_BY_CODE: Partial<
+  Record<JsonRpcErrorCode, { factory: ErrorFactory; reason: string }>
+> = {
+  [JsonRpcErrorCode.InvalidParams]: { factory: invalidParams, reason: 'upstream_invalid_params' },
+  [JsonRpcErrorCode.InvalidRequest]: {
+    factory: invalidRequest,
+    reason: 'upstream_invalid_request',
+  },
+  [JsonRpcErrorCode.Unauthorized]: { factory: unauthorized, reason: 'upstream_unauthorized' },
+  [JsonRpcErrorCode.Forbidden]: { factory: forbidden, reason: 'upstream_forbidden' },
+  [JsonRpcErrorCode.NotFound]: { factory: notFound, reason: 'entity_not_found' },
+  [JsonRpcErrorCode.Timeout]: { factory: timeout, reason: 'upstream_timeout' },
+  [JsonRpcErrorCode.Conflict]: { factory: conflict, reason: 'upstream_conflict' },
+  [JsonRpcErrorCode.ValidationError]: {
+    factory: validationError,
+    reason: 'upstream_validation_failed',
+  },
+  [JsonRpcErrorCode.RateLimited]: { factory: rateLimited, reason: 'rate_limited' },
+  [JsonRpcErrorCode.ServiceUnavailable]: {
+    factory: serviceUnavailable,
+    reason: 'upstream_unavailable',
+  },
+};
+
 function hasEntries(record?: Record<string, string>): record is Record<string, string> {
   return record !== undefined && Object.keys(record).length > 0;
 }
@@ -310,7 +349,7 @@ class OpenAlexService {
           const text = await response.text();
           return this.parseResponse(text, path);
         } catch (error) {
-          this.throwNormalizedRequestError(error, path);
+          this.throwNormalizedRequestError(error, path, ctx);
         }
       },
       {
@@ -323,46 +362,34 @@ class OpenAlexService {
     );
   }
 
-  private throwNormalizedRequestError(error: unknown, path: string): never {
+  private throwNormalizedRequestError(error: unknown, path: string, ctx: Context): never {
     if (!(error instanceof McpError) || typeof error.data?.statusCode !== 'number') {
       throw error;
     }
 
-    const statusCode = error.data.statusCode;
+    const code = httpStatusToErrorCode(error.data.statusCode);
+    const normalized = code === undefined ? undefined : NORMALIZED_THROW_BY_CODE[code];
+    if (normalized === undefined) {
+      throw error;
+    }
+
+    const { factory, reason } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data.responseBody);
-    const message = upstream?.message ?? error.message;
+    const message =
+      code === JsonRpcErrorCode.NotFound
+        ? (upstream?.message ?? `Entity not found at ${path}`)
+        : (upstream?.message ?? error.message);
+
     const data = {
       ...error.data,
       path,
+      reason,
+      ...ctx.recoveryFor(reason),
       ...(upstream?.error ? { upstreamError: upstream.error } : {}),
       ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
     };
-    const rethrow = (factory: typeof invalidParams, nextMessage = message): never => {
-      throw factory(nextMessage, data, { cause: error });
-    };
 
-    switch (statusCode) {
-      case 400:
-      case 422:
-        return rethrow(invalidParams);
-      case 401:
-        return rethrow(unauthorized);
-      case 403:
-        return rethrow(forbidden);
-      case 404:
-        return rethrow(notFound, upstream?.message ?? `Entity not found at ${path}`);
-      case 408:
-        return rethrow(timeout);
-      case 409:
-        return rethrow(conflict);
-      case 429:
-        return rethrow(rateLimited);
-      default:
-        if (statusCode >= 400 && statusCode < 500) {
-          return rethrow(invalidParams);
-        }
-        throw error;
-    }
+    throw factory(message, data, { cause: error });
   }
 
   private parseResponse<T>(text: string, path: string): T {
@@ -370,24 +397,32 @@ class OpenAlexService {
     const responsePreview = trimmed.slice(0, 200);
 
     if (!trimmed) {
-      throw serviceUnavailable(`OpenAlex API returned an empty response for ${path}`, { path });
+      throw serviceUnavailable(`OpenAlex API returned an empty response for ${path}`, {
+        path,
+        reason: 'upstream_unavailable',
+      });
     }
 
     if (/^<(!DOCTYPE\s+html|html[\s>])/i.test(trimmed)) {
       throw serviceUnavailable(`OpenAlex API returned HTML instead of JSON for ${path}`, {
         path,
         responsePreview,
+        reason: 'upstream_unavailable',
       });
     }
 
     try {
       return JSON.parse(trimmed) as T;
     } catch (error) {
+      // Treated as ServiceUnavailable (not SerializationError) so withRetry's
+      // transient set picks it up — OpenAlex truncates responses under load and
+      // the next attempt usually succeeds.
       throw serviceUnavailable(
         `OpenAlex API returned invalid JSON for ${path}`,
         {
           path,
           responsePreview,
+          reason: 'upstream_unavailable',
         },
         { cause: error },
       );

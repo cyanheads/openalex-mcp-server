@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.6.4
+**Version:** 0.6.5
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -137,31 +137,44 @@ Handlers receive a unified `ctx` object. Key properties:
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
 | `ctx.signal` | `AbortSignal` for cancellation. Passed to `fetch()` in the OpenAlex service. |
 | `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.list(prefix, { cursor, limit })`. Not currently used but available. |
+| `ctx.fail` | Typed throw keyed by a declared `errors[]` contract — `ctx.fail(reason, msg?, data?)`. Auto-populates `data.reason` and resolves `code` from the contract. |
+| `ctx.recoveryFor` | Opt-in resolver returning `{ recovery: { hint } }` for a declared reason. Spread into `data` at throw site to surface contract recovery on the wire. |
 | `ctx.requestId` | Unique request ID. |
-| `ctx.tenantId` | Tenant ID from JWT or `'default'` for stdio. |
+| `ctx.tenantId` | `'default'` for stdio and `MCP_AUTH_MODE=none` over HTTP; JWT `tid` claim for `MCP_AUTH_MODE=jwt`/`oauth`. |
 
 ---
 
 ## Errors
 
-Handlers throw — the framework catches, classifies, and formats. Three escalation levels:
+Handlers throw — the framework catches, classifies, and formats.
+
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable? }]` on `tool()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union — `ctx.fail('typo')` is a TS error, `data.reason` is auto-populated, and the linter enforces conformance against the handler. The `recovery` field is required (≥5 words). Spread `ctx.recoveryFor('reason')` into `data` to opt the contract recovery onto the wire.
 
 ```ts
-// 1. Plain Error — framework auto-classifies from message patterns
-throw new Error('Item not found');           // → NotFound
-throw new Error('Invalid query format');     // → ValidationError
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
-// 2. Error factories — explicit code, concise
-import { notFound, validationError, forbidden, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-throw notFound('Item not found', { itemId });
-throw serviceUnavailable('API unavailable', { url }, { cause: err });
-
-// 3. McpError — full control over code and data
-import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-throw new McpError(JsonRpcErrorCode.DatabaseError, 'Connection failed', { pool: 'primary' });
+errors: [
+  { reason: 'semantic_per_page_cap', code: JsonRpcErrorCode.InvalidParams,
+    when: 'per_page exceeds the semantic-search cap',
+    recovery: 'Reduce per_page to 50 or less, or switch search_mode to keyword.' },
+],
+async handler(input, ctx) {
+  if (overCap) throw ctx.fail('semantic_per_page_cap', message, { ...ctx.recoveryFor('semantic_per_page_cap') });
+}
 ```
 
-Plain `Error` is fine for most cases. Use factories when the error code matters. See framework CLAUDE.md for the full auto-classification table and all available factories.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes; those bubble through and are auto-classified. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`) bubble freely without needing to be declared on a contract.
+
+**Fallback for ad-hoc throws:** error factories or plain `Error`.
+
+```ts
+import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+throw notFound('Item not found', { itemId });
+throw serviceUnavailable('API unavailable', { url }, { cause: err });
+throw new Error('Item not found');           // → auto-classified to NotFound
+```
+
+See framework CLAUDE.md for the full auto-classification table and all available factories.
 
 ---
 
@@ -251,10 +264,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting |
 | `bun run lint:mcp` | Validate MCP tool/prompt definitions |
 | `bun run test` | Run tests |
-| `bun run dev:stdio` | Dev mode (stdio) |
-| `bun run dev:http` | Dev mode (HTTP) |
-| `bun run start:stdio` | Production mode (stdio) |
-| `bun run start:http` | Production mode (HTTP) |
+| `bun run start:stdio` | Production mode (stdio, after `rebuild`) |
+| `bun run start:http` | Production mode (HTTP, after `rebuild`) |
 
 ---
 
