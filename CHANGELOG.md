@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.6](changelog/0.6.x/0.6.6.md) — 2026-05-01
+
+search_entities — coerce bare relevance_score sort to descending so OpenAlex stops rejecting it; document that relevance_score requires an active search
+
 ## [0.6.5](changelog/0.6.x/0.6.5.md) — 2026-04-30
 
 Adopt @cyanheads/mcp-ts-core 0.7.5 → 0.8.7: typed error contracts on every tool, service-layer reason carrying via ctx.recoveryFor, httpStatusToErrorCode replaces manual status mapping (fixes 422 → ValidationError, other 4xx → InvalidRequest)

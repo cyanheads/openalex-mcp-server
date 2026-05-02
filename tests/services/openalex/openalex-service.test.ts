@@ -575,6 +575,36 @@ describe('OpenAlexService', () => {
       expect(url.searchParams.get('cursor')).toBe('abc');
     });
 
+    it('passes a bare sort field unchanged (ascending default)', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sort: 'publication_date' }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('publication_date');
+    });
+
+    it('coerces bare relevance_score to descending', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', query: 'climate', sort: 'relevance_score' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('relevance_score:desc');
+    });
+
+    it('passes -relevance_score as relevance_score:desc', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', query: 'climate', sort: '-relevance_score' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('relevance_score:desc');
+    });
+
+    it('omits the sort param when no sort is provided', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works' }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('sort')).toBe(false);
+    });
+
     it('wraps single entity in standard response shape', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ id: 'W1', display_name: 'Solo Paper' }), { status: 200 }),

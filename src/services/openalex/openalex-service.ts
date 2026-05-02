@@ -302,7 +302,9 @@ function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
 
 function normalizeSort(sort?: string): string | undefined {
   if (!sort) return;
-  return sort.startsWith('-') ? `${sort.slice(1)}:desc` : sort;
+  if (sort.startsWith('-')) return `${sort.slice(1)}:desc`;
+  if (sort === 'relevance_score') return 'relevance_score:desc';
+  return sort;
 }
 
 function toRequestContext(ctx: Context, operation: string): RequestContext {

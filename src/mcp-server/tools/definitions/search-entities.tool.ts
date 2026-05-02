@@ -235,7 +235,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date", "relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "relevance_score" or omit sort to keep the most relevant results first.',
+        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail.',
       ),
     select: z
       .array(z.string())
