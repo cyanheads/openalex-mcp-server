@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.7](changelog/0.6.x/0.6.7.md) — 2026-05-03
+
+Maintenance: pick up @cyanheads/mcp-ts-core 0.8.7 → 0.8.12, biome 2.4.13 → 2.4.14, tsc-alias 1.8.16 → 1.8.17; resync 7 framework skills + add api-canvas reference. No tool/service code changes.
+
 ## [0.6.6](changelog/0.6.x/0.6.6.md) — 2026-05-01
 
 search_entities — coerce bare relevance_score sort to descending so OpenAlex stops rejecting it; document that relevance_score requires an active search
