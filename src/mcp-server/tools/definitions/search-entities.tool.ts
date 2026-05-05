@@ -9,6 +9,7 @@ import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 const SEMANTIC_PER_PAGE_CAP = 50;
+const SAMPLE_MAX = 100;
 
 type Scalar = string | number | boolean;
 type SearchEntityRecord = {
@@ -135,6 +136,8 @@ function buildSearchEcho(input: {
   search_mode?: string | undefined;
   filters?: Record<string, string> | undefined;
   sort?: string | undefined;
+  sample?: number | undefined;
+  seed?: string | undefined;
 }): string {
   const parts = [`entity_type=${input.entity_type}`];
   if (input.id) parts.push(`id=${input.id}`);
@@ -146,6 +149,8 @@ function buildSearchEcho(input: {
     parts.push(`filters=${JSON.stringify(input.filters)}`);
   }
   if (input.sort) parts.push(`sort=${input.sort}`);
+  if (input.sample !== undefined) parts.push(`sample=${input.sample}`);
+  if (input.seed !== undefined) parts.push(`seed=${input.seed}`);
   return parts.join(' | ');
 }
 
@@ -158,9 +163,21 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   errors: [
     {
       reason: 'semantic_per_page_cap',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: `per_page exceeds the semantic-search cap of ${SEMANTIC_PER_PAGE_CAP}.`,
       recovery: `Reduce per_page to ${SEMANTIC_PER_PAGE_CAP} or less, or switch search_mode to keyword.`,
+    },
+    {
+      reason: 'sample_with_cursor',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Both `sample` and `cursor` were provided.',
+      recovery: 'Sampling returns a single page only; remove `cursor` or remove `sample`.',
+    },
+    {
+      reason: 'seed_without_sample',
+      code: JsonRpcErrorCode.ValidationError,
+      when: '`seed` was provided without `sample`.',
+      recovery: 'Pass `sample` to enable random sampling, or remove `seed`.',
     },
     {
       reason: 'entity_not_found',
@@ -229,7 +246,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate. Use OpenAlex IDs (not names) for entity filters — resolve names first.',
+        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
       ),
     sort: z
       .string()
@@ -256,6 +273,21 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe('Pagination cursor from a previous response. Pass to get the next page.'),
+    sample: z
+      .number()
+      .int()
+      .min(1)
+      .max(SAMPLE_MAX)
+      .optional()
+      .describe(
+        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — pagination via \`cursor\` is not supported with sampling. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
+      ),
+    seed: z
+      .string()
+      .optional()
+      .describe(
+        'Deterministic seed for `sample`. Same seed + same filters = same results — pass when reproducibility matters. Has no effect (and is rejected) without `sample`.',
+      ),
   }),
   output: z.object({
     meta: z
@@ -304,6 +336,22 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       );
     }
 
+    if (input.sample !== undefined && input.cursor !== undefined) {
+      throw ctx.fail(
+        'sample_with_cursor',
+        'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
+        { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
+      );
+    }
+
+    if (input.seed !== undefined && input.sample === undefined) {
+      throw ctx.fail(
+        'seed_without_sample',
+        '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
+        { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
+      );
+    }
+
     const service = getOpenAlexService();
     const result = await service.search(
       {
@@ -316,6 +364,8 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         select: input.select,
         perPage: input.per_page,
         cursor: input.cursor,
+        sample: input.sample,
+        seed: input.seed,
       },
       ctx,
     );

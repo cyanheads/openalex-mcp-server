@@ -214,6 +214,28 @@ function normalizeAutocompleteRecords(
 const REQUIRED_SEARCH_FIELDS = ['id', 'display_name'] as const;
 
 /**
+ * Works-only `select` field aliases. LLM callers reach for intuitive names that don't match
+ * OpenAlex's vocabulary; renaming on the way out keeps tool ergonomics aligned with caller
+ * priors. Pure key renames — no value transformation. Canonical names pass through unchanged.
+ */
+const SELECT_ALIASES_WORKS: Record<string, string> = {
+  abstract: 'abstract_inverted_index',
+  authors: 'authorships',
+  year: 'publication_year',
+};
+
+/**
+ * Works-only `filter` key aliases. Same shape as `SELECT_ALIASES_WORKS` — LLM callers reach
+ * for `cited_works` (the semantic phrasing) and `year` (universal in REST), neither of which
+ * upstream accepts. Renames are fail-open: misses pass through to upstream and surface its
+ * helpful 400 with the valid-field list.
+ */
+const FILTER_ALIASES_WORKS: Record<string, string> = {
+  cited_works: 'cites',
+  year: 'publication_year',
+};
+
+/**
  * Translate caller-friendly aliases in `select` to the upstream OpenAlex field name and
  * guarantee the schema-required fields (`id`, `display_name`) are always projected.
  * `abstract` is reconstructed from `abstract_inverted_index` in the response — the API
@@ -223,7 +245,44 @@ const REQUIRED_SEARCH_FIELDS = ['id', 'display_name'] as const;
 function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
   const withRequired = Array.from(new Set([...REQUIRED_SEARCH_FIELDS, ...fields]));
   if (entityType !== 'works') return withRequired;
-  return withRequired.map((field) => (field === 'abstract' ? 'abstract_inverted_index' : field));
+  return withRequired.map((field) => SELECT_ALIASES_WORKS[field] ?? field);
+}
+
+/**
+ * Match a single bare or URL-form OpenAlex ID. Combined with pipe-splitting in
+ * `isOpenAlexFilterValue` to detect OR-joined ID lists.
+ */
+const OPENALEX_ID_VALUE_PATTERN = /^(?:https:\/\/openalex\.org\/)?[WAISTKPFCG]\d+$/;
+
+/**
+ * Detect a value the `id:` filter would carry — a bare or URL-form OpenAlex ID, optionally
+ * pipe-joined for OR semantics. When matched, we rewrite `id` → `openalex` (the canonical
+ * filter key); the URL form passes through unchanged because upstream accepts both.
+ * Stricter than a single regex so a future generic upstream `id:` filter wouldn't be shadowed
+ * by our rewrite — only values that look like OpenAlex IDs get redirected.
+ */
+function isOpenAlexFilterValue(value: string): boolean {
+  return value.split('|').every((seg) => OPENALEX_ID_VALUE_PATTERN.test(seg));
+}
+
+/**
+ * Rewrite caller-supplied filter keys to the upstream OpenAlex names. Works-only key map plus
+ * a universal `id` → `openalex` rewrite when the value looks like an OpenAlex ID. Values pass
+ * through unchanged. Misses fall through so upstream's 400 with the valid-field list still
+ * fires for typos no map can preempt.
+ */
+function translateFilters(
+  entityType: SearchParams['entityType'],
+  filters: Record<string, string>,
+): Record<string, string> {
+  const aliases = entityType === 'works' ? FILTER_ALIASES_WORKS : undefined;
+  const out: Record<string, string> = {};
+  for (const [rawKey, value] of Object.entries(filters)) {
+    const aliased = aliases?.[rawKey] ?? rawKey;
+    const finalKey = aliased === 'id' && isOpenAlexFilterValue(value) ? 'openalex' : aliased;
+    out[finalKey] = value;
+  }
+  return out;
 }
 
 const MAX_ATTEMPTS = 3;
@@ -460,7 +519,7 @@ class OpenAlexService {
     }
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(params.filters);
+      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
     }
 
     const sort = normalizeSort(params.sort);
@@ -477,10 +536,21 @@ class OpenAlexService {
       queryParams.select = select.join(',');
     }
 
-    queryParams.per_page = String(params.perPage ?? 25);
+    // Sampling overrides per_page — upstream truncates results at per_page even when
+    // sample is larger, which silently drops samples the caller asked for. Aligning the
+    // two means callers get exactly `sample` results in a single page.
+    if (params.sample !== undefined) {
+      queryParams.sample = String(params.sample);
+      queryParams.per_page = String(params.sample);
+      if (params.seed !== undefined) queryParams.seed = params.seed;
+    } else {
+      queryParams.per_page = String(params.perPage ?? 25);
+    }
 
-    // Semantic search doesn't support cursor pagination — use page/per_page only
-    if (params.searchMode !== 'semantic') {
+    // Semantic search doesn't support cursor pagination — use page/per_page only.
+    // Sampling returns one page only — cursor is mutually exclusive (enforced at the tool
+    // layer; the service never sends both).
+    if (params.searchMode !== 'semantic' && params.sample === undefined) {
       queryParams.cursor = params.cursor ?? '*';
     }
 
@@ -507,7 +577,7 @@ class OpenAlexService {
       : params.groupBy;
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(params.filters);
+      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
     }
 
     // Only send cursor when explicitly provided — boolean group_by fields

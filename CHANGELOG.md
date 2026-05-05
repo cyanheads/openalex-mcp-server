@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.8](changelog/0.6.x/0.6.8.md) — 2026-05-05
+
+search_entities — random sampling via sample/seed (#14); alias common LLM-prior field/filter names to OpenAlex canonical names (#17).
+
 ## [0.6.7](changelog/0.6.x/0.6.7.md) — 2026-05-03
 
 Maintenance: pick up @cyanheads/mcp-ts-core 0.8.7 → 0.8.12, biome 2.4.13 → 2.4.14, tsc-alias 1.8.16 → 1.8.17; resync 7 framework skills + add api-canvas reference. No tool/service code changes.

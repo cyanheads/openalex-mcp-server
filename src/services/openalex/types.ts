@@ -84,7 +84,9 @@ export interface SearchParams {
   id?: string | undefined;
   perPage?: number | undefined;
   query?: string | undefined;
+  sample?: number | undefined;
   searchMode?: 'keyword' | 'exact' | 'semantic' | undefined;
+  seed?: string | undefined;
   select?: string[] | undefined;
   sort?: string | undefined;
 }

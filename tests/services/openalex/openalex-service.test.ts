@@ -420,7 +420,7 @@ describe('OpenAlexService', () => {
     });
   });
 
-  // --- Select translation (abstract → abstract_inverted_index) ---
+  // --- Select translation (abstract → abstract_inverted_index, year → publication_year, …) ---
 
   describe('translateSelect', () => {
     it('rewrites select: ["abstract"] to abstract_inverted_index for works', async () => {
@@ -431,6 +431,17 @@ describe('OpenAlexService', () => {
       );
       expect(lastFetchUrl().searchParams.get('select')).toBe(
         'id,display_name,abstract_inverted_index',
+      );
+    });
+
+    it('rewrites year → publication_year and authors → authorships for works', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', select: ['id', 'display_name', 'year', 'authors'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,publication_year,authorships',
       );
     });
 
@@ -457,6 +468,15 @@ describe('OpenAlexService', () => {
       expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,abstract');
     });
 
+    it('does not translate year on non-works entities', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', select: ['id', 'display_name', 'year'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,year');
+    });
+
     it('reconstructs abstract end-to-end when select uses the alias', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(
@@ -480,6 +500,158 @@ describe('OpenAlexService', () => {
       );
       expect(result.results[0]).toHaveProperty('abstract', 'Hello world');
       expect(result.results[0]).not.toHaveProperty('abstract_inverted_index');
+    });
+  });
+
+  // --- Filter key translation (gh #17) ---
+
+  describe('translateFilters', () => {
+    function filterParam(): string {
+      return lastFetchUrl().searchParams.get('filter') ?? '';
+    }
+
+    it('rewrites cited_works → cites for works', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { cited_works: 'W2741809807' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('cites:W2741809807');
+    });
+
+    it('rewrites year → publication_year for works (range value passes through)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { year: '2020-2024' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('publication_year:2020-2024');
+    });
+
+    it('rewrites id → openalex when value is a bare OpenAlex ID', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { id: 'W2741809807' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:W2741809807');
+    });
+
+    it('rewrites id → openalex for pipe-joined OpenAlex IDs', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { id: 'W123|W456|W789' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:W123|W456|W789');
+    });
+
+    it('rewrites id → openalex when value is a URL-form OpenAlex ID', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { id: 'https://openalex.org/W2741809807' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:https://openalex.org/W2741809807');
+    });
+
+    it('rewrites id → openalex universally (works on non-works entities too)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', filters: { id: 'A1234567890' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:A1234567890');
+    });
+
+    it('does not rewrite id when the value is not an OpenAlex ID (fail-open)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { id: 'not-an-openalex-id' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('id:not-an-openalex-id');
+    });
+
+    it('does not rewrite cited_works on non-works entities (fail-open to upstream)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', filters: { cited_works: 'W123' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('cited_works:W123');
+    });
+
+    it('passes canonical filter keys through unchanged', async () => {
+      const service = await getService();
+      await service.search(
+        {
+          entityType: 'works',
+          filters: { publication_year: '2024', cites: 'W123', is_oa: 'true' },
+        },
+        createMockContext(),
+      );
+      const filter = filterParam();
+      expect(filter).toContain('publication_year:2024');
+      expect(filter).toContain('cites:W123');
+      expect(filter).toContain('is_oa:true');
+    });
+
+    it('also applies aliases on the analyze path', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'oa_status',
+          filters: { year: '2024', id: 'W123' },
+        },
+        createMockContext(),
+      );
+      const filter = filterParam();
+      expect(filter).toContain('publication_year:2024');
+      expect(filter).toContain('openalex:W123');
+    });
+  });
+
+  // --- Random sampling (gh #14) ---
+
+  describe('sample and seed', () => {
+    it('passes sample as a query param and aligns per_page to it', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sample: 7 }, createMockContext());
+      const url = lastFetchUrl();
+      expect(url.searchParams.get('sample')).toBe('7');
+      expect(url.searchParams.get('per_page')).toBe('7');
+    });
+
+    it('omits cursor when sample is set (single-page contract)', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sample: 5 }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+    });
+
+    it('passes seed when sample is set', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sample: 3, seed: 'abc' }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('seed')).toBe('abc');
+    });
+
+    it('overrides caller-supplied per_page when sample is set', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sample: 5, perPage: 25 }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('per_page')).toBe('5');
+    });
+
+    it('does not send sample/seed when sample is undefined', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works' }, createMockContext());
+      const url = lastFetchUrl();
+      expect(url.searchParams.has('sample')).toBe(false);
+      expect(url.searchParams.has('seed')).toBe(false);
+      expect(url.searchParams.get('cursor')).toBe('*');
     });
   });
 

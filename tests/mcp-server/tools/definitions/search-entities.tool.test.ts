@@ -145,6 +145,75 @@ describe('searchEntitiesTool', () => {
     expect(mockSearch).toHaveBeenCalled();
   });
 
+  describe('sample and seed (gh #14)', () => {
+    it('passes sample and seed through to the service', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        sample: 5,
+        seed: 'reproducible',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ sample: 5, seed: 'reproducible' }),
+        ctx,
+      );
+    });
+
+    it('rejects sample + cursor with sample_with_cursor before calling upstream', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        sample: 5,
+        cursor: 'abc',
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        message: expect.stringMatching(/sample.*cursor|one page only/i),
+        data: expect.objectContaining({ reason: 'sample_with_cursor' }),
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('rejects seed without sample with seed_without_sample before calling upstream', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        seed: 'abc',
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        message: expect.stringMatching(/seed.*sample/i),
+        data: expect.objectContaining({ reason: 'seed_without_sample' }),
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('rejects sample > 100 at the schema layer', () => {
+      expect(() => searchEntitiesTool.input.parse({ entity_type: 'works', sample: 101 })).toThrow();
+    });
+
+    it('rejects sample < 1 at the schema layer', () => {
+      expect(() => searchEntitiesTool.input.parse({ entity_type: 'works', sample: 0 })).toThrow();
+    });
+
+    it('surfaces sample and seed in the echo', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        sample: 10,
+        seed: 'xyz',
+      });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+      expect(result.meta.echo).toContain('sample=10');
+      expect(result.meta.echo).toContain('seed=xyz');
+    });
+  });
+
   describe('format', () => {
     type ToolOutput = SearchResult & { meta: SearchResult['meta'] & { echo: string } };
     const text = (result: ToolOutput) => {
