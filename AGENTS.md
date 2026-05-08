@@ -248,6 +248,7 @@ Available skills:
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling |
+| `api-telemetry` | OTel catalog: spans, metrics, completion logs, env config, cardinality rules |
 | `api-workers` | Cloudflare Workers runtime |
 | `api-linter` | MCP definition lint rules reference (rule IDs, severities, fixes) |
 | `release-and-publish` | End-to-end ship workflow (npm + MCP Registry + GHCR) |

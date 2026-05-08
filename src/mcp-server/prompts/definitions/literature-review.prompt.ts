@@ -11,7 +11,11 @@ export const literatureReviewPrompt = prompt('openalex_literature_review', {
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/prompts/definitions/literature-review.prompt.ts',
   args: z.object({
-    topic: z.string().describe('Research topic or question to review.'),
+    topic: z
+      .string()
+      .describe(
+        'Research topic or question to review (e.g., "CRISPR off-target effects in human cell lines").',
+      ),
     scope: z
       .enum(['narrow', 'broad'])
       .default('narrow')

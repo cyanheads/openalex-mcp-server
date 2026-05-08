@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.9](changelog/0.6.x/0.6.9.md) — 2026-05-08
+
+Adopt @cyanheads/mcp-ts-core ^0.8.15 → ^0.8.19; bump Node engine ≥24, pin Docker base to oven/bun:1.3; tighten tool/prompt copy.
+
 ## [0.6.8](changelog/0.6.x/0.6.8.md) — 2026-05-05
 
 search_entities — random sampling via sample/seed (#14); alias common LLM-prior field/filter names to OpenAlex canonical names (#17).

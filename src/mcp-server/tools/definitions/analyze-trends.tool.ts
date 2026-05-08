@@ -42,7 +42,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
       recovery:
-        'Check that group_by names a valid field and that filter syntax matches the OpenAlex docs.',
+        'Read the upstream message for the rejected token, then retry with a valid group_by field for the entity_type (publication_year/type/oa_status for works; country_code/has_orcid for authors).',
     },
     {
       reason: 'upstream_validation_failed',

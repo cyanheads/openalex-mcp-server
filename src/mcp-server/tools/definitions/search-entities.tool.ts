@@ -156,7 +156,7 @@ function buildSearchEcho(input: {
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity (free, unlimited API calls). Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches return a curated set of fields by default; pass `select` to override with specific fields.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches return a curated set of fields by default; pass `select` to override with specific fields.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -212,7 +212,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the request as malformed (HTTP 400).',
       recovery:
-        'Check filter syntax, sort field, and select field names against the OpenAlex documentation.',
+        'Read the upstream message for the rejected token, then retry after correcting the filter operator, sort field, or select field name it names.',
     },
     {
       reason: 'upstream_validation_failed',

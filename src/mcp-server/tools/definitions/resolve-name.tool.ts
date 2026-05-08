@@ -10,7 +10,7 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const resolveNameTool = tool('openalex_resolve_name', {
   description:
-    'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. Also accepts DOIs directly for quick lookup. Response time ~200ms.',
+    'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. Also accepts DOIs directly for quick lookup.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/resolve-name.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -82,7 +82,9 @@ export const resolveNameTool = tool('openalex_resolve_name', {
             display_name: z.string().describe('Human-readable name.'),
             entity_type: z
               .string()
-              .describe('Entity type (work, author, source, institution, etc.).'),
+              .describe(
+                'Entity type — one of: work, author, source, institution, topic, keyword, publisher, funder.',
+              ),
             cited_by_count: z
               .number()
               .describe('Citation count (direct for works, aggregate for others).'),

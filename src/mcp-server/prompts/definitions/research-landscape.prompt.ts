@@ -11,7 +11,7 @@ export const researchLandscapePrompt = prompt('openalex_research_landscape', {
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/prompts/definitions/research-landscape.prompt.ts',
   args: z.object({
-    topic: z.string().describe('Research area to analyze.'),
+    topic: z.string().describe('Research area to analyze (e.g., "single-cell RNA sequencing").'),
   }),
   generate: (args) => [
     {
