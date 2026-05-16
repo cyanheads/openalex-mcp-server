@@ -15,6 +15,8 @@ import { initOpenAlexService } from '@/services/openalex/openalex-service.js';
 await createApp({
   tools: [resolveNameTool, searchEntitiesTool, analyzeTrendsTool],
   prompts: [literatureReviewPrompt, researchLandscapePrompt],
+  instructions:
+    'Use the openalex_* tools to query the OpenAlex scholarly catalog (works, authors, sources, institutions, topics, keywords, publishers, funders): resolve names to IDs, search/filter/sort or fetch by ID, and group_by for trends. Names are ambiguous and IDs are not — call openalex_resolve_name before filtering by entity.',
   landing: {
     tagline: 'Search the OpenAlex catalog — 270M+ works, 90M+ authors, 100K+ sources.',
     repoRoot: 'https://github.com/cyanheads/openalex-mcp-server',
