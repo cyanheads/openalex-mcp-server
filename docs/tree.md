@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-05-08 12:49:20
+Generated on: 2026-05-16 19:22:39
 
 ```text
 openalex-mcp-server/
@@ -143,6 +143,7 @@ openalex-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
