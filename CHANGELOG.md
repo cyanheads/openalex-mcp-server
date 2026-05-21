@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.12](changelog/0.6.x/0.6.12.md) — 2026-05-20
+
+Citation-graph seed validation and reserved-filter-key rejection; recover truncated upstream 400 messages; true population count under sample.
+
 ## [0.6.11](changelog/0.6.x/0.6.11.md) — 2026-05-20 · 🛡️ Security
 
 Add openalex_get_citation_graph for one-hop citation traversal; polish analyze_trends (per_page, chronological year sort, broader recovery hint); redact polite-pool mailto from error messages.

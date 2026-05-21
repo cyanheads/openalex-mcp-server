@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.6.11-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+[![Version](https://img.shields.io/badge/Version-0.6.12-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
 
 </div>
 
@@ -73,7 +73,7 @@ One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`c
 - `cites`: works that cite the seed (incoming citations)
 - `cited_by`: works the seed cites (its reference list)
 - `related_to`: OpenAlex algorithmic "related works" (~8-30 typical, may be empty for less-cited seeds)
-- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`; resolves non-W-IDs via a singleton lookup
+- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`
 - Stacks with `filters`/`sort`/`select` to narrow the graph (e.g., `publication_year=">2020"`, `is_oa="true"`)
 
 ## Prompts
