@@ -1,12 +1,12 @@
 <div align="center">
   <h1>@cyanheads/openalex-mcp-server</h1>
   <p><b>Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.</b></p>
-  <p><b>3 Tools &middot; 2 Prompts</b></p>
+  <p><b>4 Tools &middot; 2 Prompts</b></p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.6.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+[![Version](https://img.shields.io/badge/Version-0.6.11-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
 
 </div>
 
@@ -20,13 +20,14 @@
 
 ## Tools
 
-Three tools for querying the [OpenAlex](https://openalex.org) academic research catalog:
+Four tools for querying the [OpenAlex](https://openalex.org) academic research catalog:
 
 | Tool Name | Description |
 |:----------|:------------|
 | `openalex_search_entities` | Search, filter, sort, or retrieve by ID across all 8 entity types. |
 | `openalex_analyze_trends` | Group-by aggregation for trend and distribution analysis. |
 | `openalex_resolve_name` | Resolve a name or partial name to an OpenAlex ID via autocomplete. |
+| `openalex_get_citation_graph` | Walk the citation graph one hop from a seed work: cites, cited_by, or related_to. |
 
 ### `openalex_search_entities`
 
@@ -62,6 +63,18 @@ Name-to-ID resolution via autocomplete. **Always use this before filtering by en
 - Accepts partial names and DOIs for direct lookup
 - Optional entity type filter and field-level filters
 - ~200ms response time
+
+---
+
+### `openalex_get_citation_graph`
+
+One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`cited_by`/`related_to` filters behind an explicit `direction` argument so callers do not have to know the filter names.
+
+- `cites`: works that cite the seed (incoming citations)
+- `cited_by`: works the seed cites (its reference list)
+- `related_to`: OpenAlex algorithmic "related works" (~8-30 typical, may be empty for less-cited seeds)
+- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`; resolves non-W-IDs via a singleton lookup
+- Stacks with `filters`/`sort`/`select` to narrow the graph (e.g., `publication_year=">2020"`, `is_oa="true"`)
 
 ## Prompts
 

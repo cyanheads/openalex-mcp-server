@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.11](changelog/0.6.x/0.6.11.md) — 2026-05-20 · 🛡️ Security
+
+Add openalex_get_citation_graph for one-hop citation traversal; polish analyze_trends (per_page, chronological year sort, broader recovery hint); redact polite-pool mailto from error messages.
+
 ## [0.6.10](changelog/0.6.x/0.6.10.md) — 2026-05-16
 
 Adopt @cyanheads/mcp-ts-core ^0.8.19 → ^0.9.1; surface server-level `instructions` on the MCP initialize response so clients can forward catalog orientation to the model.
