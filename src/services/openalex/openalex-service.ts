@@ -354,9 +354,26 @@ function logResponseMetrics(parsed: unknown, path: string, ctx: Context): void {
   });
 }
 
+/**
+ * Permissive extractors for OpenAlex's `error` and `message` fields when the body
+ * is truncated mid-string (framework caps `responseBody` at 500 bytes; OpenAlex
+ * valid-fields listings exceed ~1 KB). The terminator `"|…|$` accepts a closing
+ * quote, the framework's truncation ellipsis, or end of string — so whatever
+ * survived the cap still gets extracted.
+ */
+const TRUNCATED_ERROR_FIELD_RE = /"error"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|…|$)/;
+const TRUNCATED_MESSAGE_FIELD_RE = /"message"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|…|$)/;
+
+/**
+ * Extract OpenAlex's `error` and `message` fields from a response body. JSON.parse
+ * works for un-truncated bodies; falls back to regex so the useful prefix of the
+ * upstream message still reaches the caller when the body was cut mid-string.
+ * `truncated` distinguishes the two paths so downstream sanitization can act only
+ * on bodies that were actually cut.
+ */
 function parseOpenAlexErrorBody(
   responseBody: unknown,
-): { error?: string | undefined; message?: string | undefined } | null {
+): { error?: string | undefined; message?: string | undefined; truncated: boolean } | null {
   if (typeof responseBody !== 'string') return null;
 
   try {
@@ -366,10 +383,27 @@ function parseOpenAlexErrorBody(
     return {
       error: typeof parsed.error === 'string' ? parsed.error : undefined,
       message: typeof parsed.message === 'string' ? parsed.message : undefined,
+      truncated: false,
     };
   } catch {
-    return null;
+    const error = TRUNCATED_ERROR_FIELD_RE.exec(responseBody)?.[1];
+    const message = TRUNCATED_MESSAGE_FIELD_RE.exec(responseBody)?.[1];
+    if (error === undefined && message === undefined) return null;
+    return { error, message, truncated: true };
   }
+}
+
+/**
+ * OpenAlex 400 messages append an alphabetically-sorted enumeration of valid field
+ * names ("Valid fields are: a, b, c, ..."). When the response body was truncated
+ * mid-list the surviving prefix misleads agents into believing the early-alphabet
+ * fields are the complete set. Strip the list when truncation occurred — the raw
+ * upstream prefix stays available on `data.upstreamMessage` for debugging.
+ */
+const VALID_FIELDS_BOUNDARY_RE = /\s*Valid fields\b.*/is;
+function stripTruncatedValidFieldsList(message: string): string {
+  if (!VALID_FIELDS_BOUNDARY_RE.test(message)) return message;
+  return `${message.replace(VALID_FIELDS_BOUNDARY_RE, '').trim()} (list of valid fields omitted — was truncated upstream; see OpenAlex docs)`;
 }
 
 function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
@@ -470,9 +504,13 @@ class OpenAlexService {
 
     const { factory, reason } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
+    const rawMessage = upstream?.message ?? upstream?.error;
+    const sanitizedMessage =
+      rawMessage !== undefined && upstream?.truncated
+        ? stripTruncatedValidFieldsList(rawMessage)
+        : rawMessage;
     const message =
-      upstream?.message ??
-      upstream?.error ??
+      sanitizedMessage ??
       (code === JsonRpcErrorCode.NotFound
         ? `Entity not found at ${path}`
         : redactUrlsInMessage(error.message));
@@ -590,14 +628,31 @@ class OpenAlexService {
       queryParams.cursor = params.cursor ?? '*';
     }
 
-    const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
+    const searchRequest = this.request(`/${params.entityType}`, queryParams, ctx) as Promise<{
       meta: SearchResult['meta'];
       results: EntityRecord[];
-    };
+    }>;
+
+    // Sampling: OpenAlex returns the sample size in `meta.count`, not the population
+    // matching the filters. The output schema documents `count` as "Total results
+    // matching the query/filters" — issue a parallel per_page=1 lookup without
+    // `sample` to recover the true population and overwrite `count` with it.
+    let populationRequest: Promise<{ meta: { count: number } }> | undefined;
+    if (params.sample !== undefined) {
+      const { sample: _sample, seed: _seed, ...filterParams } = queryParams;
+      populationRequest = this.request(
+        `/${params.entityType}`,
+        { ...filterParams, per_page: '1', cursor: '*' },
+        ctx,
+      ) as Promise<{ meta: { count: number } }>;
+    }
+
+    const [data, populationData] = await Promise.all([searchRequest, populationRequest]);
 
     return {
       meta: {
         ...data.meta,
+        ...(populationData !== undefined && { count: populationData.meta.count }),
         next_cursor: data.meta.next_cursor ?? null,
       },
       results: normalizeEntityRecords(data.results),

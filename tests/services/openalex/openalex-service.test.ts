@@ -22,15 +22,30 @@ function lastFetchUrl(): URL {
   return new URL(call[0] as string);
 }
 
+/** Find the first fetch URL matching `predicate`. Sample searches issue two parallel
+ * calls (sample + population) — use this to pick the one under test. */
+function findFetchUrl(predicate: (url: URL) => boolean): URL {
+  const calls = vi.mocked(globalThis.fetch).mock.calls;
+  for (const call of calls) {
+    const url = new URL(call[0] as string);
+    if (predicate(url)) return url;
+  }
+  throw new Error('no fetch call matched predicate');
+}
+
 describe('OpenAlexService', () => {
   beforeEach(() => {
+    // Each call gets a fresh Response — parallel fetches (e.g., sample + population
+    // lookup) would otherwise reuse the same body and hit `Body already used`.
     vi.stubGlobal(
       'fetch',
-      vi.fn<() => Promise<Response>>().mockResolvedValue(
-        new Response(JSON.stringify({ meta: { count: 0, per_page: 25 }, results: [] }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+      vi.fn<() => Promise<Response>>().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ meta: { count: 0, per_page: 25 }, results: [] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        ),
       ),
     );
   });
@@ -619,30 +634,34 @@ describe('OpenAlexService', () => {
   // --- Random sampling (gh #14) ---
 
   describe('sample and seed', () => {
+    const sampleUrl = (): URL => findFetchUrl((u) => u.searchParams.has('sample'));
+    const populationUrl = (): URL =>
+      findFetchUrl((u) => !u.searchParams.has('sample') && u.searchParams.get('per_page') === '1');
+
     it('passes sample as a query param and aligns per_page to it', async () => {
       const service = await getService();
       await service.search({ entityType: 'works', sample: 7 }, createMockContext());
-      const url = lastFetchUrl();
+      const url = sampleUrl();
       expect(url.searchParams.get('sample')).toBe('7');
       expect(url.searchParams.get('per_page')).toBe('7');
     });
 
-    it('omits cursor when sample is set (single-page contract)', async () => {
+    it('omits cursor on the sample request (single-page contract)', async () => {
       const service = await getService();
       await service.search({ entityType: 'works', sample: 5 }, createMockContext());
-      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+      expect(sampleUrl().searchParams.has('cursor')).toBe(false);
     });
 
     it('passes seed when sample is set', async () => {
       const service = await getService();
       await service.search({ entityType: 'works', sample: 3, seed: 'abc' }, createMockContext());
-      expect(lastFetchUrl().searchParams.get('seed')).toBe('abc');
+      expect(sampleUrl().searchParams.get('seed')).toBe('abc');
     });
 
     it('overrides caller-supplied per_page when sample is set', async () => {
       const service = await getService();
       await service.search({ entityType: 'works', sample: 5, perPage: 25 }, createMockContext());
-      expect(lastFetchUrl().searchParams.get('per_page')).toBe('5');
+      expect(sampleUrl().searchParams.get('per_page')).toBe('5');
     });
 
     it('does not send sample/seed when sample is undefined', async () => {
@@ -652,6 +671,28 @@ describe('OpenAlexService', () => {
       expect(url.searchParams.has('sample')).toBe(false);
       expect(url.searchParams.has('seed')).toBe(false);
       expect(url.searchParams.get('cursor')).toBe('*');
+    });
+
+    it('issues a parallel population lookup so meta.count reports the true match count', async () => {
+      vi.mocked(globalThis.fetch).mockImplementation((input) => {
+        const url = new URL(input as string);
+        const count = url.searchParams.has('sample') ? 5 : 1_234_567;
+        return Promise.resolve(
+          new Response(JSON.stringify({ meta: { count, per_page: count }, results: [] }), {
+            status: 200,
+          }),
+        );
+      });
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', sample: 5, filters: { publication_year: '2023' } },
+        createMockContext(),
+      );
+      expect(result.meta.count).toBe(1_234_567);
+      const head = populationUrl();
+      expect(head.searchParams.get('filter')).toBe('publication_year:2023');
+      expect(head.searchParams.get('cursor')).toBe('*');
+      expect(head.searchParams.has('seed')).toBe(false);
     });
   });
 
@@ -1131,6 +1172,107 @@ describe('OpenAlexService', () => {
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.InvalidParams,
         message: 'Invalid query parameters error.',
+      });
+    });
+
+    /**
+     * Framework caps error responseBody at 500 bytes. OpenAlex 400 bodies that enumerate
+     * valid fields routinely exceed that, so strict JSON.parse fails on the truncated
+     * tail and historically dropped the useful prefix on the floor (#19). Regex fallback
+     * recovers the surviving message even when the closing quote is past the cap.
+     */
+    it('extracts upstream message from a body truncated mid-string (gh #19)', async () => {
+      const longMessage =
+        'totally_made_up_field is not a valid select field. Valid fields for select are: ' +
+        'id, doi, title, display_name, relevance_score, publication_year, publication_date, ' +
+        'ids, language, primary_location, sources, type, type_crossref, indexed_in, open_access, ' +
+        'authorships, institution_assertions, institutions, countries_distinct_count, ' +
+        'institutions_distinct_count, corresponding_author_ids, corresponding_institution_ids, ' +
+        'apc_list, apc_paid, fwci, is_authors_truncated, has_fulltext, fulltext_origin, ' +
+        'cited_by_count, citation_normalized_percentile, cited_by_percentile_year, biblio, ' +
+        'is_retracted, is_paratext, is_xpac, primary_topic, topics, keywords, concepts, mesh.';
+      const fullBody = JSON.stringify({
+        error: 'Invalid query parameters error.',
+        message: longMessage,
+      });
+      // Verifies the fixture actually exercises the truncation path the fix targets.
+      expect(fullBody.length).toBeGreaterThan(500);
+
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(fullBody, { status: 400, statusText: 'Bad Request' }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search(
+          { entityType: 'works', select: ['totally_made_up_field'] },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'upstream_invalid_params' },
+        message: expect.stringContaining('totally_made_up_field is not a valid select field'),
+      });
+    });
+
+    it('strips the alphabetically-truncated "Valid fields are" list when the body was cut mid-message', async () => {
+      const longMessage =
+        'nonexistent_filter is not a valid field. Valid fields are underscore or hyphenated versions of: ' +
+        'abstract.search, abstract.search.exact, apc_list.currency, apc_list.provenance, apc_list.value, ' +
+        'apc_list.value_usd, apc_paid.currency, apc_paid.provenance, apc_paid.value, apc_paid.value_usd, ' +
+        'author.id, author.orcid, authors_count, authorships.affiliations.institution_ids, ' +
+        'authorships.author.id, authorships.author.orcid, authorships.count, ' +
+        'best_oa_location.is_oa, best_oa_location.license, best_oa_location.source.id, ' +
+        'best_oa_location.source.issn, best_oa_location.source.publisher_lineage, best_oa_location.version, ' +
+        'biblio.first_page, biblio.issue, biblio.last_page, biblio.volume, cited_by_count, cites, ' +
+        'concepts.id, concepts.wikidata, corresponding_author_ids, corresponding_institution_ids';
+      const fullBody = JSON.stringify({
+        error: 'Invalid query parameters error.',
+        message: longMessage,
+      });
+      expect(fullBody.length).toBeGreaterThan(500);
+
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(fullBody, { status: 400, statusText: 'Bad Request' }),
+      );
+      const service = await getService();
+
+      await expect(
+        service.search(
+          { entityType: 'works', filters: { nonexistent_filter: 'x' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: expect.stringMatching(
+          /^nonexistent_filter is not a valid field\..*list of valid fields omitted/,
+        ),
+        data: {
+          reason: 'upstream_invalid_params',
+          upstreamMessage: expect.stringContaining('Valid fields are'),
+        },
+      });
+    });
+
+    it('still surfaces the full message when body fits within the truncation cap', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'Invalid query parameters error.',
+            message: 'short error message.',
+          }),
+          { status: 400, statusText: 'Bad Request' },
+        ),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: 'short error message.',
       });
     });
 
