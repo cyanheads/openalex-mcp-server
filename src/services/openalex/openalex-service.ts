@@ -331,6 +331,29 @@ function hasEntries(record?: Record<string, string>): record is Record<string, s
   return record !== undefined && Object.keys(record).length > 0;
 }
 
+/**
+ * Surface OpenAlex's per-request cost and DB latency at debug level. Both live in
+ * `meta` on every list/group/single-entity response and stay in the parsed payload
+ * — they aren't stripped on the way out because the per-tool output schemas don't
+ * declare them, so zod drops them at the MCP boundary regardless. Operators with
+ * debug logging on get per-request observability without changing the wire shape.
+ */
+function logResponseMetrics(parsed: unknown, path: string, ctx: Context): void {
+  if (!isRecord(parsed)) return;
+  const meta = parsed.meta;
+  if (!isRecord(meta)) return;
+
+  const cost = typeof meta.cost_usd === 'number' ? meta.cost_usd : undefined;
+  const db = typeof meta.db_response_time_ms === 'number' ? meta.db_response_time_ms : undefined;
+  if (cost === undefined && db === undefined) return;
+
+  ctx.log.debug('OpenAlex response metrics', {
+    path,
+    ...(cost !== undefined && { costUsd: cost }),
+    ...(db !== undefined && { dbResponseTimeMs: db }),
+  });
+}
+
 function parseOpenAlexErrorBody(
   responseBody: unknown,
 ): { error?: string | undefined; message?: string | undefined } | null {
@@ -409,7 +432,9 @@ class OpenAlexService {
             signal: ctx.signal,
           });
           const text = await response.text();
-          return this.parseResponse(text, path);
+          const parsed = this.parseResponse(text, path);
+          logResponseMetrics(parsed, path, ctx);
+          return parsed;
         } catch (error) {
           this.throwNormalizedRequestError(error, path, ctx);
         }
@@ -589,6 +614,10 @@ class OpenAlexService {
 
     if (hasEntries(params.filters)) {
       queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
+    }
+
+    if (params.perPage !== undefined) {
+      queryParams.per_page = String(params.perPage);
     }
 
     // Only send cursor when explicitly provided — boolean group_by fields

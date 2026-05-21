@@ -42,7 +42,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
       recovery:
-        'Read the upstream message for the rejected token, then retry with a valid group_by field for the entity_type (publication_year/type/oa_status for works; country_code/has_orcid for authors).',
+        'OpenAlex rejected a token in group_by or filters. The upstream message names the rejected key and lists valid alternatives — read it, then retry with a valid filter key (e.g. abstract.search, title.search, default.search for full-text inside filters) or a valid group_by field for the entity_type.',
     },
     {
       reason: 'upstream_validation_failed',
@@ -63,13 +63,22 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter criteria (same syntax as openalex_search_entities filters). Narrows the population before aggregation. Example: group works by year, filtered to a specific topic.',
+        "Filter criteria (same syntax as openalex_search_entities filters). Narrows the population before aggregation. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare 'search' filter key. Example: group works by year filtered to a specific topic.",
       ),
     include_unknown: z
       .boolean()
       .default(false)
       .describe(
         'Include a group for entities with no value for the grouped field. Hidden by default.',
+      ),
+    per_page: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .default(200)
+      .describe(
+        'Maximum groups per page (1-200). Default 200 (the upstream cap). Use lower values when only the top-N groups are relevant — reduces token spend without changing the underlying aggregation.',
       ),
     cursor: z
       .string()
@@ -115,6 +124,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         groupBy: input.group_by,
         filters: input.filters,
         includeUnknown: input.include_unknown,
+        perPage: input.per_page,
         cursor: input.cursor,
       },
       ctx,
@@ -144,7 +154,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         },
       ];
     }
-    const lines = result.groups.map((g) => {
+
+    // Time-series groupings are returned upstream in count-desc — useful for "top N years"
+    // but jarring when reading a trend. Only the rendered text is reordered;
+    // structuredContent stays in upstream order for callers that want it.
+    const renderOrder = isTimeSeriesGrouping(result.groups)
+      ? [...result.groups].sort((a, b) => a.key.localeCompare(b.key))
+      : result.groups;
+
+    const lines = renderOrder.map((g) => {
       const label =
         g.key === g.key_display_name ? g.key_display_name : `${g.key_display_name} (${g.key})`;
       return `${label}: ${g.count}`;
@@ -160,6 +178,12 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     ];
   },
 });
+
+const YEAR_OR_DATE_PATTERN = /^\d{4}(-\d{2}-\d{2})?$/;
+
+function isTimeSeriesGrouping(groups: ReadonlyArray<{ key: string }>): boolean {
+  return groups.length > 1 && groups.every((g) => YEAR_OR_DATE_PATTERN.test(g.key));
+}
 
 function buildAnalyzeEcho(input: {
   entity_type: string;

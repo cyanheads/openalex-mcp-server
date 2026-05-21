@@ -837,6 +837,70 @@ describe('OpenAlexService', () => {
       );
       expect(result.groups).toEqual([]);
     });
+
+    it('forwards per_page when provided', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'works', groupBy: 'type', perPage: 10 },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('per_page')).toBe('10');
+    });
+
+    it('omits per_page when not provided', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze({ entityType: 'works', groupBy: 'type' }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('per_page')).toBe(false);
+    });
+  });
+
+  // --- Response metrics ---
+
+  describe('response metrics logging', () => {
+    it('logs cost_usd and db_response_time_ms from meta at debug level', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 10, per_page: 25, cost_usd: 0.0002, db_response_time_ms: 42 },
+            results: [],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+      const debug = vi.spyOn(ctx.log, 'debug');
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      const metricsCall = debug.mock.calls.find(
+        ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
+      );
+      expect(metricsCall).toBeDefined();
+      expect(metricsCall?.[1]).toMatchObject({ costUsd: 0.0002, dbResponseTimeMs: 42 });
+    });
+
+    it('does not log metrics when meta lacks both fields', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, results: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+      const debug = vi.spyOn(ctx.log, 'debug');
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      const metricsCall = debug.mock.calls.find(
+        ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
+      );
+      expect(metricsCall).toBeUndefined();
+    });
   });
 
   // --- Autocomplete ---

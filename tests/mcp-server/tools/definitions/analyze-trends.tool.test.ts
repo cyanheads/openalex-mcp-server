@@ -45,12 +45,44 @@ describe('analyzeTrendsTool', () => {
         groupBy: 'publication_year',
         filters: undefined,
         includeUnknown: false,
+        perPage: 200,
         cursor: undefined,
       },
       ctx,
     );
     expect(result.groups).toHaveLength(3);
     expect(result.meta.count).toBe(50000);
+  });
+
+  it('threads per_page through to the service', async () => {
+    mockAnalyze.mockResolvedValue(sampleResult);
+    const ctx = createMockContext();
+    const input = analyzeTrendsTool.input.parse({
+      entity_type: 'works',
+      group_by: 'publication_year',
+      per_page: 25,
+    });
+
+    await analyzeTrendsTool.handler(input, ctx);
+
+    expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ perPage: 25 }), ctx);
+  });
+
+  it('rejects per_page outside 1-200', () => {
+    expect(() =>
+      analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        per_page: 201,
+      }),
+    ).toThrow();
+    expect(() =>
+      analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        per_page: 0,
+      }),
+    ).toThrow();
   });
 
   it('passes filters and includeUnknown', async () => {
@@ -115,6 +147,29 @@ describe('analyzeTrendsTool', () => {
       expect(output).toContain('entity_type=works | group_by=publication_year');
       expect(output).toContain('2024: 20000');
       expect(output).toContain('2023: 18000');
+    });
+
+    it('renders year-keyed groups in chronological order, not count order', () => {
+      const output = text(sampleWithEcho);
+      const positions = ['2022', '2023', '2024'].map((year) => output.indexOf(`${year}:`));
+      expect(positions[0]).toBeLessThan(positions[1]!);
+      expect(positions[1]!).toBeLessThan(positions[2]!);
+    });
+
+    it('keeps count-desc order for non-time-series groupings', () => {
+      const output = text({
+        meta: {
+          count: 100,
+          groups_count: 2,
+          next_cursor: null,
+          echo: 'entity_type=works | group_by=type',
+        },
+        groups: [
+          { key: 'article', key_display_name: 'article', count: 80 },
+          { key: 'book', key_display_name: 'book', count: 20 },
+        ],
+      });
+      expect(output.indexOf('article: 80')).toBeLessThan(output.indexOf('book: 20'));
     });
 
     it('renders every group returned on the page', () => {

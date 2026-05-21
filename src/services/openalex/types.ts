@@ -106,6 +106,7 @@ export interface AnalyzeParams {
   filters?: Record<string, string> | undefined;
   groupBy: string;
   includeUnknown?: boolean | undefined;
+  perPage?: number | undefined;
 }
 
 export interface AnalyzeResult {
