@@ -5,129 +5,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
-import { ENTITY_TYPES } from '@/services/openalex/types.js';
+import { ENTITY_TYPES, type EntityRecord } from '@/services/openalex/types.js';
 
 const SEMANTIC_PER_PAGE_CAP = 50;
 const SAMPLE_MAX = 100;
-
-type Scalar = string | number | boolean;
-type SearchEntityRecord = {
-  display_name: string;
-  id: string;
-} & Record<string, unknown>;
-
-const ACRONYMS = new Set([
-  'apc',
-  'doi',
-  'fwci',
-  'id',
-  'issn',
-  'oa',
-  'orcid',
-  'pmcid',
-  'pmid',
-  'ror',
-  'url',
-]);
-
-function toFieldLabel(field: string): string {
-  return field
-    .split(/[_\-.]/g)
-    .filter(Boolean)
-    .map((part) =>
-      ACRONYMS.has(part.toLowerCase())
-        ? part.toUpperCase()
-        : part.charAt(0).toUpperCase() + part.slice(1),
-    )
-    .join(' ');
-}
-
-function isScalar(value: unknown): value is Scalar {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
-}
-
-function isScalarOrNull(value: unknown): value is Scalar | null {
-  return value === null || isScalar(value);
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function formatScalar(value: Scalar): string {
-  return String(value);
-}
-
-/**
- * Flatten a value to "path: value" strings, one per scalar leaf. Nested objects use dot
- * notation (`subfield.display_name`); arrays of scalars collapse to a single comma-joined
- * pair (`countries: us, gb`); arrays of objects produce one entry per element with bracket
- * indexing (`institutions[0].id`). All terminal values reach the output — `format()` and
- * `structuredContent` stay in parity.
- */
-function flattenLeaves(value: unknown, prefix = ''): string[] {
-  if (value === null || value === undefined) {
-    return prefix ? [`${prefix}: —`] : [];
-  }
-  if (isScalar(value)) {
-    return [prefix ? `${prefix}: ${formatScalar(value)}` : formatScalar(value)];
-  }
-  if (Array.isArray(value)) {
-    if (value.length === 0) return [`${prefix || 'value'}: (empty)`];
-    if (value.every(isScalarOrNull)) {
-      const joined = value.map((item) => (item === null ? '—' : formatScalar(item))).join(', ');
-      return [prefix ? `${prefix}: ${joined}` : joined];
-    }
-    return value.flatMap((item, i) => flattenLeaves(item, `${prefix}[${i}]`));
-  }
-  if (isPlainObject(value)) {
-    const entries = Object.entries(value);
-    if (entries.length === 0) return prefix ? [`${prefix}: (empty)`] : [];
-    return entries.flatMap(([k, v]) => flattenLeaves(v, prefix ? `${prefix}.${k}` : k));
-  }
-  return [prefix ? `${prefix}: ${String(value)}` : String(value)];
-}
-
-function compactPairs(value: Record<string, unknown>): string {
-  return flattenLeaves(value).join(', ');
-}
-
-function renderField(field: string, value: unknown): string {
-  const label = toFieldLabel(field);
-  if (value == null) return `**${label}:** —`;
-  if (isScalar(value)) return `**${label}:** ${formatScalar(value)}`;
-
-  if (Array.isArray(value)) {
-    if (value.length === 0) return `**${label}:** (empty)`;
-    if (value.every(isScalarOrNull)) {
-      return `**${label}:** ${value.map((item) => (item === null ? '—' : formatScalar(item))).join(', ')}`;
-    }
-    const items = value.map((item, i) =>
-      isPlainObject(item)
-        ? `- [${i}] ${compactPairs(item)}`
-        : `- [${i}] ${flattenLeaves(item).join(', ') || '—'}`,
-    );
-    return `**${label}:**\n${items.join('\n')}`;
-  }
-
-  if (isPlainObject(value)) {
-    return `**${label}:** ${compactPairs(value)}`;
-  }
-
-  return `**${label}:** ${String(value)}`;
-}
-
-function renderRecord(record: SearchEntityRecord): string[] {
-  const { id, display_name, ...rest } = record;
-  const lines = ['', `### ${display_name || id}`, `**ID:** ${id}`];
-
-  for (const [field, value] of Object.entries(rest)) {
-    lines.push(renderField(field, value));
-  }
-
-  return lines;
-}
 
 function buildSearchEcho(input: {
   entity_type: string;
@@ -402,7 +285,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     }
 
     for (const record of result.results) {
-      lines.push(...renderRecord(record as SearchEntityRecord));
+      lines.push(...renderEntityRecord(record as EntityRecord));
     }
 
     return [{ type: 'text', text: lines.join('\n') }];

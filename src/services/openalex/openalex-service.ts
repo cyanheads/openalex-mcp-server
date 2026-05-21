@@ -56,7 +56,7 @@ function buildFilterString(filters: Record<string, string>): string {
  * "PMC1234567" → "pmcid:PMC1234567"
  * "W2741809807" → "W2741809807"
  */
-function normalizeId(id: string): string {
+export function normalizeId(id: string): string {
   const trimmed = id.trim();
 
   // Full OpenAlex URL

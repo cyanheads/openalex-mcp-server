@@ -1,0 +1,235 @@
+/**
+ * @fileoverview One-hop citation graph traversal: cites / cited_by / related_to from a seed work.
+ * @module mcp-server/tools/definitions/citation-graph.tool
+ */
+
+import type { Context } from '@cyanheads/mcp-ts-core';
+import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
+import { getOpenAlexService, normalizeId } from '@/services/openalex/openalex-service.js';
+import type { EntityRecord } from '@/services/openalex/types.js';
+
+/** Bare or URL-form OpenAlex work ID — the only form `cites`/`cited_by`/`related_to` filters accept. */
+const OPENALEX_WORK_ID_PATTERN = /^(?:https:\/\/openalex\.org\/)?W\d+$/;
+const OPENALEX_URL_PREFIX = 'https://openalex.org/';
+
+/**
+ * The `cites`/`cited_by`/`related_to` filters require an OpenAlex W-ID; DOIs and PMIDs
+ * are rejected upstream even after `normalizeId` adds a `doi:` prefix (that prefix only
+ * works on the `/works/{id}` singleton path). Resolve non-W-IDs via a one-shot singleton
+ * lookup so callers can pass any identifier the docs advertise.
+ */
+async function resolveSeedToWorkId(
+  service: ReturnType<typeof getOpenAlexService>,
+  seedId: string,
+  ctx: Context,
+): Promise<string> {
+  const normalized = normalizeId(seedId);
+  if (OPENALEX_WORK_ID_PATTERN.test(normalized)) {
+    return normalized.replace(OPENALEX_URL_PREFIX, '');
+  }
+
+  const lookup = await service.search({ entityType: 'works', id: seedId, select: ['id'] }, ctx);
+  const record = lookup.results[0];
+  if (!record?.id) {
+    throw new Error(`Could not resolve seed_id "${seedId}" to an OpenAlex work ID.`);
+  }
+  return record.id.replace(OPENALEX_URL_PREFIX, '');
+}
+
+const DIRECTIONS = ['cites', 'cited_by', 'related_to'] as const;
+type Direction = (typeof DIRECTIONS)[number];
+
+function buildCitationEcho(input: {
+  seed_id: string;
+  direction: Direction;
+  filters?: Record<string, string> | undefined;
+  sort?: string | undefined;
+}): string {
+  const parts = [`seed_id=${input.seed_id}`, `direction=${input.direction}`];
+  if (input.filters && Object.keys(input.filters).length > 0) {
+    parts.push(`filters=${JSON.stringify(input.filters)}`);
+  }
+  if (input.sort) parts.push(`sort=${input.sort}`);
+  return parts.join(' | ');
+}
+
+export const getCitationGraphTool = tool('openalex_get_citation_graph', {
+  description:
+    "Walk the citation graph one hop from a seed work. Direction picks which edge: incoming citations (cites), the seed's own references (cited_by), or OpenAlex's algorithmic related-works (related_to). Thin wrapper over openalex_search_entities scoped to works — exposes the direction explicitly so callers do not have to know the underlying filter names. Results pass through the works schema; combine with filters/sort to narrow further.",
+  sourceUrl:
+    'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/citation-graph.tool.ts',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  errors: [
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'OpenAlex throttled the request (HTTP 429).',
+      retryable: true,
+      recovery:
+        'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_unauthorized',
+      code: JsonRpcErrorCode.Unauthorized,
+      when: 'OpenAlex rejected the API key (HTTP 401).',
+      recovery:
+        'Check that OPENALEX_API_KEY is set to a valid email-format key registered with OpenAlex.',
+    },
+    {
+      reason: 'upstream_forbidden',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'OpenAlex denied access to the requested resource (HTTP 403).',
+      recovery:
+        'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+    },
+    {
+      reason: 'upstream_invalid_params',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected the seed_id, filter, or sort as malformed (HTTP 400).',
+      recovery:
+        'Read the upstream message for the rejected token, then retry with a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter/sort field name it names.',
+    },
+    {
+      reason: 'entity_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'OpenAlex returned no edges for the seed_id in the requested direction.',
+      recovery:
+        'Verify seed_id resolves to an OpenAlex work via openalex_resolve_name; not all works have related_to entries.',
+    },
+  ],
+  input: z.object({
+    seed_id: z
+      .string()
+      .min(1)
+      .describe(
+        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), PMID, or PMCID. Use openalex_resolve_name first if you only have a title.',
+      ),
+    direction: z
+      .enum(DIRECTIONS)
+      .describe(
+        '"cites": works that cite seed_id (incoming citations). "cited_by": works that seed_id cites (its reference list). "related_to": OpenAlex algorithmically-related works (~8-30 typical, may be empty for less-cited seeds).',
+      ),
+    filters: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". The direction filter is added automatically — do not pass cites/cited_by/related_to here.',
+      ),
+    sort: z
+      .string()
+      .optional()
+      .describe(
+        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date". Default is OpenAlex relevance.',
+      ),
+    select: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted.',
+      ),
+    per_page: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(25)
+      .describe('Results per page (1-100). Default 25.'),
+    cursor: z
+      .string()
+      .optional()
+      .describe('Pagination cursor from a previous response. Pass to get the next page.'),
+  }),
+  output: z.object({
+    meta: z
+      .object({
+        count: z
+          .number()
+          .describe('Total edges from seed_id in this direction (across all pages).'),
+        per_page: z.number().describe('Records on this page.'),
+        next_cursor: z
+          .string()
+          .nullable()
+          .describe('Cursor for next page. null if no more results.'),
+        echo: z
+          .string()
+          .describe('Compact echo of seed_id, direction, filters, sort — useful when empty.'),
+      })
+      .describe('Result metadata including pagination.'),
+    results: z
+      .array(
+        z
+          .object({
+            id: z.string().describe('OpenAlex work ID.'),
+            display_name: z.string().describe('Work title.'),
+          })
+          .passthrough()
+          .describe(
+            'A single OpenAlex work record on the citation graph. Additional fields vary by `select`.',
+          ),
+      )
+      .describe('Works on the citation graph in this direction.'),
+  }),
+
+  async handler(input, ctx) {
+    const service = getOpenAlexService();
+    const workId = await resolveSeedToWorkId(service, input.seed_id, ctx);
+
+    const mergedFilters: Record<string, string> = {
+      ...(input.filters ?? {}),
+      [input.direction]: workId,
+    };
+
+    const result = await service.search(
+      {
+        entityType: 'works',
+        filters: mergedFilters,
+        sort: input.sort,
+        select: input.select,
+        perPage: input.per_page,
+        cursor: input.cursor,
+      },
+      ctx,
+    );
+
+    ctx.log.info('Citation graph fetched', {
+      seedId: input.seed_id,
+      direction: input.direction,
+      resultCount: result.results.length,
+      totalCount: result.meta.count,
+    });
+
+    return {
+      meta: {
+        ...result.meta,
+        echo: buildCitationEcho(input),
+      },
+      results: result.results,
+    };
+  },
+
+  format: (result) => {
+    const lines: string[] = [];
+    const countLabel = `${result.meta.count} edge(s) — ${result.meta.per_page} per page`;
+    const header = result.meta.next_cursor
+      ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
+      : `**${countLabel}**`;
+    lines.push(`${header} | ${result.meta.echo}`);
+
+    if (result.results.length === 0) {
+      lines.push(
+        '',
+        `No edges for ${result.meta.echo}.`,
+        'Verify the seed_id (use openalex_resolve_name), broaden filters, or try a different direction.',
+      );
+      return [{ type: 'text', text: lines.join('\n') }];
+    }
+
+    for (const record of result.results) {
+      lines.push(...renderEntityRecord(record as EntityRecord));
+    }
+
+    return [{ type: 'text', text: lines.join('\n') }];
+  },
+});
