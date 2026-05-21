@@ -7,29 +7,24 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
-import { getOpenAlexService, normalizeId } from '@/services/openalex/openalex-service.js';
+import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import type { EntityRecord } from '@/services/openalex/types.js';
 
-/** Bare or URL-form OpenAlex work ID — the only form `cites`/`cited_by`/`related_to` filters accept. */
-const OPENALEX_WORK_ID_PATTERN = /^(?:https:\/\/openalex\.org\/)?W\d+$/;
 const OPENALEX_URL_PREFIX = 'https://openalex.org/';
 
 /**
- * The `cites`/`cited_by`/`related_to` filters require an OpenAlex W-ID; DOIs and PMIDs
- * are rejected upstream even after `normalizeId` adds a `doi:` prefix (that prefix only
- * works on the `/works/{id}` singleton path). Resolve non-W-IDs via a one-shot singleton
- * lookup so callers can pass any identifier the docs advertise.
+ * Resolve any accepted seed identifier to a bare W-ID and confirm it exists. The graph
+ * filters (`cites`/`cited_by`/`related_to`) themselves don't validate the seed — passing
+ * a non-existent W-ID returns zero edges, indistinguishable from a valid seed with no
+ * citations yet. A singleton `/works/{id}` lookup gates the query so bad seeds surface
+ * as NotFound (bubbles via the service as `entity_not_found`) and good seeds with empty
+ * graphs return honest empty results.
  */
 async function resolveSeedToWorkId(
   service: ReturnType<typeof getOpenAlexService>,
   seedId: string,
   ctx: Context,
 ): Promise<string> {
-  const normalized = normalizeId(seedId);
-  if (OPENALEX_WORK_ID_PATTERN.test(normalized)) {
-    return normalized.replace(OPENALEX_URL_PREFIX, '');
-  }
-
   const lookup = await service.search({ entityType: 'works', id: seedId, select: ['id'] }, ctx);
   const record = lookup.results[0];
   if (!record?.id) {
@@ -40,6 +35,8 @@ async function resolveSeedToWorkId(
 
 const DIRECTIONS = ['cites', 'cited_by', 'related_to'] as const;
 type Direction = (typeof DIRECTIONS)[number];
+
+const RESERVED_FILTER_KEYS: ReadonlySet<string> = new Set<string>(DIRECTIONS);
 
 function buildCitationEcho(input: {
   seed_id: string;
@@ -57,7 +54,7 @@ function buildCitationEcho(input: {
 
 export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   description:
-    "Walk the citation graph one hop from a seed work. Direction picks which edge: incoming citations (cites), the seed's own references (cited_by), or OpenAlex's algorithmic related-works (related_to). Thin wrapper over openalex_search_entities scoped to works — exposes the direction explicitly so callers do not have to know the underlying filter names. Results pass through the works schema; combine with filters/sort to narrow further.",
+    "Walk the citation graph one hop from a seed work. Direction picks the edge: incoming citations (`cites`), the seed's own references (`cited_by`), or OpenAlex's algorithmically-related works (`related_to`). Results use the works schema; combine with filters/sort to narrow further.",
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/citation-graph.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -92,11 +89,18 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         'Read the upstream message for the rejected token, then retry with a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter/sort field name it names.',
     },
     {
+      reason: 'reserved_filter_key',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'filters contains cites/cited_by/related_to — the direction parameter reserves those keys.',
+      recovery:
+        'Remove the reserved key from filters, or restate the relationship through direction.',
+    },
+    {
       reason: 'entity_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'OpenAlex returned no edges for the seed_id in the requested direction.',
+      when: 'OpenAlex has no work matching the seed_id.',
       recovery:
-        'Verify seed_id resolves to an OpenAlex work via openalex_resolve_name; not all works have related_to entries.',
+        'Verify seed_id with openalex_resolve_name, or pass a known OpenAlex work ID (W…), DOI, PMID, or PMCID.',
     },
   ],
   input: z.object({
@@ -115,7 +119,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". The direction filter is added automatically — do not pass cites/cited_by/related_to here.',
+        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Do not include cites/cited_by/related_to — those are set by the `direction` parameter.',
       ),
     sort: z
       .string()
@@ -173,6 +177,21 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   }),
 
   async handler(input, ctx) {
+    if (input.filters) {
+      const reserved = Object.keys(input.filters).find((key) => RESERVED_FILTER_KEYS.has(key));
+      if (reserved !== undefined) {
+        throw ctx.fail(
+          'reserved_filter_key',
+          `${reserved} cannot be passed in filters — direction reserves cites/cited_by/related_to.`,
+          {
+            ...ctx.recoveryFor('reserved_filter_key'),
+            reservedKey: reserved,
+            direction: input.direction,
+          },
+        );
+      }
+    }
+
     const service = getOpenAlexService();
     const workId = await resolveSeedToWorkId(service, input.seed_id, ctx);
 

@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/citation-graph.tool.test
  */
 
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -11,16 +12,23 @@ const mockSearch = vi.fn<() => Promise<SearchResult>>();
 
 vi.mock('@/services/openalex/openalex-service.js', () => ({
   getOpenAlexService: () => ({ search: mockSearch }),
-  normalizeId: (id: string) => {
-    if (id.startsWith('10.')) return `doi:${id}`;
-    if (id.startsWith('https://doi.org/')) return `doi:${id.replace('https://doi.org/', '')}`;
-    return id;
-  },
 }));
 
 const { getCitationGraphTool } = await import(
   '@/mcp-server/tools/definitions/citation-graph.tool.js'
 );
+
+/**
+ * Seed-lookup response factory — every handler call now starts with a `/works/{id}`
+ * singleton lookup before walking the graph, so each test queues one resolved
+ * lookup response per seed before the actual graph search response.
+ */
+function lookupResponse(workId: string): SearchResult {
+  return {
+    meta: { count: 1, per_page: 1, next_cursor: null },
+    results: [{ id: `https://openalex.org/${workId}`, display_name: '' }],
+  };
+}
 
 describe('getCitationGraphTool', () => {
   beforeEach(() => {
@@ -52,7 +60,9 @@ describe('getCitationGraphTool', () => {
   };
 
   it('merges direction into filters and searches works', async () => {
-    mockSearch.mockResolvedValue(sampleResult);
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
+      .mockResolvedValueOnce(sampleResult);
     const ctx = createMockContext();
     const input = getCitationGraphTool.input.parse({
       seed_id: 'W2741809807',
@@ -61,7 +71,8 @@ describe('getCitationGraphTool', () => {
 
     await getCitationGraphTool.handler(input, ctx);
 
-    expect(mockSearch).toHaveBeenCalledWith(
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         entityType: 'works',
         filters: { cites: 'W2741809807' },
@@ -74,10 +85,7 @@ describe('getCitationGraphTool', () => {
   it('resolves a DOI seed_id to a W-ID via a singleton lookup before filtering', async () => {
     const ctx = createMockContext();
     mockSearch
-      .mockResolvedValueOnce({
-        meta: { count: 1, per_page: 1, next_cursor: null },
-        results: [{ id: 'https://openalex.org/W2741809807', display_name: '' }],
-      })
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
       .mockResolvedValueOnce(sampleResult);
 
     const input = getCitationGraphTool.input.parse({
@@ -100,8 +108,10 @@ describe('getCitationGraphTool', () => {
     );
   });
 
-  it('skips the lookup when seed_id is already a W-ID', async () => {
-    mockSearch.mockResolvedValue(sampleResult);
+  it('validates the seed even when seed_id is already a W-ID (gh #20)', async () => {
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
+      .mockResolvedValueOnce(sampleResult);
     const ctx = createMockContext();
     const input = getCitationGraphTool.input.parse({
       seed_id: 'W2741809807',
@@ -110,15 +120,36 @@ describe('getCitationGraphTool', () => {
 
     await getCitationGraphTool.handler(input, ctx);
 
-    expect(mockSearch).toHaveBeenCalledTimes(1);
-    expect(mockSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ filters: { cites: 'W2741809807' } }),
+    expect(mockSearch).toHaveBeenCalledTimes(2);
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ entityType: 'works', id: 'W2741809807', select: ['id'] }),
       ctx,
     );
   });
 
+  it('propagates NotFound when the seed does not exist (gh #20)', async () => {
+    const notFoundError = new McpError(JsonRpcErrorCode.NotFound, 'Entity not found at /works/W9', {
+      reason: 'entity_not_found',
+    });
+    mockSearch.mockRejectedValueOnce(notFoundError);
+    const ctx = createMockContext();
+    const input = getCitationGraphTool.input.parse({
+      seed_id: 'W9999999999999',
+      direction: 'cites',
+    });
+
+    await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'entity_not_found' },
+    });
+    expect(mockSearch).toHaveBeenCalledTimes(1);
+  });
+
   it('strips the URL prefix when seed_id is a full OpenAlex work URL', async () => {
-    mockSearch.mockResolvedValue(sampleResult);
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
+      .mockResolvedValueOnce(sampleResult);
     const ctx = createMockContext();
     const input = getCitationGraphTool.input.parse({
       seed_id: 'https://openalex.org/W2741809807',
@@ -127,15 +158,17 @@ describe('getCitationGraphTool', () => {
 
     await getCitationGraphTool.handler(input, ctx);
 
-    expect(mockSearch).toHaveBeenCalledTimes(1);
-    expect(mockSearch).toHaveBeenCalledWith(
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({ filters: { cites: 'W2741809807' } }),
       ctx,
     );
   });
 
   it('preserves caller filters alongside the direction filter', async () => {
-    mockSearch.mockResolvedValue(sampleResult);
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
+      .mockResolvedValueOnce(sampleResult);
     const ctx = createMockContext();
     const input = getCitationGraphTool.input.parse({
       seed_id: 'W2741809807',
@@ -145,7 +178,8 @@ describe('getCitationGraphTool', () => {
 
     await getCitationGraphTool.handler(input, ctx);
 
-    expect(mockSearch).toHaveBeenCalledWith(
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         filters: {
           publication_year: '>2020',
@@ -158,7 +192,9 @@ describe('getCitationGraphTool', () => {
   });
 
   it('echoes seed_id and direction in result meta', async () => {
-    mockSearch.mockResolvedValue(sampleResult);
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2741809807'))
+      .mockResolvedValueOnce(sampleResult);
     const ctx = createMockContext();
     const input = getCitationGraphTool.input.parse({
       seed_id: 'W2741809807',
@@ -169,6 +205,39 @@ describe('getCitationGraphTool', () => {
 
     expect(result.meta.echo).toContain('seed_id=W2741809807');
     expect(result.meta.echo).toContain('direction=cites');
+  });
+
+  describe('reserved filter keys (gh #21)', () => {
+    for (const reservedKey of ['cites', 'cited_by', 'related_to'] as const) {
+      it(`rejects ${reservedKey} in filters with InvalidParams before hitting upstream`, async () => {
+        const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+        const input = getCitationGraphTool.input.parse({
+          seed_id: 'W2741809807',
+          direction: 'cites',
+          filters: { [reservedKey]: 'W12345' },
+        });
+
+        await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'reserved_filter_key', reservedKey, direction: 'cites' },
+        });
+        expect(mockSearch).not.toHaveBeenCalled();
+      });
+    }
+
+    it('still allows non-reserved filter keys alongside direction', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        filters: { publication_year: '>2020' },
+      });
+
+      await expect(getCitationGraphTool.handler(input, ctx)).resolves.toBeDefined();
+    });
   });
 
   describe('format', () => {
