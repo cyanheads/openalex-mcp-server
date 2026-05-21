@@ -1017,6 +1017,59 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).toHaveBeenCalledTimes(3);
     });
 
+    it('strips mailto from the message when upstream body is not JSON (400)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response('Bad Request', { status: 400, statusText: 'Bad Request' }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search(
+          { entityType: 'works', id: 'W1', select: ['this_field_does_not_exist'] },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'upstream_invalid_params' },
+        message: expect.not.stringMatching(/mailto|test-key/),
+      });
+    });
+
+    it('strips mailto from the message when 404 body is not JSON', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response('Not Found', { status: 404, statusText: 'Not Found' }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works', id: 'W99999999999' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'entity_not_found' },
+        message: expect.not.stringMatching(/mailto|test-key/),
+      });
+    });
+
+    it('falls back to upstream `error` when `message` is missing', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ error: 'Invalid query parameters error.' }), {
+          status: 400,
+          statusText: 'Bad Request',
+        }),
+      );
+
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: 'Invalid query parameters error.',
+      });
+    });
+
     it('stops retrying when ctx.signal aborts during backoff', async () => {
       vi.useFakeTimers();
       const controller = new AbortController();

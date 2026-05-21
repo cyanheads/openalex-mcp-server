@@ -34,6 +34,7 @@ import {
   type SearchParams,
   type SearchResult,
 } from './types.js';
+import { redactUrlsInMessage } from './url-redaction.js';
 
 /**
  * Build an OpenAlex filter string from a key-value record.
@@ -424,22 +425,32 @@ class OpenAlexService {
   }
 
   private throwNormalizedRequestError(error: unknown, path: string, ctx: Context): never {
-    if (!(error instanceof McpError) || typeof error.data?.statusCode !== 'number') {
+    if (!(error instanceof McpError)) {
       throw error;
     }
 
-    const code = httpStatusToErrorCode(error.data.statusCode);
+    const statusCode =
+      typeof error.data?.statusCode === 'number' ? error.data.statusCode : undefined;
+    const code = statusCode === undefined ? undefined : httpStatusToErrorCode(statusCode);
     const normalized = code === undefined ? undefined : NORMALIZED_THROW_BY_CODE[code];
+
     if (normalized === undefined) {
-      throw error;
+      // Framework fetch errors (network, timeout, unmapped status) format the message as
+      // `Fetch failed for <URL>. Status: …` — the URL carries the polite-pool `mailto`
+      // and any future internal params. Redact before bubbling.
+      throw new McpError(error.code, redactUrlsInMessage(error.message), error.data, {
+        cause: error,
+      });
     }
 
     const { factory, reason } = normalized;
-    const upstream = parseOpenAlexErrorBody(error.data.responseBody);
+    const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const message =
-      code === JsonRpcErrorCode.NotFound
-        ? (upstream?.message ?? `Entity not found at ${path}`)
-        : (upstream?.message ?? error.message);
+      upstream?.message ??
+      upstream?.error ??
+      (code === JsonRpcErrorCode.NotFound
+        ? `Entity not found at ${path}`
+        : redactUrlsInMessage(error.message));
 
     const data = {
       ...error.data,
