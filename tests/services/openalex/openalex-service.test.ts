@@ -1216,7 +1216,7 @@ describe('OpenAlexService', () => {
       });
     });
 
-    it('strips the alphabetically-truncated "Valid fields are" list when the body was cut mid-message', async () => {
+    it('strips the valid-fields list from the message while preserving the full upstream message on data', async () => {
       const longMessage =
         'nonexistent_filter is not a valid field. Valid fields are underscore or hyphenated versions of: ' +
         'abstract.search, abstract.search.exact, apc_list.currency, apc_list.provenance, apc_list.value, ' +
@@ -1250,7 +1250,7 @@ describe('OpenAlexService', () => {
         ),
         data: {
           reason: 'upstream_invalid_params',
-          upstreamMessage: expect.stringContaining('Valid fields are'),
+          upstreamMessage: longMessage,
         },
       });
     });

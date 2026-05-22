@@ -19,7 +19,7 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { httpStatusToErrorCode, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -290,6 +290,8 @@ const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace(/s$/, '')));
+const FETCH_TIMEOUT_SENTINEL = 'OPENALEX_FETCH_TIMEOUT';
+const COMPACT_VALID_FIELDS_BODY_THRESHOLD = 500;
 
 type ErrorFactory = (
   message: string,
@@ -394,16 +396,15 @@ function parseOpenAlexErrorBody(
 }
 
 /**
- * OpenAlex 400 messages append an alphabetically-sorted enumeration of valid field
- * names ("Valid fields are: a, b, c, ..."). When the response body was truncated
- * mid-list the surviving prefix misleads agents into believing the early-alphabet
- * fields are the complete set. Strip the list when truncation occurred — the raw
- * upstream prefix stays available on `data.upstreamMessage` for debugging.
+ * OpenAlex 400 messages can append long, alphabetically-sorted enumerations of valid
+ * fields ("Valid fields are: a, b, c, ..."). Keep those long top-level JSON-RPC
+ * messages compact and put the complete upstream text on `data.upstreamMessage`,
+ * where agents can read the rejected token and valid alternatives.
  */
 const VALID_FIELDS_BOUNDARY_RE = /\s*Valid fields\b.*/is;
-function stripTruncatedValidFieldsList(message: string): string {
+function stripValidFieldsList(message: string): string {
   if (!VALID_FIELDS_BOUNDARY_RE.test(message)) return message;
-  return `${message.replace(VALID_FIELDS_BOUNDARY_RE, '').trim()} (list of valid fields omitted — was truncated upstream; see OpenAlex docs)`;
+  return `${message.replace(VALID_FIELDS_BOUNDARY_RE, '').trim()} (list of valid fields omitted from message; see data.upstreamMessage)`;
 }
 
 function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
@@ -436,6 +437,81 @@ function toRequestContext(ctx: Context, operation: string): RequestContext {
   };
 }
 
+async function fetchOpenAlexWithTimeout(
+  url: URL,
+  requestContext: RequestContext,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(FETCH_TIMEOUT_SENTINEL), REQUEST_TIMEOUT_MS);
+  const abortFromCaller = () => controller.abort(signal?.reason);
+
+  if (signal?.aborted) {
+    abortFromCaller();
+  } else {
+    signal?.addEventListener('abort', abortFromCaller, { once: true });
+  }
+
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+
+    if (response.ok) return response;
+
+    const rawBody = await response.text().catch(() => 'Could not read response body');
+    const code = httpStatusToErrorCode(response.status) ?? JsonRpcErrorCode.InternalError;
+    const retryAfter = response.headers.get('retry-after');
+
+    throw new McpError(code, `Fetch failed for ${String(url)}. Status: ${response.status}`, {
+      requestId: requestContext.requestId,
+      operation: requestContext.operation,
+      statusCode: response.status,
+      statusText: response.statusText,
+      responseBody: rawBody,
+      ...(retryAfter !== null && { retryAfter }),
+      errorSource: 'FetchHttpError',
+    });
+  } catch (error) {
+    if (error instanceof McpError) throw error;
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      if (controller.signal.reason === FETCH_TIMEOUT_SENTINEL) {
+        throw timeout(`OpenAlex request timed out after ${REQUEST_TIMEOUT_MS}ms`, {
+          requestId: requestContext.requestId,
+          operation: requestContext.operation,
+          errorSource: 'FetchTimeout',
+        });
+      }
+
+      throw new McpError(
+        JsonRpcErrorCode.InternalError,
+        'OpenAlex request was cancelled',
+        {
+          requestId: requestContext.requestId,
+          operation: requestContext.operation,
+          errorSource: 'FetchAbort',
+        },
+        { cause: error },
+      );
+    }
+
+    throw serviceUnavailable(
+      'OpenAlex request failed',
+      {
+        requestId: requestContext.requestId,
+        operation: requestContext.operation,
+        errorSource: 'FetchNetworkError',
+      },
+      error instanceof Error ? { cause: error } : undefined,
+    );
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abortFromCaller);
+  }
+}
+
 class OpenAlexService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -461,10 +537,7 @@ class OpenAlexService {
     return withRetry(
       async () => {
         try {
-          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, requestContext, {
-            headers: { Accept: 'application/json' },
-            signal: ctx.signal,
-          });
+          const response = await fetchOpenAlexWithTimeout(url, requestContext, ctx.signal);
           const text = await response.text();
           const parsed = this.parseResponse(text, path);
           logResponseMetrics(parsed, path, ctx);
@@ -503,12 +576,17 @@ class OpenAlexService {
     }
 
     const { factory, reason } = normalized;
-    const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
+    const upstreamResponseBody = error.data?.responseBody;
+    const upstream = parseOpenAlexErrorBody(upstreamResponseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
-    const sanitizedMessage =
-      rawMessage !== undefined && upstream?.truncated
-        ? stripTruncatedValidFieldsList(rawMessage)
-        : rawMessage;
+    const shouldCompactValidFieldsList =
+      rawMessage !== undefined &&
+      (upstream?.truncated ||
+        (typeof upstreamResponseBody === 'string' &&
+          upstreamResponseBody.length > COMPACT_VALID_FIELDS_BODY_THRESHOLD));
+    const sanitizedMessage = shouldCompactValidFieldsList
+      ? stripValidFieldsList(rawMessage)
+      : rawMessage;
     const message =
       sanitizedMessage ??
       (code === JsonRpcErrorCode.NotFound
