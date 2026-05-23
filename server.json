@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/openalex-mcp-server",
-  "description": "Access the OpenAlex academic research catalog - 270M+ publications via MCP. STDIO & HTTP.",
+  "description": "Access the OpenAlex academic research catalog — 270M+ publications.",
   "repository": {
     "url": "https://github.com/cyanheads/openalex-mcp-server",
     "source": "github"
   },
-  "version": "0.6.12",
+  "version": "0.6.13",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.6.12",
+      "version": "0.6.13",
       "packageArguments": [
         {
           "type": "positional",
@@ -33,9 +33,9 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_API_KEY",
-          "description": "API key from openalex.org (free).",
+          "description": "OpenAlex API key or mailto email \u2014 optional. Without: anonymous rate limits. With: polite pool access.",
           "format": "string",
-          "isRequired": true
+          "isRequired": false
         },
         {
           "name": "OPENALEX_BASE_URL",
@@ -61,7 +61,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.6.12",
+      "version": "0.6.13",
       "packageArguments": [
         {
           "type": "positional",
@@ -75,9 +75,9 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_API_KEY",
-          "description": "API key from openalex.org (free).",
+          "description": "OpenAlex API key or mailto email \u2014 optional. Without: anonymous rate limits. With: polite pool access.",
           "format": "string",
-          "isRequired": true
+          "isRequired": false
         },
         {
           "name": "OPENALEX_BASE_URL",

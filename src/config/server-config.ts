@@ -6,7 +6,12 @@
 import { z } from '@cyanheads/mcp-ts-core';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().min(1).describe('OpenAlex API key'),
+  apiKey: z
+    .string()
+    .default('')
+    .describe(
+      'OpenAlex API key or mailto email — optional (without: anonymous rate limits; with: polite pool)',
+    ),
   baseUrl: z.string().url().default('https://api.openalex.org').describe('OpenAlex API base URL'),
 });
 

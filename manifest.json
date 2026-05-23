@@ -1,0 +1,47 @@
+{
+  "manifest_version": "0.3",
+  "name": "openalex-mcp-server",
+  "version": "0.6.13",
+  "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
+  "author": { "name": "cyanheads" },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "MCP_AUTH_MODE": "none",
+        "NODE_ENV": "production"
+      }
+    }
+  },
+  "compatibility": {
+    "runtimes": { "node": ">=24.0.0" }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "user_config": {
+    "OPENALEX_API_KEY": {
+      "type": "string",
+      "title": "OpenAlex Email / API Key",
+      "description": "Email address for polite pool access (10x faster rate limits). Optional — omit for anonymous access.",
+      "required": false
+    },
+    "OPENALEX_BASE_URL": {
+      "type": "string",
+      "title": "OpenAlex Base URL",
+      "description": "OpenAlex API base URL.",
+      "default": "https://api.openalex.org",
+      "required": false
+    },
+    "MCP_LOG_LEVEL": {
+      "type": "string",
+      "title": "Log Level",
+      "description": "Minimum log level for output (debug, info, warn, error).",
+      "default": "info",
+      "required": false
+    }
+  }
+}

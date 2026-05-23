@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.13](changelog/0.6.x/0.6.13.md) — 2026-05-23
+
+mcp-ts-core ^0.9.1 → ^0.9.6, zod added, manifest.json + .mcpbignore scaffolded, install badges
+
 ## [0.6.12](changelog/0.6.x/0.6.12.md) — 2026-05-20
 
 Citation-graph seed validation and reserved-filter-key rejection; recover truncated upstream 400 messages; true population count under sample.

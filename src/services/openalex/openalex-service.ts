@@ -451,7 +451,7 @@ class OpenAlexService {
     const operation = `OpenAlex ${path}`;
     const requestContext = toRequestContext(ctx, operation);
     const url = new URL(`${this.baseUrl}${path}`);
-    url.searchParams.set('mailto', this.apiKey);
+    if (this.apiKey) url.searchParams.set('mailto', this.apiKey);
     for (const [key, value] of Object.entries(params)) {
       if (value) url.searchParams.set(key, value);
     }
