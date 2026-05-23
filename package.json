@@ -20,7 +20,7 @@
     "lint:mcp": "bun scripts/lint-mcp.ts",
     "lint:packaging": "bun scripts/lint-packaging.ts",
     "list-skills": "bun scripts/list-skills.ts",
-    "bundle": "bun run build && npx -y @anthropic-ai/mcpb pack . dist/@cyanheads/openalex-mcp-server.mcpb",
+    "bundle": "bun run build && npx -y @anthropic-ai/mcpb pack . dist/openalex-mcp-server.mcpb",
     "audit:refresh": "rm -f bun.lock && bun install && bun audit",
     "changelog:build": "bun scripts/build-changelog.ts",
     "changelog:check": "bun scripts/build-changelog.ts --check",
