@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.14](changelog/0.6.x/0.6.14.md) — 2026-05-25
+
+cursor pagination for non-boolean group_by, corrected citation direction semantics, scope optional
+
 ## [0.6.13](changelog/0.6.x/0.6.13.md) — 2026-05-23
 
 mcp-ts-core ^0.9.1 → ^0.9.6, zod added, manifest.json + .mcpbignore scaffolded, install badges
