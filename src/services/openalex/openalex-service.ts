@@ -37,6 +37,23 @@ import {
 import { redactUrlsInMessage } from './url-redaction.js';
 
 /**
+ * OpenAlex group_by fields that produce only true/false groups and reject
+ * cursor pagination (HTTP 400). These fields never have more than two groups,
+ * so cursor-based paging is unnecessary and the upstream rejects `cursor=*`.
+ */
+const BOOLEAN_GROUP_BY_FIELDS = new Set([
+  'is_retracted',
+  'is_paratext',
+  'is_oa',
+  'has_orcid',
+  'has_doi',
+  'has_raw_affiliation_string',
+  'open_access.is_oa',
+  'apc_paid',
+  'has_fulltext',
+]);
+
+/**
  * Build an OpenAlex filter string from a key-value record.
  * Input: { "cited_by_count": ">100", "is_oa": "true" }
  * Output: "cited_by_count:>100,is_oa:true"
@@ -675,10 +692,17 @@ class OpenAlexService {
       queryParams.per_page = String(params.perPage);
     }
 
-    // Only send cursor when explicitly provided — boolean group_by fields
-    // (is_retracted, has_orcid, etc.) reject cursor pagination entirely.
+    // Boolean group_by fields (is_retracted, has_orcid, etc.) only produce
+    // two groups (true/false) and reject cursor pagination with a 400.
+    // All other fields require cursor=* on the first request to enable
+    // cursor-based pagination — without it, next_cursor is never returned.
+    const baseField = params.groupBy.replace(/:include_unknown$/, '');
+    const isBooleanGroupBy = BOOLEAN_GROUP_BY_FIELDS.has(baseField);
+
     if (params.cursor) {
       queryParams.cursor = params.cursor;
+    } else if (!isBooleanGroupBy) {
+      queryParams.cursor = '*';
     }
 
     const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
