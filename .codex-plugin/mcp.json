@@ -1,0 +1,10 @@
+{
+  "openalex-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/openalex-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio",
+      "OPENALEX_API_KEY": ""
+    }
+  }
+}

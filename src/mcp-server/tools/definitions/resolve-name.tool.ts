@@ -38,7 +38,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the autocomplete query as malformed (HTTP 400).',
       recovery:
         'Trim the query, check filter syntax, and ensure the entity_type is a supported value.',

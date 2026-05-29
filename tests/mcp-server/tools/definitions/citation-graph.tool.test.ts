@@ -209,7 +209,7 @@ describe('getCitationGraphTool', () => {
 
   describe('reserved filter keys (gh #21)', () => {
     for (const reservedKey of ['cites', 'cited_by', 'related_to'] as const) {
-      it(`rejects ${reservedKey} in filters with InvalidParams before hitting upstream`, async () => {
+      it(`rejects ${reservedKey} in filters with ValidationError before hitting upstream`, async () => {
         const ctx = createMockContext({ errors: getCitationGraphTool.errors });
         const input = getCitationGraphTool.input.parse({
           seed_id: 'W2741809807',
@@ -218,7 +218,7 @@ describe('getCitationGraphTool', () => {
         });
 
         await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
-          code: JsonRpcErrorCode.InvalidParams,
+          code: JsonRpcErrorCode.ValidationError,
           data: { reason: 'reserved_filter_key', reservedKey, direction: 'cites' },
         });
         expect(mockSearch).not.toHaveBeenCalled();

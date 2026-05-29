@@ -1,11 +1,16 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-05-23 12:24:09
+Generated on: 2026-05-29 05:24:07
 
 ```text
 openalex-mcp-server/
 ├── .agents/
 ├── .claude/
+├── .claude-plugin/
+│   └── plugin.json
+├── .codex-plugin/
+│   ├── mcp.json
+│   └── plugin.json
 ├── .github/
 │   └── ISSUE_TEMPLATE/
 │       ├── bug_report.yml
@@ -80,15 +85,17 @@ openalex-mcp-server/
 │   │   └── SKILL.md
 │   ├── api-workers/
 │   │   └── SKILL.md
+│   ├── code-simplifier/
+│   │   └── SKILL.md
 │   ├── design-mcp-server/
 │   │   └── SKILL.md
 │   ├── devcheck/
 │   │   └── SKILL.md
 │   ├── field-test/
 │   │   └── SKILL.md
-│   ├── maintenance/
+│   ├── git-wrapup/
 │   │   └── SKILL.md
-│   ├── migrate-mcp-ts-template/
+│   ├── maintenance/
 │   │   └── SKILL.md
 │   ├── polish-docs-meta/
 │   │   ├── references/

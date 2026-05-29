@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.15](changelog/0.6.x/0.6.15.md) — 2026-05-28
+
+mcp-ts-core ^0.9.6 → ^0.9.13: body limit guard, session-init gate, quieter client-error logs, GET /mcp keywords; dep refresh
+
 ## [0.6.14](changelog/0.6.x/0.6.14.md) — 2026-05-25
 
 cursor pagination for non-boolean group_by, corrected citation direction semantics, scope optional

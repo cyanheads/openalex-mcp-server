@@ -1,8 +1,8 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.6.14
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.6`
+**Version:** 0.6.15
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.13`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -26,6 +26,7 @@
 | Tool | `openalex_search_entities` | Search, filter, sort, or retrieve by ID |
 | Tool | `openalex_analyze_trends` | Group-by aggregation for trends/distributions |
 | Tool | `openalex_resolve_name` | Name-to-ID resolution via autocomplete |
+| Tool | `openalex_get_citation_graph` | One-hop citation graph traversal (cites/cited_by/related_to) |
 | Prompt | `openalex_literature_review` | Guided systematic literature search workflow |
 | Prompt | `openalex_research_landscape` | Quantitative research landscape analysis |
 
@@ -66,6 +67,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
 - **Check `ctx.elicit` / `ctx.sample`** for presence before calling.
 - **Secrets in env vars only** — never hardcoded.
+- **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
 
@@ -164,7 +166,7 @@ Handlers throw — the framework catches, classifies, and formats.
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 errors: [
-  { reason: 'semantic_per_page_cap', code: JsonRpcErrorCode.InvalidParams,
+  { reason: 'semantic_per_page_cap', code: JsonRpcErrorCode.ValidationError,
     when: 'per_page exceeds the semantic-search cap',
     recovery: 'Reduce per_page to 50 or less, or switch search_mode to keyword.' },
 ],
@@ -206,6 +208,7 @@ src/
       search-entities.tool.ts           # openalex_search_entities
       analyze-trends.tool.ts            # openalex_analyze_trends
       resolve-name.tool.ts              # openalex_resolve_name
+      citation-graph.tool.ts            # openalex_get_citation_graph
     prompts/definitions/
       literature-review.prompt.ts       # openalex_literature_review
       research-landscape.prompt.ts      # openalex_research_landscape
@@ -243,25 +246,27 @@ Available skills:
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
-| `security-pass` | Audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `tool-defs-analysis` | Read-only audit of LLM-facing definition language (voice, leaks, recovery, sparsity, structure) across tools/resources/prompts |
+| `security-pass` | Audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation |
+| `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
 | `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
+| `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
+| `release-and-publish` | Push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` |
 | `report-issue-local` | File a bug or feature request against this server's own repo |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
-| `api-canvas` | DataCanvas primitive — register tabular data, run SQL, export, `spillover()` helper. Tier 3 opt-in (DuckDB) |
+| `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper — Tier 3 opt-in |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, logger, state, progress |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
+| `api-linter` | Definition linter rule catalog — invoked by `bun run lint:mcp` and `devcheck` |
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
-| `api-utils` | Formatting, parsing, security, pagination, scheduling |
+| `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
 | `api-telemetry` | OTel catalog: spans, metrics, completion logs, env config, cardinality rules |
 | `api-workers` | Cloudflare Workers runtime |
-| `api-linter` | MCP definition lint rules reference (rule IDs, severities, fixes) |
-| `release-and-publish` | End-to-end ship workflow (npm + MCP Registry + GHCR) |
 
 When you complete a skill's checklist, check the boxes and add a completion timestamp at the end (e.g., `Completed: 2026-03-11`).
 
@@ -344,4 +349,7 @@ import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 - [ ] OpenAlex wrapping: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
+- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = package name; `interface.shortDescription` from `package.json` description
+- [ ] `.codex-plugin/mcp.json` updated — server name key matches `package.json` name; env vars added for any required API keys
+- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry with server name key, env vars for any required API keys
 - [ ] `bun run devcheck` passes

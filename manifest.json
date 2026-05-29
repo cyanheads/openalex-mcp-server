@@ -1,9 +1,17 @@
 {
   "manifest_version": "0.3",
   "name": "openalex-mcp-server",
-  "version": "0.6.14",
+  "version": "0.6.15",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
-  "author": { "name": "cyanheads" },
+  "author": {
+    "name": "cyanheads"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/openalex-mcp-server"
+  },
+  "homepage": "https://github.com/cyanheads/openalex-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
@@ -18,7 +26,9 @@
     }
   },
   "compatibility": {
-    "runtimes": { "node": ">=24.0.0" }
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
   },
   "tools_generated": true,
   "prompts_generated": true,
@@ -27,6 +37,7 @@
       "type": "string",
       "title": "OpenAlex Email / API Key",
       "description": "Email address for polite pool access (10x faster rate limits). Optional — omit for anonymous access.",
+      "default": "",
       "required": false
     },
     "OPENALEX_BASE_URL": {

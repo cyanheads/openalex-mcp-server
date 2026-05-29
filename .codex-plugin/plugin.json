@@ -1,0 +1,25 @@
+{
+  "name": "@cyanheads/openalex-mcp-server",
+  "version": "0.6.15",
+  "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/openalex-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/openalex-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "openalex", "academic-research", "scholarly-data"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "@cyanheads/openalex-mcp-server",
+    "shortDescription": "Access the OpenAlex academic research catalog - 270M+ publications through MCP.",
+    "longDescription": "Query the OpenAlex scholarly catalog: 270M+ works, 90M+ authors, 100K+ sources. Search, filter, sort entities by type; analyze publication trends and distributions; resolve author/institution names to IDs; walk citation graphs.",
+    "developerName": "cyanheads",
+    "category": "research",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/openalex-mcp-server",
+    "defaultPrompt": []
+  }
+}

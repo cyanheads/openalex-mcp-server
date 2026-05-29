@@ -83,14 +83,14 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the seed_id, filter, or sort as malformed (HTTP 400).',
       recovery:
         'Read the upstream message for the rejected token, then retry with a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter/sort field name it names.',
     },
     {
       reason: 'reserved_filter_key',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'filters contains cites/cited_by/related_to — the direction parameter reserves those keys.',
       recovery:
         'Remove the reserved key from filters, or restate the relationship through direction.',

@@ -92,7 +92,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the request as malformed (HTTP 400).',
       recovery:
         'Read the upstream message for the rejected token, then retry after correcting the filter operator, sort field, or select field name it names.',
