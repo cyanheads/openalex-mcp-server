@@ -181,11 +181,6 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           .string()
           .nullable()
           .describe('Cursor for next page. null if no more results.'),
-        echo: z
-          .string()
-          .describe(
-            'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — useful when results are empty so callers see what was actually searched.',
-          ),
       })
       .describe('Result metadata including pagination.'),
     results: z
@@ -204,6 +199,29 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         'OpenAlex entity objects passed through unchanged. Additional fields depend on entity_type and select.',
       ),
   }),
+
+  // Agent-facing context for the success path — the query/filters as parsed, the
+  // total match count, and recovery guidance for empty results. Populated via
+  // ctx.enrich(...) so it reaches structuredContent and content[] alike.
+  enrichment: {
+    echo: z
+      .string()
+      .describe(
+        'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — useful when results are empty so callers see what was actually searched.',
+      ),
+    totalCount: z.number().describe('Total results matching the query/filters across all pages.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when results are empty — echoes the criteria and suggests how to broaden. Absent on successful result pages.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    echo: { label: 'Query' },
+    totalCount: { label: 'Total' },
+  },
 
   async handler(input, ctx) {
     if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
@@ -261,8 +279,20 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       totalCount: result.meta.count,
     });
 
+    const echo = buildSearchEcho(input);
+    ctx.enrich({ echo, totalCount: result.meta.count });
+    if (result.results.length === 0) {
+      ctx.enrich.notice(
+        `No matches for ${echo}. Try broadening the query, removing filters, or switching search_mode.`,
+      );
+    }
+
     return {
-      meta: { ...result.meta, echo: buildSearchEcho(input) },
+      meta: {
+        count: result.meta.count,
+        per_page: result.meta.per_page,
+        next_cursor: result.meta.next_cursor,
+      },
       results: result.results,
     };
   },
@@ -273,14 +303,9 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     const header = result.meta.next_cursor
       ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
       : `**${countLabel}**`;
-    lines.push(`${header} | ${result.meta.echo}`);
+    lines.push(header);
 
     if (result.results.length === 0) {
-      lines.push(
-        '',
-        `No matches for ${result.meta.echo}.`,
-        'Try broadening the query, removing filters, or switching search_mode.',
-      );
       return [{ type: 'text', text: lines.join('\n') }];
     }
 

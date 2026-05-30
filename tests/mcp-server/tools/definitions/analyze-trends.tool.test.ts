@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/analyze-trends.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
 
@@ -128,29 +128,76 @@ describe('analyzeTrendsTool', () => {
     expect(input.include_unknown).toBe(false);
   });
 
+  describe('enrichment', () => {
+    it('populates echo and entityTotal on success', async () => {
+      mockAnalyze.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'oa_status',
+        filters: { 'authorships.institutions.country_code': 'us' },
+        include_unknown: true,
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.entityTotal).toBe(50000);
+      expect(enrichment.echo).toContain('entity_type=works');
+      expect(enrichment.echo).toContain('group_by=oa_status');
+      expect(enrichment.echo).toContain('filters={"authorships.institutions.country_code":"us"}');
+      expect(enrichment.echo).toContain('include_unknown=true');
+      expect(enrichment.notice).toBeUndefined();
+    });
+
+    it('sets notice when no groups are returned', async () => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 0, groups_count: 0, next_cursor: null },
+        groups: [],
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'type',
+        filters: { x: 'y' },
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.entityTotal).toBe(0);
+      expect(enrichment.notice).toMatch(/No groups/i);
+    });
+
+    it('does not set notice when groups are present', async () => {
+      mockAnalyze.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+  });
+
   describe('format', () => {
-    type ToolOutput = AnalyzeResult & { meta: AnalyzeResult['meta'] & { echo: string } };
-    const text = (result: ToolOutput) => {
+    const text = (result: AnalyzeResult) => {
       const blocks = analyzeTrendsTool.format?.(result) ?? [];
       expect(blocks[0]).toHaveProperty('type', 'text');
       return (blocks[0] as { type: 'text'; text: string }).text;
     };
 
-    const sampleWithEcho: ToolOutput = {
-      meta: { ...sampleResult.meta, echo: 'entity_type=works | group_by=publication_year' },
-      groups: sampleResult.groups,
-    };
-
-    it('formats groups with total count and echo', () => {
-      const output = text(sampleWithEcho);
+    it('formats groups with total count', () => {
+      const output = text(sampleResult);
       expect(output).toContain('50000 total entities across 3 groups on this page');
-      expect(output).toContain('entity_type=works | group_by=publication_year');
       expect(output).toContain('2024: 20000');
       expect(output).toContain('2023: 18000');
     });
 
     it('renders year-keyed groups in chronological order, not count order', () => {
-      const output = text(sampleWithEcho);
+      const output = text(sampleResult);
       const positions = ['2022', '2023', '2024'].map((year) => output.indexOf(`${year}:`));
       expect(positions[0]).toBeLessThan(positions[1]!);
       expect(positions[1]!).toBeLessThan(positions[2]!);
@@ -162,7 +209,6 @@ describe('analyzeTrendsTool', () => {
           count: 100,
           groups_count: 2,
           next_cursor: null,
-          echo: 'entity_type=works | group_by=type',
         },
         groups: [
           { key: 'article', key_display_name: 'article', count: 80 },
@@ -183,7 +229,6 @@ describe('analyzeTrendsTool', () => {
           count: 600,
           groups_count: groups.length,
           next_cursor: null,
-          echo: 'entity_type=works | group_by=type',
         },
         groups,
       });
@@ -192,20 +237,18 @@ describe('analyzeTrendsTool', () => {
       expect(output).toContain('Group 60 (group-60): 1');
     });
 
-    it('returns "No groups" for empty results with echo and broadening hint', () => {
+    it('returns "No groups" for empty results', () => {
       const output = text({
         meta: {
           count: 0,
           groups_count: 0,
           next_cursor: null,
-          echo: 'entity_type=works | group_by=type | filters={"x":"y"}',
         },
         groups: [],
       });
-      expect(output).toContain('No groups found for entity_type=works | group_by=type');
+      expect(output).toContain('No groups found');
       expect(output).toContain('count=0');
       expect(output).toContain('groups_count=0');
-      expect(output).toContain('Try removing filters');
     });
 
     it('surfaces next_cursor when present', () => {
@@ -214,32 +257,11 @@ describe('analyzeTrendsTool', () => {
           count: 500,
           groups_count: 200,
           next_cursor: 'nxt-abc',
-          echo: 'entity_type=works | group_by=type',
         },
         groups: [{ key: 'k', key_display_name: 'K', count: 1 }],
       });
       expect(output).toContain('nxt-abc');
       expect(output).toContain('200 groups on this page');
-    });
-  });
-
-  describe('handler echo', () => {
-    it('wraps service result with a meta.echo derived from input', async () => {
-      mockAnalyze.mockResolvedValue(sampleResult);
-      const ctx = createMockContext();
-      const input = analyzeTrendsTool.input.parse({
-        entity_type: 'works',
-        group_by: 'oa_status',
-        filters: { 'authorships.institutions.country_code': 'us' },
-        include_unknown: true,
-      });
-
-      const result = await analyzeTrendsTool.handler(input, ctx);
-
-      expect(result.meta.echo).toContain('entity_type=works');
-      expect(result.meta.echo).toContain('group_by=oa_status');
-      expect(result.meta.echo).toContain('filters={"authorships.institutions.country_code":"us"}');
-      expect(result.meta.echo).toContain('include_unknown=true');
     });
   });
 });

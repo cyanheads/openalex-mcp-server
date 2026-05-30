@@ -106,6 +106,17 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .describe('Autocomplete matches, up to 10.'),
   }),
 
+  // Agent-facing success-path context — a notice when the query matched nothing so the
+  // caller sees explicit guidance rather than a silent empty array.
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when no matches were found — echoes the query and suggests corrections. Absent when results are present.',
+      ),
+  },
+
   async handler(input, ctx) {
     const service = getOpenAlexService();
     const result = await service.autocomplete(
@@ -122,6 +133,13 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       entityType: input.entity_type ?? 'all',
       matchCount: result.results.length,
     });
+
+    if (result.results.length === 0) {
+      const scope = input.entity_type ? ` among ${input.entity_type}` : '';
+      ctx.enrich.notice(
+        `No matches for "${input.query}"${scope}. Try a shorter name, alternate spelling, or omit entity_type to search across all types.`,
+      );
+    }
 
     return result;
   },

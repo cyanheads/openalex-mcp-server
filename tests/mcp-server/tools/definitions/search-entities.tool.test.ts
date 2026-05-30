@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
 
@@ -101,6 +101,8 @@ describe('searchEntitiesTool', () => {
         perPage: 10,
         cursor: 'abc123',
         id: undefined,
+        sample: undefined,
+        seed: undefined,
       },
       ctx,
     );
@@ -199,7 +201,7 @@ describe('searchEntitiesTool', () => {
       expect(() => searchEntitiesTool.input.parse({ entity_type: 'works', sample: 0 })).toThrow();
     });
 
-    it('surfaces sample and seed in the echo', async () => {
+    it('surfaces sample and seed in the enrichment echo', async () => {
       mockSearch.mockResolvedValue(sampleResult);
       const ctx = createMockContext();
       const input = searchEntitiesTool.input.parse({
@@ -208,38 +210,93 @@ describe('searchEntitiesTool', () => {
         seed: 'xyz',
       });
 
-      const result = await searchEntitiesTool.handler(input, ctx);
-      expect(result.meta.echo).toContain('sample=10');
-      expect(result.meta.echo).toContain('seed=xyz');
+      await searchEntitiesTool.handler(input, ctx);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.echo).toContain('sample=10');
+      expect(enrichment.echo).toContain('seed=xyz');
+    });
+  });
+
+  describe('enrichment', () => {
+    it('populates echo and totalCount on success', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'climate',
+        filters: { is_oa: 'true' },
+        sort: '-cited_by_count',
+        search_mode: 'semantic',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalCount).toBe(2);
+      expect(enrichment.echo).toContain('entity_type=works');
+      expect(enrichment.echo).toContain('query="climate"');
+      expect(enrichment.echo).toContain('filters={"is_oa":"true"}');
+      expect(enrichment.echo).toContain('sort=-cited_by_count');
+      expect(enrichment.echo).toContain('search_mode=semantic');
+      expect(enrichment.notice).toBeUndefined();
+    });
+
+    it('omits search_mode from echo when keyword (default)', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'x' });
+      await searchEntitiesTool.handler(input, ctx);
+      expect(getEnrichment(ctx).echo).not.toContain('search_mode');
+    });
+
+    it('sets notice when results are empty', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'xyzzy_no_match',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalCount).toBe(0);
+      expect(enrichment.notice).toMatch(/No matches/i);
+      expect(enrichment.notice).toContain('xyzzy_no_match');
+    });
+
+    it('does not set notice when results are present', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'ml' });
+
+      await searchEntitiesTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
     });
   });
 
   describe('format', () => {
-    type ToolOutput = SearchResult & { meta: SearchResult['meta'] & { echo: string } };
-    const text = (result: ToolOutput) => {
+    const text = (result: SearchResult) => {
       const blocks = searchEntitiesTool.format?.(result) ?? [];
       expect(blocks[0]).toHaveProperty('type', 'text');
       return (blocks[0] as { type: 'text'; text: string }).text;
     };
 
-    const sampleWithEcho: ToolOutput = {
-      meta: { ...sampleResult.meta, echo: 'entity_type=works | query="ml"' },
-      results: sampleResult.results,
-    };
-
     it('renders a count header and per-result sections', () => {
-      const output = text(sampleWithEcho);
+      const output = text(sampleResult);
       expect(output).toContain('**2 result(s) — 25 per page**');
       expect(output).toContain('### Paper Alpha');
       expect(output).toContain('### Paper Beta');
       expect(output).toContain('**ID:** W001');
       expect(output).toContain('**ID:** W002');
-      expect(output).toContain('entity_type=works | query="ml"');
     });
 
     it('renders scalar fields with humanized labels', () => {
       const output = text({
-        meta: { count: 1, per_page: 1, next_cursor: null, echo: 'entity_type=works' },
+        meta: { count: 1, per_page: 1, next_cursor: null },
         results: [
           {
             id: 'W001',
@@ -257,7 +314,7 @@ describe('searchEntitiesTool', () => {
 
     it('joins arrays of scalars and renders arrays of objects with one item per line', () => {
       const output = text({
-        meta: { count: 1, per_page: 1, next_cursor: null, echo: 'entity_type=works' },
+        meta: { count: 1, per_page: 1, next_cursor: null },
         results: [
           {
             id: 'W001',
@@ -279,7 +336,7 @@ describe('searchEntitiesTool', () => {
 
     it('flattens nested objects to dot-notation key:value pairs', () => {
       const output = text({
-        meta: { count: 1, per_page: 1, next_cursor: null, echo: 'entity_type=works' },
+        meta: { count: 1, per_page: 1, next_cursor: null },
         results: [
           {
             id: 'W001',
@@ -305,57 +362,22 @@ describe('searchEntitiesTool', () => {
           count: 100,
           per_page: 25,
           next_cursor: 'next123',
-          echo: 'entity_type=works | query="x"',
         },
         results: [{ id: 'W001', display_name: 'Paper' }],
       });
       expect(output).toContain('next cursor: `next123`');
-      expect(output).toContain('entity_type=works | query="x"');
     });
 
-    it('renders empty responses with the echo and a broadening hint', () => {
+    it('renders empty responses with just the count header', () => {
       const output = text({
         meta: {
           count: 0,
           per_page: 25,
           next_cursor: null,
-          echo: 'entity_type=works | query="xyz_no_match"',
         },
         results: [],
       });
       expect(output).toContain('**0 result(s) — 25 per page**');
-      expect(output).toContain('No matches for entity_type=works | query="xyz_no_match"');
-      expect(output).toContain('Try broadening the query');
-    });
-  });
-
-  describe('handler echo', () => {
-    it('wraps service result with a meta.echo derived from input', async () => {
-      mockSearch.mockResolvedValue(sampleResult);
-      const ctx = createMockContext();
-      const input = searchEntitiesTool.input.parse({
-        entity_type: 'works',
-        query: 'climate',
-        filters: { is_oa: 'true' },
-        sort: '-cited_by_count',
-        search_mode: 'semantic',
-      });
-
-      const result = await searchEntitiesTool.handler(input, ctx);
-
-      expect(result.meta.echo).toContain('entity_type=works');
-      expect(result.meta.echo).toContain('query="climate"');
-      expect(result.meta.echo).toContain('filters={"is_oa":"true"}');
-      expect(result.meta.echo).toContain('sort=-cited_by_count');
-      expect(result.meta.echo).toContain('search_mode=semantic');
-    });
-
-    it('omits search_mode from echo when keyword (default)', async () => {
-      mockSearch.mockResolvedValue(sampleResult);
-      const ctx = createMockContext();
-      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'x' });
-      const result = await searchEntitiesTool.handler(input, ctx);
-      expect(result.meta.echo).not.toContain('search_mode');
     });
   });
 });

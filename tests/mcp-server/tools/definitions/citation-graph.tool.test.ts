@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
 
@@ -191,20 +191,57 @@ describe('getCitationGraphTool', () => {
     );
   });
 
-  it('echoes seed_id and direction in result meta', async () => {
-    mockSearch
-      .mockResolvedValueOnce(lookupResponse('W2741809807'))
-      .mockResolvedValueOnce(sampleResult);
-    const ctx = createMockContext();
-    const input = getCitationGraphTool.input.parse({
-      seed_id: 'W2741809807',
-      direction: 'cites',
+  describe('enrichment', () => {
+    it('populates echo and totalEdges on success', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+      });
+
+      await getCitationGraphTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalEdges).toBe(3);
+      expect(enrichment.echo).toContain('seed_id=W2741809807');
+      expect(enrichment.echo).toContain('direction=cites');
+      expect(enrichment.notice).toBeUndefined();
     });
 
-    const result = await getCitationGraphTool.handler(input, ctx);
+    it('sets notice when no edges are returned', async () => {
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockResolvedValueOnce({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'related_to',
+      });
 
-    expect(result.meta.echo).toContain('seed_id=W2741809807');
-    expect(result.meta.echo).toContain('direction=cites');
+      await getCitationGraphTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalEdges).toBe(0);
+      expect(enrichment.notice).toMatch(/No edges/i);
+    });
+
+    it('does not set notice when edges are present', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+      });
+
+      await getCitationGraphTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
   });
 
   describe('reserved filter keys (gh #21)', () => {
@@ -249,7 +286,7 @@ describe('getCitationGraphTool', () => {
 
     it('renders results with id and display_name', () => {
       const output = text({
-        meta: { ...sampleResult.meta, echo: 'seed_id=W1 | direction=cites' },
+        meta: { ...sampleResult.meta },
         results: sampleResult.results,
       });
       expect(output).toContain('First citing work');
@@ -263,25 +300,22 @@ describe('getCitationGraphTool', () => {
           count: 100,
           per_page: 25,
           next_cursor: 'next-page-cursor',
-          echo: 'seed_id=W1 | direction=cites',
         },
         results: sampleResult.results,
       });
       expect(output).toContain('next-page-cursor');
     });
 
-    it('returns empty-edges message when results are empty', () => {
+    it('returns count header when results are empty', () => {
       const output = text({
         meta: {
           count: 0,
           per_page: 25,
           next_cursor: null,
-          echo: 'seed_id=W1 | direction=related_to',
         },
         results: [],
       });
-      expect(output).toContain('No edges for seed_id=W1 | direction=related_to');
-      expect(output).toContain('openalex_resolve_name');
+      expect(output).toContain('0 edge(s) — 25 per page');
     });
   });
 });

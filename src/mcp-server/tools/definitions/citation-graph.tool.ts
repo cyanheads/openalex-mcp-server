@@ -156,9 +156,6 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
           .string()
           .nullable()
           .describe('Cursor for next page. null if no more results.'),
-        echo: z
-          .string()
-          .describe('Compact echo of seed_id, direction, filters, sort — useful when empty.'),
       })
       .describe('Result metadata including pagination.'),
     results: z
@@ -175,6 +172,29 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       )
       .describe('Works on the citation graph in this direction.'),
   }),
+
+  // Agent-facing context for the success path — the query as parsed (seed + direction),
+  // the total edge count, and recovery guidance for empty traversals. Populated via
+  // ctx.enrich(...) so it reaches structuredContent and content[] alike.
+  enrichment: {
+    echo: z
+      .string()
+      .describe(
+        'Compact echo of seed_id, direction, filters, sort — useful when no edges are returned so callers see what was actually queried.',
+      ),
+    totalEdges: z.number().describe('Total edges from seed_id in this direction across all pages.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when no edges are returned — suggests verifying the seed_id, broadening filters, or trying a different direction. Absent when results are present.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    echo: { label: 'Query' },
+    totalEdges: { label: 'Total Edges' },
+  },
 
   async handler(input, ctx) {
     if (input.filters) {
@@ -219,10 +239,19 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       totalCount: result.meta.count,
     });
 
+    const echo = buildCitationEcho(input);
+    ctx.enrich({ echo, totalEdges: result.meta.count });
+    if (result.results.length === 0) {
+      ctx.enrich.notice(
+        `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`,
+      );
+    }
+
     return {
       meta: {
-        ...result.meta,
-        echo: buildCitationEcho(input),
+        count: result.meta.count,
+        per_page: result.meta.per_page,
+        next_cursor: result.meta.next_cursor,
       },
       results: result.results,
     };
@@ -234,14 +263,9 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     const header = result.meta.next_cursor
       ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
       : `**${countLabel}**`;
-    lines.push(`${header} | ${result.meta.echo}`);
+    lines.push(header);
 
     if (result.results.length === 0) {
-      lines.push(
-        '',
-        `No edges for ${result.meta.echo}.`,
-        'Verify the seed_id (use openalex_resolve_name), broaden filters, or try a different direction.',
-      );
       return [{ type: 'text', text: lines.join('\n') }];
     }
 

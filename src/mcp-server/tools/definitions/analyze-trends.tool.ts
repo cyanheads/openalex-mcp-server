@@ -96,11 +96,6 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
           .string()
           .nullable()
           .describe('Cursor for next page of groups. null if no more groups.'),
-        echo: z
-          .string()
-          .describe(
-            'Compact echo of the input criteria (entity_type, group_by, filters) — useful when no groups are returned so callers see what was actually requested.',
-          ),
       })
       .describe('Aggregation metadata.'),
     groups: z
@@ -115,6 +110,31 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       )
       .describe('Aggregation groups with counts.'),
   }),
+
+  // Agent-facing context for the success path — the criteria as parsed, the entity
+  // total, and recovery guidance for empty group results. Populated via ctx.enrich(...)
+  // so it reaches structuredContent and content[] alike.
+  enrichment: {
+    echo: z
+      .string()
+      .describe(
+        'Compact echo of the input criteria (entity_type, group_by, filters) — useful when no groups are returned so callers see what was actually requested.',
+      ),
+    entityTotal: z
+      .number()
+      .describe('Total entities matching the filters before grouping (across all pages).'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when no groups are returned — echoes the criteria and suggests how to adjust. Absent when groups are present.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    echo: { label: 'Query' },
+    entityTotal: { label: 'Entity Total' },
+  },
 
   async handler(input, ctx) {
     const service = getOpenAlexService();
@@ -137,20 +157,32 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       groupCount: result.groups.length,
     });
 
+    const echo = buildAnalyzeEcho(input);
+    ctx.enrich({ echo, entityTotal: result.meta.count });
+    if (result.groups.length === 0) {
+      ctx.enrich.notice(
+        `No groups returned for ${echo}. Try removing filters or grouping by a different field.`,
+      );
+    }
+
     return {
-      meta: { ...result.meta, echo: buildAnalyzeEcho(input) },
+      meta: {
+        count: result.meta.count,
+        groups_count: result.meta.groups_count,
+        next_cursor: result.meta.next_cursor,
+      },
       groups: result.groups,
     };
   },
 
   format: (result) => {
-    const heading = `${result.meta.count} total entities across ${result.meta.groups_count ?? result.groups.length} groups on this page (${result.meta.echo})`;
+    const heading = `${result.meta.count} total entities across ${result.meta.groups_count ?? result.groups.length} groups on this page`;
 
     if (result.groups.length === 0) {
       return [
         {
           type: 'text',
-          text: `No groups found for ${result.meta.echo}. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})\n\nTry removing filters or grouping by a different field.`,
+          text: `No groups found. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})`,
         },
       ];
     }

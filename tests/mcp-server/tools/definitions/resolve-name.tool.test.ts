@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/resolve-name.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
 
@@ -90,6 +90,42 @@ describe('resolveNameTool', () => {
       expect.objectContaining({ entityType: undefined }),
       ctx,
     );
+  });
+
+  describe('enrichment', () => {
+    it('sets no notice when results are present', async () => {
+      mockAutocomplete.mockResolvedValue(sampleResults);
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'Harvard' });
+
+      await resolveNameTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('sets notice when no matches found (cross-entity)', async () => {
+      mockAutocomplete.mockResolvedValue({ results: [] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'xyzzy_nonexistent_entity_abc' });
+
+      await resolveNameTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toMatch(/No matches/i);
+      expect(notice).toContain('xyzzy_nonexistent_entity_abc');
+    });
+
+    it('includes entity_type scope in notice when specified', async () => {
+      mockAutocomplete.mockResolvedValue({ results: [] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({
+        entity_type: 'works',
+        query: 'missing_title_xyz',
+      });
+
+      await resolveNameTool.handler(input, ctx);
+
+      expect(getEnrichment(ctx).notice).toContain('works');
+    });
   });
 
   describe('format', () => {
