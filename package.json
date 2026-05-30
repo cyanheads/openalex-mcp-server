@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/openalex-mcp-server",
-  "version": "0.6.15",
+  "version": "0.6.16",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "mcpName": "io.github.cyanheads/openalex-mcp-server",
   "type": "module",
@@ -9,14 +9,15 @@
   "bin": {
     "openalex-mcp-server": "dist/index.js"
   },
-  "files": ["dist/", "README.md", "LICENSE", "CLAUDE.md", "Dockerfile", "server.json"],
+  "files": ["dist/", "README.md", "LICENSE", "CLAUDE.md", "AGENTS.md", "Dockerfile", "server.json"],
   "scripts": {
     "build": "bun scripts/build.ts",
     "rebuild": "bun scripts/clean.ts && bun scripts/build.ts",
     "clean": "bun scripts/clean.ts",
     "devcheck": "bun scripts/devcheck.ts",
     "tree": "bun scripts/tree.ts",
-    "format": "biome check --write --unsafe .",
+    "format": "biome check --write .",
+    "format:unsafe": "biome check --write --unsafe .",
     "lint:mcp": "bun scripts/lint-mcp.ts",
     "lint:packaging": "bun scripts/lint-packaging.ts",
     "list-skills": "bun scripts/list-skills.ts",
@@ -75,7 +76,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.9.13",
+    "@cyanheads/mcp-ts-core": "^0.9.16",
     "pino-pretty": "^13.1.3",
     "zod": "^4.4.3"
   },
