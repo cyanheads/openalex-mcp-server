@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.18](changelog/0.6.x/0.6.18.md) — 2026-06-01
+
+openalex_search_entities: curated DEFAULT_SELECT applied to ID lookups; resolveSelect helper unifies ID and search paths; select: [\"*\"] sentinel for full record
+
 ## [0.6.17](changelog/0.6.x/0.6.17.md) — 2026-06-01
 
 tool contract fixes: upstream_timeout/unavailable recovery hints, tightened invalid-params hints, direction-inversion note, consumer-phrasing scrub; remove unused tsx devDependency

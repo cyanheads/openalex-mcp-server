@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 05:24:07
+Generated on: 2026-06-01 10:19:14
 
 ```text
 openalex-mcp-server/
@@ -89,8 +89,6 @@ openalex-mcp-server/
 │   │   └── SKILL.md
 │   ├── design-mcp-server/
 │   │   └── SKILL.md
-│   ├── devcheck/
-│   │   └── SKILL.md
 │   ├── field-test/
 │   │   └── SKILL.md
 │   ├── git-wrapup/
@@ -140,14 +138,16 @@ openalex-mcp-server/
 ├── tests/
 │   ├── mcp-server/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── analyze-trends.tool.test.ts
-│   │           ├── citation-graph.tool.test.ts
-│   │           ├── resolve-name.tool.test.ts
-│   │           └── search-entities.tool.test.ts
+│   │       ├── definitions/
+│   │       │   ├── analyze-trends.tool.test.ts
+│   │       │   ├── citation-graph.tool.test.ts
+│   │       │   ├── resolve-name.tool.test.ts
+│   │       │   └── search-entities.tool.test.ts
+│   │       └── render-entity-record.test.ts
 │   └── services/
 │       └── openalex/
 │           ├── openalex-service.test.ts
+│           ├── security.test.ts
 │           └── url-redaction.test.ts
 ├── .dockerignore
 ├── .env.example
