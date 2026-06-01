@@ -267,6 +267,25 @@ function translateSelect(entityType: SearchParams['entityType'], fields: string[
 }
 
 /**
+ * Resolve the upstream `select` projection for an entity request — applied identically to
+ * single-entity ID lookups and search/filter/list calls.
+ *
+ * - omitted or empty → the curated `DEFAULT_SELECT` for the entity type, keeping responses lean
+ *   (full records run 20-70 KB);
+ * - contains `'*'` → the full record: returns `undefined` so the caller omits `select` entirely
+ *   (OpenAlex has no `select=*` wildcard — the sentinel is consumed here, not forwarded);
+ * - explicit field list → those fields, with `id`/`display_name` guaranteed and works aliases
+ *   translated.
+ */
+function resolveSelect(
+  entityType: SearchParams['entityType'],
+  select: string[] | undefined,
+): string[] | undefined {
+  if (select?.includes('*')) return;
+  return translateSelect(entityType, select?.length ? select : DEFAULT_SELECT[entityType]);
+}
+
+/**
  * Match a single bare or URL-form OpenAlex ID. Combined with pipe-splitting in
  * `isOpenAlexFilterValue` to detect OR-joined ID lists.
  */
@@ -586,13 +605,11 @@ class OpenAlexService {
     // Singleton lookup by ID
     if (params.id) {
       const normalizedId = normalizeId(params.id);
-      const queryParams = params.select?.length
-        ? { select: translateSelect(params.entityType, params.select).join(',') }
-        : {};
+      const select = resolveSelect(params.entityType, params.select);
 
       const data = (await this.request(
         `/${params.entityType}/${normalizedId}`,
-        queryParams,
+        select ? { select: select.join(',') } : {},
         ctx,
       )) as EntityRecord;
 
@@ -619,11 +636,8 @@ class OpenAlexService {
       queryParams.sort = sort;
     }
 
-    const select = translateSelect(
-      params.entityType,
-      params.select?.length ? params.select : DEFAULT_SELECT[params.entityType],
-    );
-    if (select.length > 0) {
+    const select = resolveSelect(params.entityType, params.select);
+    if (select) {
       queryParams.select = select.join(',');
     }
 

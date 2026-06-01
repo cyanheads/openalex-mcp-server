@@ -7,6 +7,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_SELECT } from '@/services/openalex/types.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({
@@ -734,6 +735,50 @@ describe('OpenAlexService', () => {
       const service = await getService();
       await service.search({ entityType: 'authors', select: ['id', 'orcid'] }, createMockContext());
       expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,orcid');
+    });
+  });
+
+  // --- Curated default + full-record opt-out (gh #29) ---
+
+  describe('curated default on id lookups (gh #29)', () => {
+    it('applies the curated DEFAULT_SELECT to a bare id lookup', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'works', id: 'W1' }, createMockContext());
+
+      const select = lastFetchUrl().searchParams.get('select');
+      expect(select).not.toBeNull();
+      const fields = new Set(select?.split(','));
+      for (const field of DEFAULT_SELECT.works) expect(fields.has(field)).toBe(true);
+    });
+
+    it('omits select for a full-record id lookup via ["*"]', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'works', id: 'W1', select: ['*'] }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('select')).toBe(false);
+    });
+
+    it('omits select for a full-record search via ["*"]', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', query: 'climate', select: ['*'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.has('select')).toBe(false);
+    });
+
+    it('treats select: [] as no preference — curated default, not the full record', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'works', id: 'W1', select: [] }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('select')).toBe(true);
     });
   });
 

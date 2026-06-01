@@ -39,7 +39,7 @@ function buildSearchEcho(input: {
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches return a curated set of fields by default; pass `select` to override with specific fields.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -127,7 +127,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, other search/filter/sort params are ignored. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, other search/filter/sort params are ignored — but `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -157,7 +157,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()
