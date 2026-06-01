@@ -77,6 +77,22 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
     },
     {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'OpenAlex did not respond within the request deadline.',
+      retryable: true,
+      recovery:
+        'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      retryable: true,
+      recovery:
+        'Wait and retry; check https://openalex.org for service status if the outage persists.',
+    },
+    {
       reason: 'upstream_unauthorized',
       code: JsonRpcErrorCode.Unauthorized,
       when: 'OpenAlex rejected the API key (HTTP 401).',
@@ -95,7 +111,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the request as malformed (HTTP 400).',
       recovery:
-        'Read the upstream message for the rejected token, then retry after correcting the filter operator, sort field, or select field name it names.',
+        'The upstream message names the rejected field; the valid-fields list it appends may be truncated. Drop or correct that filter, sort, or select field — for select, retry without it to see the curated valid fields, then re-add corrected names.',
     },
     {
       reason: 'upstream_validation_failed',
@@ -141,7 +157,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error listing the valid ones. Example: ["doi", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. Searches apply a curated default per entity type; pass to override. Single-entity lookups (by `id`) return the full record unless set. Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()
@@ -207,7 +223,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     echo: z
       .string()
       .describe(
-        'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — useful when results are empty so callers see what was actually searched.',
+        'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — surfaces what was actually searched when results are empty.',
       ),
     totalCount: z.number().describe('Total results matching the query/filters across all pages.'),
     notice: z

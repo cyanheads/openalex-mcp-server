@@ -24,6 +24,22 @@ export const resolveNameTool = tool('openalex_resolve_name', {
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
     },
     {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'OpenAlex did not respond within the request deadline.',
+      retryable: true,
+      recovery:
+        'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      retryable: true,
+      recovery:
+        'Wait and retry; check https://openalex.org for service status if the outage persists.',
+    },
+    {
       reason: 'upstream_unauthorized',
       code: JsonRpcErrorCode.Unauthorized,
       when: 'OpenAlex rejected the API key (HTTP 401).',

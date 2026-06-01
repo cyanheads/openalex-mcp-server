@@ -24,6 +24,22 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
     },
     {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'OpenAlex did not respond within the request deadline.',
+      retryable: true,
+      recovery:
+        'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      retryable: true,
+      recovery:
+        'Wait and retry; check https://openalex.org for service status if the outage persists.',
+    },
+    {
       reason: 'upstream_unauthorized',
       code: JsonRpcErrorCode.Unauthorized,
       when: 'OpenAlex rejected the API key (HTTP 401).',
@@ -42,7 +58,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
       recovery:
-        'OpenAlex rejected a token in group_by or filters. The upstream message names the rejected key and lists valid alternatives — read it, then retry with a valid filter key (e.g. abstract.search, title.search, default.search for full-text inside filters) or a valid group_by field for the entity_type.',
+        'The upstream message names the rejected key in group_by or filters; the valid-fields list it appends may be truncated. Retry with a valid group_by field for the entity_type, or a valid filter key — for full-text inside filters use abstract.search, title.search, or default.search.',
     },
     {
       reason: 'upstream_validation_failed',
@@ -78,7 +94,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .max(200)
       .default(200)
       .describe(
-        'Maximum groups per page (1-200). Default 200 (the upstream cap). Use lower values when only the top-N groups are relevant — reduces token spend without changing the underlying aggregation.',
+        'Maximum groups per page (1-200). Default 200 (the upstream cap). Reduce when only the top-N groups matter — same aggregation, smaller payload.',
       ),
     cursor: z
       .string()
@@ -118,7 +134,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     echo: z
       .string()
       .describe(
-        'Compact echo of the input criteria (entity_type, group_by, filters) — useful when no groups are returned so callers see what was actually requested.',
+        'Compact echo of the input criteria (entity_type, group_by, filters) — surfaces what was actually requested when no groups are returned.',
       ),
     entityTotal: z
       .number()

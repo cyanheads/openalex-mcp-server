@@ -54,7 +54,7 @@ function buildCitationEcho(input: {
 
 export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   description:
-    "Walk the citation graph one hop from a seed work. Direction picks the edge: incoming citations (`cites`), the seed's own references (`cited_by`), or OpenAlex's algorithmically-related works (`related_to`). Results use the works schema; combine with filters/sort to narrow further.",
+    "Walk the citation graph one hop from a seed work. Direction picks the edge: incoming citations (`cites`), the seed's own references (`cited_by`), or OpenAlex's algorithmically-related works (`related_to`). Note: `direction` follows OpenAlex's filter convention, which inverts the common English reading — `cites` returns works that cite the seed; `cited_by` returns works the seed cites. Results use the works schema; combine with filters/sort to narrow further.",
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/citation-graph.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -66,6 +66,22 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'OpenAlex did not respond within the request deadline.',
+      retryable: true,
+      recovery:
+        'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      retryable: true,
+      recovery:
+        'Wait and retry; check https://openalex.org for service status if the outage persists.',
     },
     {
       reason: 'upstream_unauthorized',
@@ -86,7 +102,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the seed_id, filter, or sort as malformed (HTTP 400).',
       recovery:
-        'Read the upstream message for the rejected token, then retry with a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter/sort field name it names.',
+        'The upstream message names the rejected token; any valid-fields list it appends may be truncated. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter or sort field name.',
     },
     {
       reason: 'reserved_filter_key',
@@ -180,7 +196,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     echo: z
       .string()
       .describe(
-        'Compact echo of seed_id, direction, filters, sort — useful when no edges are returned so callers see what was actually queried.',
+        'Compact echo of seed_id, direction, filters, sort — surfaces what was actually queried when no edges are returned.',
       ),
     totalEdges: z.number().describe('Total edges from seed_id in this direction across all pages.'),
     notice: z
