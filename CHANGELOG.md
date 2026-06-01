@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.17](changelog/0.6.x/0.6.17.md) — 2026-06-01
+
+tool contract fixes: upstream_timeout/unavailable recovery hints, tightened invalid-params hints, direction-inversion note, consumer-phrasing scrub; remove unused tsx devDependency
+
 ## [0.6.16](changelog/0.6.x/0.6.16.md) — 2026-05-30
 
 enrichment block on search/analyze/citation/resolve_name tools; query echo, true totals, and empty-result guidance in both structuredContent and content[]
