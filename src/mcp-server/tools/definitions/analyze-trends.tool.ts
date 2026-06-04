@@ -94,13 +94,19 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .max(200)
       .default(200)
       .describe(
-        'Maximum groups per page (1-200). Default 200 (the upstream cap). Reduce when only the top-N groups matter — same aggregation, smaller payload.',
+        'Maximum groups per page (1-200). Default 200 (the upstream cap). A real top-N knob when order is count (the default) — reduce to return only the highest-count groups.',
+      ),
+    order: z
+      .enum(['count', 'key'])
+      .optional()
+      .describe(
+        'Sort order for groups. Omit or pass "count" (default) to return the top-N groups by count descending — no further pages. Pass "key" to enumerate all distinct values in key-ascending order with cursor pagination. Use "key" only when you need a full traversal; most analysis calls want "count".',
       ),
     cursor: z
       .string()
       .optional()
       .describe(
-        'Pagination cursor from a previous response. Group-by returns max 200 groups per page. Pass cursor to get the next page. The first page is sorted by count descending; subsequent pages (cursor pages) are sorted by key, not by count.',
+        'Pagination cursor from a previous response. Only relevant when order is "key" — count-descending results have no next page. Pass the next_cursor from the previous response to advance.',
       ),
   }),
   output: z.object({
@@ -128,8 +134,8 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
   }),
 
   // Agent-facing context for the success path — the criteria as parsed, the entity
-  // total, and recovery guidance for empty group results. Populated via ctx.enrich(...)
-  // so it reaches structuredContent and content[] alike.
+  // total, and recovery guidance for empty group results or truncation. Populated via
+  // ctx.enrich(...) so it reaches structuredContent and content[] alike.
   enrichment: {
     echo: z
       .string()
@@ -143,7 +149,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Recovery guidance when no groups are returned — echoes the criteria and suggests how to adjust. Absent when groups are present.',
+        'Guidance notice. Set when no groups are returned (recovery suggestions) or when the page is full and more groups likely exist (truncation signal with narrowing advice). Absent otherwise.',
       ),
   },
 
@@ -161,6 +167,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         filters: input.filters,
         includeUnknown: input.include_unknown,
         perPage: input.per_page,
+        order: input.order,
         cursor: input.cursor,
       },
       ctx,
@@ -175,9 +182,18 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
 
     const echo = buildAnalyzeEcho(input);
     ctx.enrich({ echo, entityTotal: result.meta.count });
+
     if (result.groups.length === 0) {
       ctx.enrich.notice(
         `No groups returned for ${echo}. Try removing filters or grouping by a different field.`,
+      );
+    } else if (result.groups.length === input.per_page) {
+      // Page is filled to the limit — more distinct groups likely exist beyond this page.
+      // In count-desc order (the default) the omitted groups all have counts ≤ the smallest
+      // group shown, so we can bound the gap even though OpenAlex exposes no total group count.
+      const smallestCount = result.groups[result.groups.length - 1]?.count ?? 0;
+      ctx.enrich.notice(
+        `Showing the top ${result.groups.length} groups by count. Smallest shown has count = ${smallestCount}; any omitted group has count ≤ ${smallestCount}. Narrow with \`filters\`, raise \`per_page\` (max 200), or enumerate all with \`order: "key"\`.`,
       );
     }
 
@@ -238,11 +254,13 @@ function buildAnalyzeEcho(input: {
   group_by: string;
   filters?: Record<string, string> | undefined;
   include_unknown?: boolean | undefined;
+  order?: 'count' | 'key' | undefined;
 }): string {
   const parts = [`entity_type=${input.entity_type}`, `group_by=${input.group_by}`];
   if (input.filters && Object.keys(input.filters).length > 0) {
     parts.push(`filters=${JSON.stringify(input.filters)}`);
   }
   if (input.include_unknown) parts.push('include_unknown=true');
+  if (input.order) parts.push(`order=${input.order}`);
   return parts.join(' | ');
 }

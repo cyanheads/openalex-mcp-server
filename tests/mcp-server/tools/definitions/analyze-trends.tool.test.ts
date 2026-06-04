@@ -120,6 +120,33 @@ describe('analyzeTrendsTool', () => {
     expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'page2' }), ctx);
   });
 
+  it('threads order through to the service', async () => {
+    mockAnalyze.mockResolvedValue(sampleResult);
+    const ctx = createMockContext();
+    const input = analyzeTrendsTool.input.parse({
+      entity_type: 'works',
+      group_by: 'primary_topic.field.id',
+      order: 'key',
+    });
+
+    await analyzeTrendsTool.handler(input, ctx);
+
+    expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ order: 'key' }), ctx);
+  });
+
+  it('passes order: undefined when not supplied', async () => {
+    mockAnalyze.mockResolvedValue(sampleResult);
+    const ctx = createMockContext();
+    const input = analyzeTrendsTool.input.parse({
+      entity_type: 'works',
+      group_by: 'publication_year',
+    });
+
+    await analyzeTrendsTool.handler(input, ctx);
+
+    expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ order: undefined }), ctx);
+  });
+
   it('defaults include_unknown to false', () => {
     const input = analyzeTrendsTool.input.parse({
       entity_type: 'works',
@@ -169,12 +196,60 @@ describe('analyzeTrendsTool', () => {
       expect(enrichment.notice).toMatch(/No groups/i);
     });
 
-    it('does not set notice when groups are present', async () => {
+    it('does not set notice when groups are present but page is not full', async () => {
       mockAnalyze.mockResolvedValue(sampleResult);
       const ctx = createMockContext();
       const input = analyzeTrendsTool.input.parse({
         entity_type: 'works',
         group_by: 'publication_year',
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('sets truncation notice when page is filled to per_page limit', async () => {
+      // Create a result with exactly per_page=4 groups (page full)
+      const groups = Array.from({ length: 4 }, (_, i) => ({
+        key: `k${i}`,
+        key_display_name: `Key ${i}`,
+        count: 100 - i * 10,
+      }));
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 5000, groups_count: 4, next_cursor: null },
+        groups,
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'primary_topic.field.id',
+        per_page: 4,
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.notice).toBeDefined();
+      expect(enrichment.notice).toContain('top 4 groups by count');
+      expect(enrichment.notice).toContain('Smallest shown has count = 70');
+      expect(enrichment.notice).toContain('order: "key"');
+    });
+
+    it('does not set truncation notice when groups count is less than per_page', async () => {
+      // 3 groups returned but per_page=10 — page not full
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 500, groups_count: 3, next_cursor: null },
+        groups: [
+          { key: 'a', key_display_name: 'A', count: 300 },
+          { key: 'b', key_display_name: 'B', count: 150 },
+          { key: 'c', key_display_name: 'C', count: 50 },
+        ],
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'type',
+        per_page: 10,
       });
 
       await analyzeTrendsTool.handler(input, ctx);

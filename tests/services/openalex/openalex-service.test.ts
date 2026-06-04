@@ -944,6 +944,65 @@ describe('OpenAlexService', () => {
       await service.analyze({ entityType: 'works', groupBy: 'type' }, createMockContext());
       expect(lastFetchUrl().searchParams.has('per_page')).toBe(false);
     });
+
+    // --- cursor / sort-order fix (gh #37) ---
+
+    it('omits cursor on the first page (count-desc default)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'works', groupBy: 'primary_topic.field.id' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+    });
+
+    it('sends cursor=* when order is "key" (key-asc enumeration first page)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'works', groupBy: 'primary_topic.field.id', order: 'key' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('cursor')).toBe('*');
+    });
+
+    it('forwards an explicit cursor on subsequent pages regardless of order', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'works', groupBy: 'primary_topic.field.id', cursor: 'abc123' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('cursor')).toBe('abc123');
+    });
+
+    it('omits cursor for boolean fields even with order: "key" (upstream rejects cursor on boolean fields)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'works', groupBy: 'is_oa', order: 'key' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+    });
+
+    it('omits cursor for boolean fields in count-desc mode', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.analyze({ entityType: 'works', groupBy: 'is_retracted' }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+    });
   });
 
   // --- Response metrics ---

@@ -708,14 +708,20 @@ class OpenAlexService {
 
     // Boolean group_by fields (is_retracted, has_orcid, etc.) only produce
     // two groups (true/false) and reject cursor pagination with a 400.
-    // All other fields require cursor=* on the first request to enable
-    // cursor-based pagination — without it, next_cursor is never returned.
+    //
+    // For all other fields, cursor behaviour follows the sort order:
+    //   - count-desc (default): omit cursor on the first page so OpenAlex returns groups
+    //     count-descending. `next_cursor` will be null — count-desc has no next page.
+    //   - key-asc (order: "key"): send cursor=* on the first page. OpenAlex returns groups
+    //     in key-ascending order and emits a `next_cursor` for full enumeration.
+    //   - subsequent pages: forward the caller-supplied cursor as-is.
     const baseField = params.groupBy.replace(/:include_unknown$/, '');
     const isBooleanGroupBy = BOOLEAN_GROUP_BY_FIELDS.has(baseField);
+    const keyAscOrder = !isBooleanGroupBy && params.order === 'key';
 
     if (params.cursor) {
       queryParams.cursor = params.cursor;
-    } else if (!isBooleanGroupBy) {
+    } else if (keyAscOrder) {
       queryParams.cursor = '*';
     }
 

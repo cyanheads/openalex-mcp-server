@@ -106,6 +106,12 @@ export interface AnalyzeParams {
   filters?: Record<string, string> | undefined;
   groupBy: string;
   includeUnknown?: boolean | undefined;
+  /**
+   * Sort order for groups. Omit (or `"count"`) for count-descending — the top-N groups by
+   * count, matching OpenAlex's native default. Pass `"key"` to enumerate all distinct values
+   * in key-ascending order with cursor pagination.
+   */
+  order?: 'count' | 'key' | undefined;
   perPage?: number | undefined;
 }
 
