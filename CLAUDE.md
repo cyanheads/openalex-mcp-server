@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.6.19
+**Version:** 0.6.20
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.21`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.20](changelog/0.6.x/0.6.20.md) — 2026-06-04
+
+openalex_analyze_trends: order parameter, count-desc default, cursor fix, truncation notice
+
 ## [0.6.19](changelog/0.6.x/0.6.19.md) — 2026-06-02
 
 Adopt @cyanheads/mcp-ts-core 0.9.21: per-request log context fix, fetchWithTimeout secret scrubbing, withRetry fail-fast on non-retryable errors
