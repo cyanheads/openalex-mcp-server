@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-06-08
+
+openalex_analyze_trends: gated page-truncation notice on sort order; 0.7.0 recognizes openalex_describe_fields as a minor addition
+
 ## [0.6.21](changelog/0.6.x/0.6.21.md) — 2026-06-08
 
 openalex_describe_fields tool, ranked invalid-field suggestions, comma-safe filters
