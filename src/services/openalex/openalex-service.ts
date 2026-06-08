@@ -23,6 +23,8 @@ import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/m
 
 import { getServerConfig } from '@/config/server-config.js';
 
+import fieldCatalog from './field-catalog.json' with { type: 'json' };
+import { rankFields } from './field-ranker.js';
 import {
   type AnalyzeParams,
   type AnalyzeResult,
@@ -31,6 +33,7 @@ import {
   DEFAULT_SELECT,
   ENTITY_TYPES,
   type EntityRecord,
+  type EntityType,
   type SearchParams,
   type SearchResult,
 } from './types.js';
@@ -57,10 +60,33 @@ const BOOLEAN_GROUP_BY_FIELDS = new Set([
  * Build an OpenAlex filter string from a key-value record.
  * Input: { "cited_by_count": ">100", "is_oa": "true" }
  * Output: "cited_by_count:>100,is_oa:true"
+ *
+ * Comma handling (commas collide with OpenAlex's filter clause separator):
+ * - `*.search` keys: wrap the value in double quotes for faithful phrase passthrough
+ *   (skip if already quoted).
+ * - All other keys: throw a pre-flight validation error — OpenAlex OR-lists use `|`, not commas.
  */
-function buildFilterString(filters: Record<string, string>): string {
+function buildFilterString(filters: Record<string, string>, ctx: Context): string {
   return Object.entries(filters)
-    .map(([key, value]) => `${key}:${value}`)
+    .map(([key, value]) => {
+      if (value.includes(',')) {
+        if (key.endsWith('.search')) {
+          // Phrase passthrough: double-quote wrapping preserves the comma as free-text.
+          const quoted = value.startsWith('"') && value.endsWith('"') ? value : `"${value}"`;
+          return `${key}:${quoted}`;
+        }
+        // Non-search key: comma is a caller error — OpenAlex uses | for OR, not comma.
+        throw invalidParams(
+          `Filter \`${key}\` value contains a comma, which OpenAlex reads as a filter separator. Use \`|\` for OR (e.g. \`2020|2021\`), or a \`.search\` filter or the \`query\` parameter for free text.`,
+          {
+            ...ctx.recoveryFor('comma_in_filter_value'),
+            reason: 'comma_in_filter_value',
+            filterKey: key,
+          },
+        );
+      }
+      return `${key}:${value}`;
+    })
     .join(',');
 }
 
@@ -442,6 +468,63 @@ function stripTruncatedValidFieldsList(message: string): string {
   return `${message.replace(VALID_FIELDS_BOUNDARY_RE, '').trim()} (list of valid fields omitted — was truncated upstream; see OpenAlex docs)`;
 }
 
+/**
+ * Regex to extract the rejected field name from an OpenAlex 400 message.
+ * Matches patterns like:
+ *   "funder is not a valid field for group_by"
+ *   "totally_made_up_field is not a valid select field"
+ *   "nonexistent_filter is not a valid field"
+ * Capture group 1 = the rejected field name.
+ */
+const REJECTED_FIELD_RE = /^([a-z0-9_.]+)\s+is not a valid/i;
+
+/**
+ * Context keywords in the upstream 400 message mapped to the catalog lookup key.
+ * OpenAlex uses "filter" and "group_by" / "select" in its messages.
+ */
+function inferContext(message: string): 'filter' | 'select' {
+  return /\bselect\b/i.test(message) ? 'select' : 'filter';
+}
+
+/**
+ * Derive the entity type from the API path (e.g., "/works" → "works").
+ * Falls back to undefined when the path doesn't match a known entity type.
+ */
+function entityTypeFromPath(path: string): EntityType | undefined {
+  const segment = path.replace(/^\//, '').split('/')[0];
+  return ENTITY_TYPES.includes(segment as EntityType) ? (segment as EntityType) : undefined;
+}
+
+/**
+ * Append ranked field suggestions and a describe_fields pointer to an
+ * `upstream_invalid_params` error message when a rejected field name is
+ * extractable from the upstream body.
+ */
+function appendFieldSuggestions(message: string, path: string): string {
+  const match = REJECTED_FIELD_RE.exec(message);
+  if (!match?.[1]) return message;
+
+  const rejectedField = match[1];
+  const entityType = entityTypeFromPath(path);
+  if (!entityType) return message;
+
+  const context = inferContext(message);
+  const catalogEntry = (fieldCatalog as Record<string, { filter: string[]; select: string[] }>)[
+    entityType
+  ];
+  if (!catalogEntry) return message;
+
+  const pool = catalogEntry[context];
+  const suggestions = rankFields(rejectedField, pool, 3);
+  if (suggestions.length === 0) return message;
+
+  const base = VALID_FIELDS_BOUNDARY_RE.test(message)
+    ? message.replace(VALID_FIELDS_BOUNDARY_RE, '').trim()
+    : message;
+
+  return `${base} Did you mean: ${suggestions.join(', ')}? Browse all with openalex_describe_fields(entity_type, context).`;
+}
+
 function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
   switch (searchMode) {
     case 'exact':
@@ -541,10 +624,21 @@ class OpenAlexService {
     const { factory, reason } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
-    const sanitizedMessage =
-      rawMessage !== undefined && upstream?.truncated
-        ? stripTruncatedValidFieldsList(rawMessage)
-        : rawMessage;
+    // A truncated body's appended valid-fields list is misleading. For an invalid-field
+    // 400, replace it with catalog-backed ranked suggestions; otherwise strip it. The two
+    // are mutually exclusive — appendFieldSuggestions already drops the partial list, so it
+    // must run on the raw message, not the stripped one.
+    let sanitizedMessage = rawMessage;
+    if (rawMessage !== undefined && upstream?.truncated) {
+      const withSuggestions =
+        code === JsonRpcErrorCode.InvalidParams
+          ? appendFieldSuggestions(rawMessage, path)
+          : rawMessage;
+      sanitizedMessage =
+        withSuggestions === rawMessage
+          ? stripTruncatedValidFieldsList(rawMessage)
+          : withSuggestions;
+    }
     const message =
       sanitizedMessage ??
       (code === JsonRpcErrorCode.NotFound
@@ -627,7 +721,10 @@ class OpenAlexService {
     }
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
+      queryParams.filter = buildFilterString(
+        translateFilters(params.entityType, params.filters),
+        ctx,
+      );
     }
 
     const sort = normalizeSort(params.sort);
@@ -699,7 +796,10 @@ class OpenAlexService {
       : params.groupBy;
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
+      queryParams.filter = buildFilterString(
+        translateFilters(params.entityType, params.filters),
+        ctx,
+      );
     }
 
     if (params.perPage !== undefined) {
@@ -749,7 +849,7 @@ class OpenAlexService {
     };
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(params.filters);
+      queryParams.filter = buildFilterString(params.filters, ctx);
     }
 
     const data = (await this.request(path, queryParams, ctx)) as {
@@ -776,4 +876,12 @@ export function getOpenAlexService(): OpenAlexService {
   if (!_service)
     throw new Error('OpenAlexService not initialized — call initOpenAlexService() in setup()');
   return _service;
+}
+
+/**
+ * Return the typed field catalog keyed by entity type → context → field list.
+ * `group_by` shares the same valid-field set as `filter` — callers resolve it to `filter`.
+ */
+export function getFieldCatalog(): Record<EntityType, { filter: string[]; select: string[] }> {
+  return fieldCatalog as Record<EntityType, { filter: string[]; select: string[] }>;
 }

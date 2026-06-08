@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-06-02 14:39:42
+Generated on: 2026-06-08 07:10:40
 
 ```text
 openalex-mcp-server/
@@ -38,6 +38,7 @@ openalex-mcp-server/
 │   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── generate-field-catalog.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
@@ -137,11 +138,14 @@ openalex-mcp-server/
 │   │       ├── definitions/
 │   │       │   ├── analyze-trends.tool.ts
 │   │       │   ├── citation-graph.tool.ts
+│   │       │   ├── describe-fields.tool.ts
 │   │       │   ├── resolve-name.tool.ts
 │   │       │   └── search-entities.tool.ts
 │   │       └── render-entity-record.ts
 │   ├── services/
 │   │   └── openalex/
+│   │       ├── field-catalog.json
+│   │       ├── field-ranker.ts
 │   │       ├── openalex-service.ts
 │   │       ├── types.ts
 │   │       └── url-redaction.ts
@@ -152,11 +156,13 @@ openalex-mcp-server/
 │   │       ├── definitions/
 │   │       │   ├── analyze-trends.tool.test.ts
 │   │       │   ├── citation-graph.tool.test.ts
+│   │       │   ├── describe-fields.tool.test.ts
 │   │       │   ├── resolve-name.tool.test.ts
 │   │       │   └── search-entities.tool.test.ts
 │   │       └── render-entity-record.test.ts
 │   └── services/
 │       └── openalex/
+│           ├── field-ranker.test.ts
 │           ├── openalex-service.test.ts
 │           ├── security.test.ts
 │           └── url-redaction.test.ts

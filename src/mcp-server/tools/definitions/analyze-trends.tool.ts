@@ -54,11 +54,18 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
     },
     {
+      reason: 'comma_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      recovery:
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+    },
+    {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
       recovery:
-        'The upstream message names the rejected key in group_by or filters; the valid-fields list it appends may be truncated. Retry with a valid group_by field for the entity_type, or a valid filter key — for full-text inside filters use abstract.search, title.search, or default.search.',
+        'The upstream message names the rejected key and suggests close matches. Use openalex_describe_fields(entity_type, "group_by") to browse valid group_by fields, or openalex_describe_fields(entity_type, "filter") for filter fields.',
     },
     {
       reason: 'upstream_validation_failed',

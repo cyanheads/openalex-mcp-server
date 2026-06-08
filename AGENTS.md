@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.6.20
+**Version:** 0.6.21
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.21`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
@@ -27,6 +27,7 @@
 | Tool | `openalex_analyze_trends` | Group-by aggregation for trends/distributions |
 | Tool | `openalex_resolve_name` | Name-to-ID resolution via autocomplete |
 | Tool | `openalex_get_citation_graph` | One-hop citation graph traversal (cites/cited_by/related_to) |
+| Tool | `openalex_describe_fields` | List valid filter/group_by/select field names per entity type |
 | Prompt | `openalex_literature_review` | Guided systematic literature search workflow |
 | Prompt | `openalex_research_landscape` | Quantitative research landscape analysis |
 

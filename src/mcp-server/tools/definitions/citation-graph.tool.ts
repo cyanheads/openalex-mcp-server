@@ -98,11 +98,18 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
     },
     {
+      reason: 'comma_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      recovery:
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+    },
+    {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the seed_id, filter, or sort as malformed (HTTP 400).',
       recovery:
-        'The upstream message names the rejected token; any valid-fields list it appends may be truncated. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or correct the filter or sort field name.',
+        'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or use openalex_describe_fields(entity_type, "filter") to browse valid filter fields.',
     },
     {
       reason: 'reserved_filter_key',

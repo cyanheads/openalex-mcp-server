@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/openalex-mcp-server</h1>
   <p><b>Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.</b>
-  <div>4 Tools &bull; 2 Prompts</div>
+  <div>5 Tools &bull; 2 Prompts</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.6.20-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.6.21-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Tools
 
-Four tools for querying the [OpenAlex](https://openalex.org) academic research catalog:
+Five tools for querying the [OpenAlex](https://openalex.org) academic research catalog:
 
 | Tool Name | Description |
 |:----------|:------------|
@@ -37,6 +37,7 @@ Four tools for querying the [OpenAlex](https://openalex.org) academic research c
 | `openalex_analyze_trends` | Group-by aggregation for trend and distribution analysis. |
 | `openalex_resolve_name` | Resolve a name or partial name to an OpenAlex ID via autocomplete. |
 | `openalex_get_citation_graph` | Walk the citation graph one hop from a seed work: cites, cited_by, or related_to. |
+| `openalex_describe_fields` | List valid filter, group_by, and select field names for an entity type — call before building a query to avoid invalid-field errors. |
 
 ### `openalex_search_entities`
 
@@ -84,6 +85,17 @@ One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`c
 - `related_to`: OpenAlex algorithmic "related works" (~8-30 typical, may be empty for less-cited seeds)
 - Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`
 - Stacks with `filters`/`sort`/`select` to narrow the graph (e.g., `publication_year=">2020"`, `is_oa="true"`)
+
+---
+
+### `openalex_describe_fields`
+
+Discover valid field names before constructing a query — avoids invalid-field 400 errors. Backed by a catalog generated from OpenAlex's own field validation.
+
+- List valid fields for any entity type and context (`filter`, `group_by`, or `select`)
+- `group_by` resolves to the same valid-field set as `filter`
+- Pass `query` (a partial or guessed name) to rank results by name similarity — surfaces the right field when you only know roughly what you want
+- Complements the ranked "did you mean" suggestions now appended to invalid-field errors on the search, trends, and citation-graph tools
 
 ## Prompts
 

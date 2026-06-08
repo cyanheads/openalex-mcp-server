@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/openalex-mcp-server",
-  "version": "0.6.20",
+  "version": "0.6.21",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "mcpName": "io.github.cyanheads/openalex-mcp-server",
   "type": "module",
@@ -22,6 +22,7 @@
     "lint:packaging": "bun scripts/lint-packaging.ts",
     "list-skills": "bun scripts/list-skills.ts",
     "bundle": "bun run build && npx -y @anthropic-ai/mcpb pack . dist/openalex-mcp-server.mcpb",
+    "generate:field-catalog": "bun scripts/generate-field-catalog.ts",
     "audit:refresh": "rm -f bun.lock && bun install && bun audit",
     "changelog:build": "bun scripts/build-changelog.ts",
     "changelog:check": "bun scripts/build-changelog.ts --check",
@@ -83,7 +84,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.2",
     "depcheck": "^1.4.7",
     "ignore": "^7.0.5",
     "tsc-alias": "^1.8.17",

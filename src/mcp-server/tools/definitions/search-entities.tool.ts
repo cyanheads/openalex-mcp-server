@@ -107,11 +107,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
     },
     {
+      reason: 'comma_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      recovery:
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+    },
+    {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the request as malformed (HTTP 400).',
       recovery:
-        'The upstream message names the rejected field; the valid-fields list it appends may be truncated. Drop or correct that filter, sort, or select field — for select, retry without it to see the curated valid fields, then re-add corrected names.',
+        'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, context) to browse all valid fields for the given entity type and context.',
     },
     {
       reason: 'upstream_validation_failed',

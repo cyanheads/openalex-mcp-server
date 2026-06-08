@@ -15,7 +15,7 @@
 
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { copyFile, mkdir, readdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -89,6 +89,28 @@ function formatBytes(bytes: number): string {
   return `${(kb / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * Recursively copy non-TS data assets (`*.json`) from `srcDir` to `destDir`,
+ * mirroring directory structure. tsc emits only compiled `.ts` output, so shipped
+ * JSON data files (the field catalog) must be copied into `dist` separately.
+ */
+async function copyAssets(srcDir: string, destDir: string): Promise<number> {
+  let copied = 0;
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const from = join(srcDir, entry.name);
+    const to = join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copied += await copyAssets(from, to);
+    } else if (entry.name.endsWith('.json')) {
+      await mkdir(destDir, { recursive: true });
+      await copyFile(from, to);
+      copied++;
+    }
+  }
+  return copied;
+}
+
 async function main() {
   // Read package info
   const pkg = JSON.parse(readFileSync(join(ROOT_DIR, 'package.json'), 'utf-8'));
@@ -113,6 +135,12 @@ async function main() {
     'tsc-alias',
   );
   if (!alias.ok) process.exit(1);
+
+  // Step 3: copy data assets tsc does not emit (e.g. field-catalog.json)
+  const assetsCopied = await copyAssets(join(ROOT_DIR, 'src'), DIST_DIR);
+  if (assetsCopied > 0) {
+    console.log(`  \x1b[32m✓\x1b[0m copied ${assetsCopied} data asset(s)`);
+  }
 
   const totalMs = Math.round(performance.now() - totalStart);
 

@@ -72,6 +72,41 @@ describe('OpenAlexService', () => {
     expect(() => getOpenAlexService()).toThrow(/not initialized/);
   });
 
+  // --- Field catalog smoke test (gh #40) ---
+
+  describe('getFieldCatalog', () => {
+    const ENTITY_TYPES_UNDER_TEST = [
+      'works',
+      'authors',
+      'sources',
+      'institutions',
+      'topics',
+      'keywords',
+      'publishers',
+      'funders',
+    ] as const;
+
+    it('returns non-empty filter and select arrays for every entity type', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const catalog = getFieldCatalog();
+
+      for (const entityType of ENTITY_TYPES_UNDER_TEST) {
+        const entry = catalog[entityType];
+        expect(entry, `${entityType} missing from catalog`).toBeDefined();
+        expect(entry.filter.length, `${entityType}.filter is empty`).toBeGreaterThan(0);
+        expect(entry.select.length, `${entityType}.select is empty`).toBeGreaterThan(0);
+      }
+    });
+
+    it('catalog works.filter contains expected common fields', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const { filter } = getFieldCatalog().works;
+      expect(filter).toContain('publication_year');
+      expect(filter).toContain('is_oa');
+      expect(filter).toContain('awards.funder_id');
+    });
+  });
+
   // --- ID normalization (tested through search with id param) ---
 
   describe('normalizeId', () => {
@@ -153,6 +188,53 @@ describe('OpenAlexService', () => {
       const service = await getService();
       await service.search({ entityType: 'works' }, createMockContext());
       expect(lastFetchUrl().searchParams.has('filter')).toBe(false);
+    });
+
+    // --- Comma-in-filter-value handling (gh #38) ---
+
+    it('wraps a .search filter value containing a comma in double quotes (faithful phrase passthrough)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { 'title.search': 'deep, learning' } },
+        createMockContext(),
+      );
+      const filter = lastFetchUrl().searchParams.get('filter') ?? '';
+      expect(filter).toBe('title.search:"deep, learning"');
+    });
+
+    it('does not double-wrap a .search value already quoted', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { 'title.search': '"deep, learning"' } },
+        createMockContext(),
+      );
+      const filter = lastFetchUrl().searchParams.get('filter') ?? '';
+      expect(filter).toBe('title.search:"deep, learning"');
+    });
+
+    it('throws comma_in_filter_value for a non-search filter with a comma, naming the field', async () => {
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'works', filters: { publication_year: '2020,2021' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: expect.stringContaining('publication_year'),
+        data: { reason: 'comma_in_filter_value', filterKey: 'publication_year' },
+      });
+      // Pre-flight: fetch must not have been called.
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('passes comma-free filter values through unchanged', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { publication_year: '2020-2024' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('publication_year:2020-2024');
     });
   });
 
@@ -1320,7 +1402,7 @@ describe('OpenAlexService', () => {
       });
     });
 
-    it('strips the alphabetically-truncated "Valid fields are" list when the body was cut mid-message', async () => {
+    it('strips the truncated "Valid fields are" list and appends catalog-backed suggestions', async () => {
       const longMessage =
         'nonexistent_filter is not a valid field. Valid fields are underscore or hyphenated versions of: ' +
         'abstract.search, abstract.search.exact, apc_list.currency, apc_list.provenance, apc_list.value, ' +
@@ -1342,20 +1424,20 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
 
-      await expect(
-        service.search(
-          { entityType: 'works', filters: { nonexistent_filter: 'x' } },
-          createMockContext(),
-        ),
-      ).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        message: expect.stringMatching(
-          /^nonexistent_filter is not a valid field\..*list of valid fields omitted/,
-        ),
-        data: {
-          reason: 'upstream_invalid_params',
-          upstreamMessage: expect.stringContaining('Valid fields are'),
-        },
+      const err = (await service
+        .search({ entityType: 'works', filters: { nonexistent_filter: 'x' } }, createMockContext())
+        .catch((e) => e)) as { code: unknown; message: string; data: Record<string, unknown> };
+
+      expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
+      // Catalog-backed suggestions replace the truncated valid-fields list. The two are
+      // mutually exclusive — the message reads cleanly with no leftover strip-note.
+      expect(err.message).toMatch(
+        /^nonexistent_filter is not a valid field\. Did you mean: .+\? Browse all with openalex_describe_fields/,
+      );
+      expect(err.message).not.toContain('list of valid fields omitted');
+      expect(err.data).toMatchObject({
+        reason: 'upstream_invalid_params',
+        upstreamMessage: expect.stringContaining('Valid fields are'),
       });
     });
 
