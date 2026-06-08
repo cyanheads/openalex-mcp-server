@@ -255,6 +255,83 @@ describe('analyzeTrendsTool', () => {
       await analyzeTrendsTool.handler(input, ctx);
       expect(getEnrichment(ctx).notice).toBeUndefined();
     });
+
+    it('emits a key-order pagination notice (not the count-bound one) on order:"key" with a next_cursor', async () => {
+      // Page filled to per_page in key-ascending mode with more pages to come (#41).
+      const groups = Array.from({ length: 5 }, (_, i) => ({
+        key: `${1990 + i}`,
+        key_display_name: `${1990 + i}`,
+        count: 10 + i,
+      }));
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 5000, groups_count: 5, next_cursor: 'nxt-key' },
+        groups,
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        order: 'key',
+        per_page: 5,
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toBeDefined();
+      expect(notice).toContain('key-ascending order');
+      expect(notice).toContain('next_cursor');
+      // The count-bound wording from #37 must not appear in key-order mode (#41).
+      expect(notice).not.toMatch(/by count/);
+      expect(notice).not.toMatch(/omitted group/);
+    });
+
+    it('suppresses the notice on order:"key" when the traversal is complete (no next_cursor)', async () => {
+      const groups = Array.from({ length: 5 }, (_, i) => ({
+        key: `${1990 + i}`,
+        key_display_name: `${1990 + i}`,
+        count: 10 + i,
+      }));
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 5000, groups_count: 5, next_cursor: null },
+        groups,
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        order: 'key',
+        per_page: 5,
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('still emits the count-bound notice when order is explicitly "count" and the page is full', async () => {
+      const groups = Array.from({ length: 4 }, (_, i) => ({
+        key: `k${i}`,
+        key_display_name: `Key ${i}`,
+        count: 100 - i * 10,
+      }));
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 5000, groups_count: 4, next_cursor: null },
+        groups,
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'primary_topic.field.id',
+        order: 'count',
+        per_page: 4,
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('top 4 groups by count');
+      expect(notice).toContain('order: "key"');
+    });
   });
 
   describe('format', () => {

@@ -194,10 +194,20 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       ctx.enrich.notice(
         `No groups returned for ${echo}. Try removing filters or grouping by a different field.`,
       );
+    } else if (input.order === 'key') {
+      // Key-ascending traversal: omitted groups sit beyond the cursor, not in a count tail, so
+      // the count-bound notice below would be false here (it would name the smallest keys as the
+      // "top by count"). The honest signal is whether OpenAlex returned a next_cursor; page-fill
+      // is irrelevant in this mode.
+      if (result.meta.next_cursor) {
+        ctx.enrich.notice(
+          `Showing ${result.groups.length} groups in key-ascending order. Pass the returned \`next_cursor\` to continue the traversal.`,
+        );
+      }
     } else if (result.groups.length === input.per_page) {
-      // Page is filled to the limit — more distinct groups likely exist beyond this page.
-      // In count-desc order (the default) the omitted groups all have counts ≤ the smallest
-      // group shown, so we can bound the gap even though OpenAlex exposes no total group count.
+      // Count-desc (the default): the page is filled to the limit, so more distinct groups likely
+      // exist. The omitted groups all have counts ≤ the smallest group shown, so we can bound the
+      // gap even though OpenAlex exposes no total group count.
       const smallestCount = result.groups[result.groups.length - 1]?.count ?? 0;
       ctx.enrich.notice(
         `Showing the top ${result.groups.length} groups by count. Smallest shown has count = ${smallestCount}; any omitted group has count ≤ ${smallestCount}. Narrow with \`filters\`, raise \`per_page\` (max 200), or enumerate all with \`order: "key"\`.`,
