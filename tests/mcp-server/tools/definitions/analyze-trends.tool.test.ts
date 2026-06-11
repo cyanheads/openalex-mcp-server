@@ -156,7 +156,7 @@ describe('analyzeTrendsTool', () => {
   });
 
   describe('enrichment', () => {
-    it('populates echo and entityTotal on success', async () => {
+    it('populates echo and totalCount on success', async () => {
       mockAnalyze.mockResolvedValue(sampleResult);
       const ctx = createMockContext();
       const input = analyzeTrendsTool.input.parse({
@@ -169,7 +169,7 @@ describe('analyzeTrendsTool', () => {
       await analyzeTrendsTool.handler(input, ctx);
 
       const enrichment = getEnrichment(ctx);
-      expect(enrichment.entityTotal).toBe(50000);
+      expect(enrichment.totalCount).toBe(50000);
       expect(enrichment.echo).toContain('entity_type=works');
       expect(enrichment.echo).toContain('group_by=oa_status');
       expect(enrichment.echo).toContain('filters={"authorships.institutions.country_code":"us"}');
@@ -192,7 +192,7 @@ describe('analyzeTrendsTool', () => {
       await analyzeTrendsTool.handler(input, ctx);
 
       const enrichment = getEnrichment(ctx);
-      expect(enrichment.entityTotal).toBe(0);
+      expect(enrichment.totalCount).toBe(0);
       expect(enrichment.notice).toMatch(/No groups/i);
     });
 

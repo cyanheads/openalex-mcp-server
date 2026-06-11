@@ -205,7 +205,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .describe(
         'Compact echo of seed_id, direction, filters, sort — surfaces what was actually queried when no edges are returned.',
       ),
-    totalEdges: z.number().describe('Total edges from seed_id in this direction across all pages.'),
+    totalCount: z.number().describe('Total edges from seed_id in this direction across all pages.'),
     notice: z
       .string()
       .optional()
@@ -216,7 +216,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
 
   enrichmentTrailer: {
     echo: { label: 'Query' },
-    totalEdges: { label: 'Total Edges' },
+    totalCount: { label: 'Total Edges' },
   },
 
   async handler(input, ctx) {
@@ -263,7 +263,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     });
 
     const echo = buildCitationEcho(input);
-    ctx.enrich({ echo, totalEdges: result.meta.count });
+    ctx.enrich({ echo, totalCount: result.meta.count });
     if (result.results.length === 0) {
       ctx.enrich.notice(
         `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`,

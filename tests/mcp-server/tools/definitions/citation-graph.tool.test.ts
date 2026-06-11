@@ -192,7 +192,7 @@ describe('getCitationGraphTool', () => {
   });
 
   describe('enrichment', () => {
-    it('populates echo and totalEdges on success', async () => {
+    it('populates echo and totalCount on success', async () => {
       mockSearch
         .mockResolvedValueOnce(lookupResponse('W2741809807'))
         .mockResolvedValueOnce(sampleResult);
@@ -205,7 +205,7 @@ describe('getCitationGraphTool', () => {
       await getCitationGraphTool.handler(input, ctx);
 
       const enrichment = getEnrichment(ctx);
-      expect(enrichment.totalEdges).toBe(3);
+      expect(enrichment.totalCount).toBe(3);
       expect(enrichment.echo).toContain('seed_id=W2741809807');
       expect(enrichment.echo).toContain('direction=cites');
       expect(enrichment.notice).toBeUndefined();
@@ -225,7 +225,7 @@ describe('getCitationGraphTool', () => {
       await getCitationGraphTool.handler(input, ctx);
 
       const enrichment = getEnrichment(ctx);
-      expect(enrichment.totalEdges).toBe(0);
+      expect(enrichment.totalCount).toBe(0);
       expect(enrichment.notice).toMatch(/No edges/i);
     });
 

@@ -149,7 +149,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .describe(
         'Compact echo of the input criteria (entity_type, group_by, filters) — surfaces what was actually requested when no groups are returned.',
       ),
-    entityTotal: z
+    totalCount: z
       .number()
       .describe('Total entities matching the filters before grouping (across all pages).'),
     notice: z
@@ -162,7 +162,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
 
   enrichmentTrailer: {
     echo: { label: 'Query' },
-    entityTotal: { label: 'Entity Total' },
+    totalCount: { label: 'Entity Total' },
   },
 
   async handler(input, ctx) {
@@ -188,7 +188,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     });
 
     const echo = buildAnalyzeEcho(input);
-    ctx.enrich({ echo, entityTotal: result.meta.count });
+    ctx.enrich({ echo, totalCount: result.meta.count });
 
     if (result.groups.length === 0) {
       ctx.enrich.notice(

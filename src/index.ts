@@ -15,6 +15,8 @@ import { searchEntitiesTool } from '@/mcp-server/tools/definitions/search-entiti
 import { initOpenAlexService } from '@/services/openalex/openalex-service.js';
 
 await createApp({
+  name: 'openalex-mcp-server',
+  title: 'openalex-mcp-server',
   tools: [
     resolveNameTool,
     searchEntitiesTool,
