@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-06-11
+
+mcp-ts-core ^0.9.21 → ^0.10.6: identity pair, sampling removed, elicitation wired, DataCanvas SQL gate hardened; enrichment key renames totalCount; bundle cleaner; skill sync
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-06-08
 
 openalex_analyze_trends: gated page-truncation notice on sort order; 0.7.0 recognizes openalex_describe_fields as a minor addition

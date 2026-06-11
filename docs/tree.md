@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-06-08 09:19:08
+Generated on: 2026-06-11 21:07:01
 
 ```text
 openalex-mcp-server/
@@ -37,6 +37,7 @@ openalex-mcp-server/
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── generate-field-catalog.ts
@@ -124,6 +125,10 @@ openalex-mcp-server/
 │   ├── security-pass/
 │   │   └── SKILL.md
 │   ├── setup/
+│   │   └── SKILL.md
+│   ├── techniques/
+│   │   ├── references/
+│   │   │   └── outline-on-overflow.md
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
