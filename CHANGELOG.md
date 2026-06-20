@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-06-20
+
+mcp-ts-core ^0.10.6 → ^0.10.9 maintenance: fresh-scaffold devcheck guards, new floating-dependency-specifier check, plugin-manifest packaging checks; dev-dependency refresh. No behavior change.
+
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-06-11
 
 mcp-ts-core ^0.9.21 → ^0.10.6: identity pair, sampling removed, elicitation wired, DataCanvas SQL gate hardened; enrichment key renames totalCount; bundle cleaner; skill sync
