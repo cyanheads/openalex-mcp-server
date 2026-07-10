@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.3](changelog/0.7.x/0.7.3.md) — 2026-07-09
+
+Fix: OPENALEX_API_KEY now authenticates as api_key= (the old mailto= was ignored); new OPENALEX_MAILTO for polite-pool identification; mcp-ts-core ^0.10.14 supply-chain guard adopted.
+
 ## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-06-20
 
 mcp-ts-core ^0.10.6 → ^0.10.9 maintenance: fresh-scaffold devcheck guards, new floating-dependency-specifier check, plugin-manifest packaging checks; dev-dependency refresh. No behavior change.

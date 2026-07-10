@@ -1,8 +1,8 @@
 # Agent Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.7.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.9`
+**Version:** 0.7.3
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.14`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -37,7 +37,8 @@ No resources — entity lookups need `select` for payload control, which fits to
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| `OPENALEX_API_KEY` | No | Email for the OpenAlex polite pool (10x faster rate limits); omit for anonymous access |
+| `OPENALEX_API_KEY` | No | OpenAlex account API key, sent as `api_key=` (free from https://openalex.org/settings/api); omit for anonymous access |
+| `OPENALEX_MAILTO` | No | Email sent as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key |
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
 
 ---
@@ -249,7 +250,7 @@ Available skills:
 | `tool-defs-analysis` | Read-only audit of LLM-facing definition language (voice, leaks, recovery, sparsity, structure) across tools/resources/prompts |
 | `security-pass` | Audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
-| `devcheck` | Lint, format, typecheck, audit |
+| `techniques` | Reusable response/data-shaping patterns — overflow handling, payload shaping, retrieval |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
 | `release-and-publish` | Push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |

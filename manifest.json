@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "openalex-mcp-server",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "author": {
     "name": "cyanheads"
@@ -35,8 +35,15 @@
   "user_config": {
     "OPENALEX_API_KEY": {
       "type": "string",
-      "title": "OpenAlex Email / API Key",
-      "description": "Email address for polite pool access (10x faster rate limits). Optional — omit for anonymous access.",
+      "title": "OpenAlex API Key",
+      "description": "OpenAlex account API key, sent as api_key= (free from https://openalex.org/settings/api). Optional — omit for anonymous access.",
+      "default": "",
+      "required": false
+    },
+    "OPENALEX_MAILTO": {
+      "type": "string",
+      "title": "OpenAlex Mailto",
+      "description": "Optional email sent as mailto= to identify yourself to OpenAlex (the polite pool). Separate from the API key.",
       "default": "",
       "required": false
     },

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -151,14 +151,14 @@ Add to your MCP client config (e.g., `claude_desktop_config.json`):
       "command": "npx",
       "args": ["-y", "@cyanheads/openalex-mcp-server"],
       "env": {
-        "OPENALEX_API_KEY": "your-email@example.com"
+        "OPENALEX_API_KEY": "your-openalex-api-key"
       }
     }
   }
 }
 ```
 
-No API key needed — just provide your email to access the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool) (10x faster rate limits).
+`OPENALEX_API_KEY` is optional — set it to a free [OpenAlex account key](https://openalex.org/settings/api) for keyed rate limits and budget under OpenAlex's usage-based pricing, or omit it for anonymous access. Set `OPENALEX_MAILTO` to an email if you want to identify yourself to OpenAlex (the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool)).
 
 ### Prerequisites
 
@@ -185,7 +185,8 @@ bun install
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `OPENALEX_API_KEY` | **Optional.** Email address for the OpenAlex [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool) (10x faster rate limits). Without it, anonymous rate limits apply. | — |
+| `OPENALEX_API_KEY` | **Optional.** OpenAlex account API key, sent upstream as `api_key=` (free from [openalex.org/settings/api](https://openalex.org/settings/api)). Without it, anonymous rate limits apply. | — |
+| `OPENALEX_MAILTO` | **Optional.** Email sent upstream as `mailto=` to identify yourself to OpenAlex (the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool)). A courtesy identifier, separate from the API key. | — |
 | `OPENALEX_BASE_URL` | OpenAlex API base URL. | `https://api.openalex.org` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |

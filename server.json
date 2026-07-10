@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/openalex-mcp-server",
     "source": "github"
   },
-  "version": "0.7.2",
+  "version": "0.7.3",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.7.2",
+      "version": "0.7.3",
       "packageArguments": [
         {
           "type": "positional",
@@ -33,7 +33,13 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_API_KEY",
-          "description": "OpenAlex API key or mailto email \u2014 optional. Without: anonymous rate limits. With: polite pool access.",
+          "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OPENALEX_MAILTO",
+          "description": "Optional email sent as mailto= to identify yourself to OpenAlex (the polite pool). Separate from the API key.",
           "format": "string",
           "isRequired": false
         },
@@ -61,7 +67,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
       "runtimeHint": "node",
-      "version": "0.7.2",
+      "version": "0.7.3",
       "packageArguments": [
         {
           "type": "positional",
@@ -75,7 +81,13 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_API_KEY",
-          "description": "OpenAlex API key or mailto email \u2014 optional. Without: anonymous rate limits. With: polite pool access.",
+          "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OPENALEX_MAILTO",
+          "description": "Optional email sent as mailto= to identify yourself to OpenAlex (the polite pool). Separate from the API key.",
           "format": "string",
           "isRequired": false
         },
