@@ -107,9 +107,23 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'OpenAlex rejected the seed_id, filter, or sort as malformed (HTTP 400).',
+      when: 'OpenAlex rejected an invalid filter or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or use openalex_describe_fields(entity_type, "filter") to browse valid filter fields.',
+    },
+    {
+      reason: 'upstream_sort_requires_search',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'sort=-relevance_score was used but the citation-graph query has no active search (HTTP 400).',
+      recovery:
+        'Sorting by relevance_score requires an active search, which a citation-graph walk lacks — choose a concrete sort field such as -cited_by_count or -publication_date, or add a `*.search` filter.',
+    },
+    {
+      reason: 'upstream_invalid_params_other',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
+      recovery:
+        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
     },
     {
       reason: 'reserved_filter_key',

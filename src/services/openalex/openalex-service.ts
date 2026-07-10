@@ -479,6 +479,38 @@ function stripTruncatedValidFieldsList(message: string): string {
 const REJECTED_FIELD_RE = /^([a-z0-9_.]+)\s+is not a valid/i;
 
 /**
+ * OpenAlex 400 emitted when a relevance-score sort is requested without an active search
+ * (no `query` and no `*.search` filter): "Must include a search query (such as ?search=…)
+ * in order to sort by relevance_score." Names no rejected field, so `describe_fields` is the
+ * wrong next move — the caller needs a search, not a corrected field name.
+ */
+const SORT_REQUIRES_SEARCH_RE = /must include a search query/i;
+
+/**
+ * OpenAlex 400 emitted when group_by targets a field it cannot aggregate — a raw date, a
+ * float, or a `*.search` operator: "Cannot group by date, number, or search fields." Names
+ * no rejected field; the caller needs a categorical/year field, not a corrected name.
+ */
+const UNGROUPABLE_GROUP_BY_RE = /cannot group by/i;
+
+/**
+ * A single upstream HTTP 400 spans several distinct failure shapes, each needing a different
+ * caller recovery. Pick the declared tool reason from the message shape so the per-tool
+ * `recovery` hint (resolved via `ctx.recoveryFor`) matches the actual failure instead of
+ * always claiming a rejected field name. Ordering: the field-name check is the most specific
+ * (anchored at string start); the rest are keyword probes; anything unmatched falls through
+ * to a neutral `_other` reason so no shape inherits the field-name recovery by default.
+ */
+function classifyInvalidParamsReason(rawMessage: string | undefined): string {
+  if (rawMessage !== undefined) {
+    if (REJECTED_FIELD_RE.test(rawMessage)) return 'upstream_invalid_params';
+    if (SORT_REQUIRES_SEARCH_RE.test(rawMessage)) return 'upstream_sort_requires_search';
+    if (UNGROUPABLE_GROUP_BY_RE.test(rawMessage)) return 'upstream_ungroupable_group_by';
+  }
+  return 'upstream_invalid_params_other';
+}
+
+/**
  * Context keywords in the upstream 400 message mapped to the catalog lookup key.
  * OpenAlex uses "filter" and "group_by" / "select" in its messages.
  */
@@ -628,9 +660,17 @@ class OpenAlexService {
       });
     }
 
-    const { factory, reason } = normalized;
+    const { factory } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
+    // Every upstream 400 shares one factory/code, but the useful recovery differs by failure
+    // shape — discriminate on the message so the tool's `recovery` hint matches (invalid field
+    // name → describe_fields; relevance sort without a search → add a query; ungroupable
+    // group_by → pick a categorical field). Non-400 codes keep their single mapped reason.
+    const reason =
+      code === JsonRpcErrorCode.InvalidParams
+        ? classifyInvalidParamsReason(rawMessage)
+        : normalized.reason;
     // A truncated body's appended valid-fields list is misleading. For an invalid-field
     // 400, replace it with catalog-backed ranked suggestions; otherwise strip it. The two
     // are mutually exclusive — appendFieldSuggestions already drops the partial list, so it
@@ -887,7 +927,9 @@ export function getOpenAlexService(): OpenAlexService {
 
 /**
  * Return the typed field catalog keyed by entity type → context → field list.
- * `group_by` shares the same valid-field set as `filter` — callers resolve it to `filter`.
+ * Only `filter` and `select` arrays are stored. `group_by` resolves to the `filter` key here;
+ * the describe-fields handler then prunes the fields group_by cannot target (raw dates,
+ * `*.search` operators, and `from_*`/`to_*` range modifiers).
  */
 export function getFieldCatalog(): Record<EntityType, { filter: string[]; select: string[] }> {
   return fieldCatalog as Record<EntityType, { filter: string[]; select: string[] }>;

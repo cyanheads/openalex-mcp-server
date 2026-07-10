@@ -1185,6 +1185,94 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
 
+    // --- Invalid-params 400 reason branching (gh #43) ---
+
+    describe('invalid-params 400 reason branching (gh #43)', () => {
+      /** Mock a single non-retried 400 carrying the given upstream message. */
+      function mock400(message: string): void {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ error: 'Invalid query parameters error.', message }), {
+            status: 400,
+            statusText: 'Bad Request',
+          }),
+        );
+      }
+
+      it('keeps upstream_invalid_params when a field name is rejected', async () => {
+        mock400('bogus_field is not a valid field for group_by.');
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works' }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_params' },
+        });
+      });
+
+      it('maps a relevance-sort-without-search 400 to upstream_sort_requires_search', async () => {
+        mock400(
+          'Must include a search query (such as ?search=example or /filter=fulltext.search:example) in order to sort by relevance_score.',
+        );
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', sort: '-relevance_score' }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_sort_requires_search' },
+        });
+      });
+
+      it('maps an ungroupable group_by 400 to upstream_ungroupable_group_by', async () => {
+        mock400('Cannot group by date, number, or search fields.');
+        const service = await getService();
+        await expect(
+          service.analyze(
+            { entityType: 'works', groupBy: 'publication_date' },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_ungroupable_group_by' },
+        });
+      });
+
+      it('maps any other 400 to the neutral upstream_invalid_params_other', async () => {
+        mock400('Invalid cursor value provided.');
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', cursor: 'garbage' }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_params_other' },
+        });
+      });
+
+      it('resolves the picked reason recovery hint from the caller contract', async () => {
+        mock400(
+          'Must include a search query (such as ?search=example) in order to sort by relevance_score.',
+        );
+        const ctx = createMockContext({
+          errors: [
+            {
+              reason: 'upstream_sort_requires_search',
+              code: JsonRpcErrorCode.ValidationError,
+              when: 'relevance sort requested without an active search',
+              recovery: 'DISTINCTIVE_HINT add a query or choose another sort field.',
+            },
+          ],
+        });
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', sort: '-relevance_score' }, ctx),
+        ).rejects.toMatchObject({
+          data: {
+            reason: 'upstream_sort_requires_search',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_HINT') },
+          },
+        });
+      });
+    });
+
     it('surfaces OpenAlex 422 responses as validation errors', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ message: 'Filter value out of range.' }), {
@@ -1337,7 +1425,7 @@ describe('OpenAlexService', () => {
         ),
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.InvalidParams,
-        data: { reason: 'upstream_invalid_params' },
+        data: { reason: 'upstream_invalid_params_other' },
         message: expect.not.stringMatching(/api_key|mailto|test-key/),
       });
     });

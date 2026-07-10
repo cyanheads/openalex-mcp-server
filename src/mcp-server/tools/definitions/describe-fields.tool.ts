@@ -12,9 +12,28 @@ import { ENTITY_TYPES } from '@/services/openalex/types.js';
 const CONTEXTS = ['filter', 'group_by', 'select'] as const;
 type FieldContext = (typeof CONTEXTS)[number];
 
-/** Resolve group_by → filter for catalog lookup (they share the same valid-field set). */
+/** Resolve group_by → the filter catalog key; the handler then prunes non-groupable fields. */
 function resolveContext(context: FieldContext): 'filter' | 'select' {
   return context === 'select' ? 'select' : 'filter';
+}
+
+/** Raw date fields OpenAlex rejects as group_by targets — valid as filters, not as aggregation keys. */
+const NON_GROUPABLE_DATE_FIELDS: ReadonlySet<string> = new Set([
+  'publication_date',
+  'created_date',
+  'updated_date',
+]);
+
+/**
+ * Whether a filter field is also a valid group_by target. group_by is a subset of filter:
+ * OpenAlex rejects (HTTP 400) the `*.search`/`*.search.exact` text operators, the `from_*`/`to_*`
+ * range-modifier directives, and the raw date fields — all valid as filters but not as aggregation
+ * keys. Integer count fields ARE groupable (bucketed) and are intentionally kept.
+ */
+function isGroupableField(field: string): boolean {
+  if (field.endsWith('.search') || field.endsWith('.search.exact')) return false;
+  if (field.startsWith('from_') || field.startsWith('to_')) return false;
+  return !NON_GROUPABLE_DATE_FIELDS.has(field);
 }
 
 export const describeFieldsTool = tool('openalex_describe_fields', {
@@ -28,7 +47,7 @@ export const describeFieldsTool = tool('openalex_describe_fields', {
     context: z
       .enum(CONTEXTS)
       .describe(
-        'Field usage context. "filter": fields accepted in the filter param. "group_by": fields accepted in group_by (same valid set as filter). "select": fields accepted in select.',
+        'Field usage context. "filter": fields accepted in the filter param. "group_by": fields accepted in group_by — a subset of the filter set (raw date and *.search fields are excluded; they cannot be grouped). "select": fields accepted in select.',
       ),
     query: z
       .string()
@@ -49,7 +68,11 @@ export const describeFieldsTool = tool('openalex_describe_fields', {
   handler(input, ctx) {
     const catalog = getFieldCatalog();
     const catalogContext = resolveContext(input.context);
-    const pool = catalog[input.entity_type]?.[catalogContext] ?? [];
+    const catalogPool = catalog[input.entity_type]?.[catalogContext] ?? [];
+    // group_by accepts only a subset of the filter fields — drop the ones OpenAlex rejects as
+    // aggregation keys so the tool never advertises a field analyze_trends will 400 on. filter
+    // and select keep the full set (dates / *.search / range-modifiers are valid there).
+    const pool = input.context === 'group_by' ? catalogPool.filter(isGroupableField) : catalogPool;
 
     const fields = input.query ? rankFields(input.query, pool, 20) : pool;
 

@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
+import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -275,6 +276,48 @@ describe('searchEntitiesTool', () => {
 
       await searchEntitiesTool.handler(input, ctx);
       expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+  });
+
+  describe('upstream 400 recovery (gh #43)', () => {
+    it('carries the sort-requires-search reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      mockSearch.mockRejectedValue(
+        invalidParams('Must include a search query in order to sort by relevance_score.', {
+          reason: 'upstream_sort_requires_search',
+          ...ctx.recoveryFor('upstream_sort_requires_search'),
+        }),
+      );
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        sort: '-relevance_score',
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_sort_requires_search',
+          recovery: { hint: expect.stringMatching(/active search/i) },
+        },
+      });
+    });
+
+    it('carries the neutral other-400 reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      mockSearch.mockRejectedValue(
+        invalidParams('Invalid cursor value provided.', {
+          reason: 'upstream_invalid_params_other',
+          ...ctx.recoveryFor('upstream_invalid_params_other'),
+        }),
+      );
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'climate' });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        data: {
+          reason: 'upstream_invalid_params_other',
+          recovery: { hint: expect.stringMatching(/upstream message/i) },
+        },
+      });
     });
   });
 

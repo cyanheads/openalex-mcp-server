@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/analyze-trends.tool.test
  */
 
+import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
@@ -331,6 +332,48 @@ describe('analyzeTrendsTool', () => {
       const { notice } = getEnrichment(ctx);
       expect(notice).toContain('top 4 groups by count');
       expect(notice).toContain('order: "key"');
+    });
+  });
+
+  describe('upstream 400 recovery (gh #43)', () => {
+    it('carries the ungroupable-group_by reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
+      mockAnalyze.mockRejectedValue(
+        invalidParams('Cannot group by date, number, or search fields.', {
+          reason: 'upstream_ungroupable_group_by',
+          ...ctx.recoveryFor('upstream_ungroupable_group_by'),
+        }),
+      );
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_date',
+      });
+
+      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_ungroupable_group_by',
+          recovery: { hint: expect.stringMatching(/categorical or year field/i) },
+        },
+      });
+    });
+
+    it('carries the neutral other-400 reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
+      mockAnalyze.mockRejectedValue(
+        invalidParams('Invalid cursor value provided.', {
+          reason: 'upstream_invalid_params_other',
+          ...ctx.recoveryFor('upstream_invalid_params_other'),
+        }),
+      );
+      const input = analyzeTrendsTool.input.parse({ entity_type: 'works', group_by: 'type' });
+
+      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
+        data: {
+          reason: 'upstream_invalid_params_other',
+          recovery: { hint: expect.stringMatching(/upstream message/i) },
+        },
+      });
     });
   });
 

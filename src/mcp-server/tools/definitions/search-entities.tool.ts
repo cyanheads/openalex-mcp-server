@@ -116,9 +116,23 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'OpenAlex rejected the request as malformed (HTTP 400).',
+      when: 'OpenAlex rejected an invalid filter, select, or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, context) to browse all valid fields for the given entity type and context.',
+    },
+    {
+      reason: 'upstream_sort_requires_search',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'sort=-relevance_score was used without an active search (HTTP 400).',
+      recovery:
+        'Sorting by relevance_score requires an active search — add a `query` or a `*.search` filter (e.g. title.search), or choose a concrete sort field such as -cited_by_count or -publication_date.',
+    },
+    {
+      reason: 'upstream_invalid_params_other',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
+      recovery:
+        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
     },
     {
       reason: 'upstream_validation_failed',

@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/citation-graph.tool.test
  */
 
-import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { invalidParams, JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -274,6 +274,52 @@ describe('getCitationGraphTool', () => {
       });
 
       await expect(getCitationGraphTool.handler(input, ctx)).resolves.toBeDefined();
+    });
+  });
+
+  describe('upstream 400 recovery (gh #43)', () => {
+    it('carries the sort-requires-search reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockRejectedValueOnce(
+        invalidParams('Must include a search query in order to sort by relevance_score.', {
+          reason: 'upstream_sort_requires_search',
+          ...ctx.recoveryFor('upstream_sort_requires_search'),
+        }),
+      );
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        sort: '-relevance_score',
+      });
+
+      await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_sort_requires_search',
+          recovery: { hint: expect.stringMatching(/active search/i) },
+        },
+      });
+    });
+
+    it('carries the neutral other-400 reason and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockRejectedValueOnce(
+        invalidParams('Invalid cursor value provided.', {
+          reason: 'upstream_invalid_params_other',
+          ...ctx.recoveryFor('upstream_invalid_params_other'),
+        }),
+      );
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+      });
+
+      await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+        data: {
+          reason: 'upstream_invalid_params_other',
+          recovery: { hint: expect.stringMatching(/upstream message/i) },
+        },
+      });
     });
   });
 

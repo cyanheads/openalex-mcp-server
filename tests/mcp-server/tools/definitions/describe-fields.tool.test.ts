@@ -59,7 +59,7 @@ describe('describeFieldsTool', () => {
       expect(result.fields).toContain('display_name');
     });
 
-    it('resolves group_by context to the filter catalog (same valid set)', async () => {
+    it('excludes non-groupable fields from group_by — a strict subset of filter (gh #42)', async () => {
       const ctx = createMockContext();
       const filterInput = describeFieldsTool.input.parse({
         entity_type: 'works',
@@ -73,9 +73,63 @@ describe('describeFieldsTool', () => {
       const filterResult = await describeFieldsTool.handler(filterInput, ctx);
       const groupByResult = await describeFieldsTool.handler(groupByInput, ctx);
 
-      // group_by context resolves to the same pool as filter
-      expect(groupByResult.total).toBe(filterResult.total);
-      expect(groupByResult.fields).toEqual(filterResult.fields);
+      // group_by is a strict subset of filter — the non-groupable fields are pruned.
+      expect(groupByResult.total).toBeLessThan(filterResult.total);
+      expect(groupByResult.fields.length).toBeLessThan(filterResult.fields.length);
+      for (const field of groupByResult.fields) {
+        expect(filterResult.fields).toContain(field);
+      }
+
+      // Concrete traps removed: raw date fields, *.search operators, from_*/to_* range modifiers.
+      for (const excluded of [
+        'publication_date',
+        'created_date',
+        'updated_date',
+        'default.search',
+        'title.search',
+        'abstract.search.exact',
+        'from_publication_date',
+        'to_publication_date',
+        'to_updated_date',
+      ]) {
+        expect(filterResult.fields).toContain(excluded);
+        expect(groupByResult.fields).not.toContain(excluded);
+      }
+
+      // Groupable fields kept: year, categorical, and integer-count fields.
+      for (const kept of [
+        'publication_year',
+        'type',
+        'oa_status',
+        'cited_by_count',
+        'awards.funder_id',
+      ]) {
+        expect(groupByResult.fields).toContain(kept);
+      }
+    });
+
+    it('does not surface publication_date when querying the group_by context (gh #42 repro)', async () => {
+      const ctx = createMockContext();
+      const groupByInput = describeFieldsTool.input.parse({
+        entity_type: 'works',
+        context: 'group_by',
+        query: 'publication_date',
+      });
+      const filterInput = describeFieldsTool.input.parse({
+        entity_type: 'works',
+        context: 'filter',
+        query: 'publication_date',
+      });
+
+      const groupByResult = await describeFieldsTool.handler(groupByInput, ctx);
+      const filterResult = await describeFieldsTool.handler(filterInput, ctx);
+
+      // The repro: publication_date must NOT appear in the group_by view (analyze_trends 400s on it)…
+      expect(groupByResult.fields).not.toContain('publication_date');
+      // …but publication_year, its groupable sibling, still ranks in.
+      expect(groupByResult.fields).toContain('publication_year');
+      // filter context legitimately still surfaces publication_date.
+      expect(filterResult.fields).toContain('publication_date');
     });
 
     it('returns funders filter fields', async () => {

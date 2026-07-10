@@ -63,9 +63,23 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'OpenAlex rejected the group_by or filter as malformed (HTTP 400).',
+      when: 'OpenAlex rejected an invalid group_by or filter field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected key and suggests close matches. Use openalex_describe_fields(entity_type, "group_by") to browse valid group_by fields, or openalex_describe_fields(entity_type, "filter") for filter fields.',
+    },
+    {
+      reason: 'upstream_ungroupable_group_by',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'group_by targets a raw date, float, or *.search field OpenAlex cannot aggregate (HTTP 400).',
+      recovery:
+        'Group by a categorical or year field (e.g. publication_year, type, oa_status, or an integer count field) — raw date fields and *.search operators cannot be grouped. Call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+    },
+    {
+      reason: 'upstream_invalid_params_other',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
+      recovery:
+        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and the group_by field.',
     },
     {
       reason: 'upstream_validation_failed',
