@@ -9,11 +9,14 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SELECT } from '@/services/openalex/types.js';
 
+const mockConfig = vi.hoisted(() => ({
+  apiKey: 'test-key',
+  baseUrl: 'https://api.openalex.org',
+  mailto: '',
+}));
+
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: () => ({
-    apiKey: 'test-key',
-    baseUrl: 'https://api.openalex.org',
-  }),
+  getServerConfig: () => ({ ...mockConfig }),
 }));
 
 /** Capture the URL from the most recent fetch call. */
@@ -52,6 +55,7 @@ describe('OpenAlexService', () => {
   });
 
   afterEach(() => {
+    mockConfig.mailto = '';
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.resetModules();
@@ -1260,10 +1264,21 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('includes mailto in request URL', async () => {
+    it('sends the configured credential as api_key, not mailto', async () => {
       const service = await getService();
       await service.search({ entityType: 'works' }, createMockContext());
-      expect(lastFetchUrl().searchParams.get('mailto')).toBe('test-key');
+      const url = lastFetchUrl();
+      expect(url.searchParams.get('api_key')).toBe('test-key');
+      expect(url.searchParams.has('mailto')).toBe(false);
+    });
+
+    it('forwards OPENALEX_MAILTO as mailto= alongside api_key', async () => {
+      mockConfig.mailto = 'ops@example.org';
+      const service = await getService();
+      await service.search({ entityType: 'works' }, createMockContext());
+      const url = lastFetchUrl();
+      expect(url.searchParams.get('api_key')).toBe('test-key');
+      expect(url.searchParams.get('mailto')).toBe('ops@example.org');
     });
 
     it('retries malformed JSON responses before failing', async () => {
@@ -1308,7 +1323,7 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).toHaveBeenCalledTimes(3);
     });
 
-    it('strips mailto from the message when upstream body is not JSON (400)', async () => {
+    it('strips the api_key credential from the message when upstream body is not JSON (400)', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response('Bad Request', { status: 400, statusText: 'Bad Request' }),
       );
@@ -1323,11 +1338,11 @@ describe('OpenAlexService', () => {
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.InvalidParams,
         data: { reason: 'upstream_invalid_params' },
-        message: expect.not.stringMatching(/mailto|test-key/),
+        message: expect.not.stringMatching(/api_key|mailto|test-key/),
       });
     });
 
-    it('strips mailto from the message when 404 body is not JSON', async () => {
+    it('strips the api_key credential from the message when 404 body is not JSON', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response('Not Found', { status: 404, statusText: 'Not Found' }),
       );
@@ -1339,7 +1354,7 @@ describe('OpenAlexService', () => {
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         data: { reason: 'entity_not_found' },
-        message: expect.not.stringMatching(/mailto|test-key/),
+        message: expect.not.stringMatching(/api_key|mailto|test-key/),
       });
     });
 

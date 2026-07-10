@@ -1,6 +1,7 @@
 /**
- * @fileoverview Tests for URL redaction — ensures the polite-pool mailto and any
- * future operator-injected query params are stripped before URLs surface in errors.
+ * @fileoverview Tests for URL redaction — ensures the api_key account credential, the
+ * polite-pool mailto, and any other operator-injected query param are stripped before URLs
+ * surface in errors.
  * @module services/openalex/url-redaction.test
  */
 
@@ -25,7 +26,7 @@ describe('redactUrl', () => {
     expect(a).not.toContain('mailto');
   });
 
-  it('drops unknown params (allowlist, not denylist)', () => {
+  it('drops the api_key credential (allowlist, not denylist)', () => {
     const redacted = redactUrl(
       'https://api.openalex.org/works?api_key=secret&select=id&filter=is_oa%3Atrue',
     );
@@ -80,6 +81,16 @@ describe('redactUrlsInMessage', () => {
     expect(redacted).not.toContain('mailto');
     expect(redacted).not.toContain('@');
     expect(redacted).not.toContain('example.com');
+    expect(redacted).toContain('select=');
+    expect(redacted).toContain('Status: 400');
+  });
+
+  it('strips the api_key credential from the framework fetch-failure message', () => {
+    const original =
+      'Fetch failed for https://api.openalex.org/works/W2919115771?api_key=sk-live-abc123&select=id%2Cdoi. Status: 400';
+    const redacted = redactUrlsInMessage(original);
+    expect(redacted).not.toContain('api_key');
+    expect(redacted).not.toContain('sk-live-abc123');
     expect(redacted).toContain('select=');
     expect(redacted).toContain('Status: 400');
   });

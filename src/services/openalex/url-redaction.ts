@@ -1,15 +1,18 @@
 /**
  * @fileoverview URL sanitization for error messages. Strips operator-injected query params
- * (currently `mailto`; future-proofed against any new internal additions) so they never
- * reach MCP clients via thrown error text.
+ * (the `api_key` account credential and the `mailto` polite-pool identifier, plus any future
+ * internal additions) so they never reach MCP clients via thrown error text. `api_key` is a
+ * real secret under OpenAlex usage-based pricing — the allowlist below is what keeps it out
+ * of surfaced errors.
  * @module services/openalex/url-redaction
  */
 
 /**
- * Query params the caller actually controls. Anything else on the URL (operator email
- * for the polite pool, future auth tokens, identifiers) is dropped before the URL is
- * surfaced in an error message. Allowlist over denylist — a future internal param won't
- * silently leak because nobody remembered to add it to a blocklist.
+ * Query params the caller actually controls. Anything else on the URL (the `api_key`
+ * account credential, the `mailto` polite-pool email, future auth tokens or identifiers) is
+ * dropped before the URL is surfaced in an error message. Allowlist over denylist — the
+ * `api_key` credential won't silently leak because nobody remembered to add it to a blocklist.
+ * NEVER add `api_key` or `mailto` here.
  */
 const CALLER_PARAMS = new Set([
   'q',

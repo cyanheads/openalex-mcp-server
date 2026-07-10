@@ -558,11 +558,13 @@ function toRequestContext(ctx: Context, operation: string): RequestContext {
 class OpenAlexService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly mailto: string;
 
   constructor() {
     const config = getServerConfig();
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.apiKey = config.apiKey;
+    this.mailto = config.mailto;
   }
 
   /** Execute an HTTP request against the OpenAlex API with retry on transient failures. */
@@ -570,7 +572,12 @@ class OpenAlexService {
     const operation = `OpenAlex ${path}`;
     const requestContext = toRequestContext(ctx, operation);
     const url = new URL(`${this.baseUrl}${path}`);
-    if (this.apiKey) url.searchParams.set('mailto', this.apiKey);
+    // OpenAlex usage-based pricing (Feb 2026): the account credential authenticates as
+    // `api_key=`. `mailto=` is now only a courtesy identifier (no budget/rate effect), sent
+    // independently when OPENALEX_MAILTO is set. Both are stripped from any URL that surfaces
+    // in an error by the url-redaction allowlist (neither is a caller-controlled param).
+    if (this.apiKey) url.searchParams.set('api_key', this.apiKey);
+    if (this.mailto) url.searchParams.set('mailto', this.mailto);
     for (const [key, value] of Object.entries(params)) {
       if (value) url.searchParams.set(key, value);
     }
@@ -614,8 +621,8 @@ class OpenAlexService {
 
     if (normalized === undefined) {
       // Framework fetch errors (network, timeout, unmapped status) format the message as
-      // `Fetch failed for <URL>. Status: …` — the URL carries the polite-pool `mailto`
-      // and any future internal params. Redact before bubbling.
+      // `Fetch failed for <URL>. Status: …` — the URL carries the `api_key` credential and
+      // the `mailto` identifier. Redact before bubbling.
       throw new McpError(error.code, redactUrlsInMessage(error.message), error.data, {
         cause: error,
       });

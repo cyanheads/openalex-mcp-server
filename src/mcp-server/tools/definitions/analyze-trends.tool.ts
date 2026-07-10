@@ -44,7 +44,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       code: JsonRpcErrorCode.Unauthorized,
       when: 'OpenAlex rejected the API key (HTTP 401).',
       recovery:
-        'Check that OPENALEX_API_KEY is set to a valid email-format key registered with OpenAlex.',
+        'Check that OPENALEX_API_KEY is set to a valid OpenAlex account API key (free from https://openalex.org/settings/api).',
     },
     {
       reason: 'upstream_forbidden',

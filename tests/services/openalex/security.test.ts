@@ -1,7 +1,8 @@
 /**
- * @fileoverview Security tests — verifies that API keys, email addresses (mailto),
- * and other operator-injected credentials never appear in tool outputs or error messages
- * surfaced to MCP clients. Also covers injection attempts in query/filter inputs.
+ * @fileoverview Security tests — verifies that the OpenAlex account API key (sent upstream
+ * as api_key=), the mailto identifier, and other operator-injected credentials never appear
+ * in tool outputs or error messages surfaced to MCP clients. Also covers injection attempts
+ * in query/filter inputs.
  * @module services/openalex/security.test
  */
 
@@ -46,18 +47,18 @@ describe('Security — API key and mailto non-leakage', () => {
     return getOpenAlexService();
   }
 
-  it('includes mailto in the outgoing URL (polite pool) but not in successful output', async () => {
+  it('sends the API key as api_key= upstream but never in successful output', async () => {
     const service = await getService();
     const result = await service.search({ entityType: 'works' }, createMockContext());
-    // The mailto is sent upstream — verify it appeared in the outgoing URL.
+    // The credential is sent upstream as api_key= — verify it appeared in the outgoing URL.
     // fetchWithTimeout calls fetch() with a URL object, so we call .toString() to get the string.
     const call = vi.mocked(globalThis.fetch).mock.lastCall;
     expect(call).toBeDefined();
     const urlString = String(call![0]);
-    expect(urlString).toContain('mailto=');
+    expect(urlString).toContain('api_key=');
     // But it must not appear in the returned data
     expect(JSON.stringify(result)).not.toContain(API_KEY);
-    expect(JSON.stringify(result)).not.toContain('mailto');
+    expect(JSON.stringify(result)).not.toContain('api_key');
   });
 
   it('does not leak API key in a 400 error message', async () => {
@@ -72,7 +73,7 @@ describe('Security — API key and mailto non-leakage', () => {
       service.search({ entityType: 'works', select: ['abstract'] }, createMockContext()),
     ).rejects.toSatisfy((err: unknown) => {
       const msg = (err as Error).message;
-      return !msg.includes(API_KEY) && !msg.includes('mailto');
+      return !msg.includes(API_KEY) && !msg.includes('api_key');
     });
   });
 
@@ -88,7 +89,7 @@ describe('Security — API key and mailto non-leakage', () => {
       service.search({ entityType: 'works', id: 'W99999999999' }, createMockContext()),
     ).rejects.toSatisfy((err: unknown) => {
       const msg = (err as Error).message;
-      return !msg.includes(API_KEY) && !msg.includes('mailto');
+      return !msg.includes(API_KEY) && !msg.includes('api_key');
     });
   });
 
@@ -101,7 +102,7 @@ describe('Security — API key and mailto non-leakage', () => {
     const promise = service.search({ entityType: 'works' }, createMockContext());
     const rejection = expect(promise).rejects.toSatisfy((err: unknown) => {
       const msg = (err as Error).message;
-      return !msg.includes(API_KEY) && !msg.includes('mailto');
+      return !msg.includes(API_KEY) && !msg.includes('api_key');
     });
     await vi.runAllTimersAsync();
     await rejection;
@@ -109,7 +110,9 @@ describe('Security — API key and mailto non-leakage', () => {
 
   it('does not leak API key in a network/fetch-failure error', async () => {
     vi.mocked(globalThis.fetch).mockRejectedValue(
-      new TypeError(`Failed to fetch https://api.openalex.org/works?mailto=${API_KEY}&search=test`),
+      new TypeError(
+        `Failed to fetch https://api.openalex.org/works?api_key=${API_KEY}&search=test`,
+      ),
     );
     const service = await getService();
     await expect(
@@ -131,7 +134,7 @@ describe('Security — API key and mailto non-leakage', () => {
     await expect(service.search({ entityType: 'works' }, createMockContext())).rejects.toSatisfy(
       (err: unknown) => {
         const serialized = JSON.stringify((err as { data?: unknown }).data ?? {});
-        return !serialized.includes(API_KEY) && !serialized.includes('mailto');
+        return !serialized.includes(API_KEY) && !serialized.includes('api_key');
       },
     );
   });
