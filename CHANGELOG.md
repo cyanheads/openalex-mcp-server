@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.4](changelog/0.7.x/0.7.4.md) — 2026-07-09
+
+Fix: research_landscape funding step resolves funder IDs correctly; invalid-params 400 recovery branches by upstream failure shape; describe_fields(group_by) no longer advertises non-groupable fields.
+
 ## [0.7.3](changelog/0.7.x/0.7.3.md) — 2026-07-09
 
 Fix: OPENALEX_API_KEY now authenticates as api_key= (the old mailto= was ignored); new OPENALEX_MAILTO for polite-pool identification; mcp-ts-core ^0.10.14 supply-chain guard adopted.
