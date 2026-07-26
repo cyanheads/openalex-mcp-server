@@ -943,10 +943,119 @@ describe('OpenAlexService', () => {
       expect(lastFetchUrl().searchParams.get('sort')).toBe('relevance_score:desc');
     });
 
+    // --- Multi-key sort normalization (gh #52) ---
+
+    it('moves :desc onto the dash-prefixed key, not the last key, in a multi-key sort', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', sort: '-publication_year,cited_by_count' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('publication_year:desc,cited_by_count');
+    });
+
+    it('normalizes a descending marker on a non-leading key', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', sort: 'publication_year,-cited_by_count' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('publication_year,cited_by_count:desc');
+    });
+
+    it('normalizes every dash-prefixed key independently', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', sort: '-publication_year,-cited_by_count' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe(
+        'publication_year:desc,cited_by_count:desc',
+      );
+    });
+
+    it('leaves an already-suffixed key alone while normalizing its dash-prefixed sibling', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', sort: 'publication_year:desc,-cited_by_count' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe(
+        'publication_year:desc,cited_by_count:desc',
+      );
+    });
+
+    it('coerces a bare relevance_score key inside a multi-key sort', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', query: 'climate', sort: 'relevance_score,-publication_year' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe(
+        'relevance_score:desc,publication_year:desc',
+      );
+    });
+
+    it('tolerates whitespace around comma-separated sort keys', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', sort: '-publication_year, cited_by_count' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('publication_year:desc,cited_by_count');
+    });
+
     it('omits the sort param when no sort is provided', async () => {
       const service = await getService();
       await service.search({ entityType: 'works' }, createMockContext());
       expect(lastFetchUrl().searchParams.has('sort')).toBe(false);
+    });
+
+    // --- Untitled records (gh #51) ---
+
+    it('passes a null display_name through untouched instead of rejecting the record', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: 'https://openalex.org/W4235673932',
+            display_name: null,
+            title: null,
+            type: 'paratext',
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', id: 'W4235673932' },
+        createMockContext(),
+      );
+
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0]).toHaveProperty('display_name', null);
+      expect(result.results[0]).toHaveProperty('type', 'paratext');
+    });
+
+    it('keeps sibling records on a page containing an untitled one', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 2, per_page: 25 },
+            results: [
+              { id: 'W4235673932', display_name: null },
+              { id: 'W2741809807', display_name: 'A Titled Paper' },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', filters: { openalex: 'W4235673932|W2741809807' } },
+        createMockContext(),
+      );
+
+      expect(result.results.map((r) => r.display_name)).toEqual([null, 'A Titled Paper']);
     });
 
     it('wraps single entity in standard response shape', async () => {
@@ -1236,6 +1345,62 @@ describe('OpenAlexService', () => {
         });
       });
 
+      it('maps a non-ID filter value 400 to upstream_invalid_id_value (gh #49)', async () => {
+        // Verbatim upstream body — OpenAlex splits the filter value on whitespace before
+        // validating, so it names only the first token of the name that was passed.
+        mock400("'Albert' is not a valid OpenAlex ID.");
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', filters: { 'authorships.author.id': 'Albert Einstein' } },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_id_value' },
+        });
+      });
+
+      it('resolves the resolve_name recovery hint for an invalid-ID-value 400', async () => {
+        mock400("'Harvard' is not a valid OpenAlex ID.");
+        const ctx = createMockContext({
+          errors: [
+            {
+              reason: 'upstream_invalid_id_value',
+              code: JsonRpcErrorCode.InvalidParams,
+              when: 'an entity-ID filter received a name',
+              recovery: 'DISTINCTIVE_ID_HINT call openalex_resolve_name to get the ID first.',
+            },
+          ],
+        });
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', filters: { 'authorships.institutions.id': 'Harvard' } },
+            ctx,
+          ),
+        ).rejects.toMatchObject({
+          data: {
+            reason: 'upstream_invalid_id_value',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_ID_HINT') },
+          },
+        });
+      });
+
+      it('keeps a plainly-malformed value in the neutral bucket, not the ID bucket', async () => {
+        mock400('Value for param publication_year must be a number.');
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', filters: { publication_year: 'notayear' } },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_params_other' },
+        });
+      });
+
       it('maps any other 400 to the neutral upstream_invalid_params_other', async () => {
         mock400('Invalid cursor value provided.');
         const service = await getService();
@@ -1310,6 +1475,285 @@ describe('OpenAlexService', () => {
 
       await rejection;
       expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    });
+
+    // --- 429 budget-vs-throttle branching (gh #54) ---
+
+    describe('429 reason branching (gh #54)', () => {
+      /** Mock a 429 carrying the given upstream body. */
+      function mock429(body: string): void {
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(new Response(body, { status: 429, statusText: 'Too Many Requests' })),
+        );
+      }
+
+      it('maps a budget-exhausted 429 to upstream_budget_exhausted and fails fast', async () => {
+        mock429(
+          JSON.stringify({
+            error: 'Rate limit exceeded.',
+            message:
+              'Insufficient budget. This request costs $0.001 but you only have $0 remaining. Resets at midnight.',
+          }),
+        );
+        const service = await getService();
+
+        await expect(
+          service.search({ entityType: 'works' }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.RateLimited,
+          data: { reason: 'upstream_budget_exhausted', retryable: false },
+        });
+        // `retryable: false` opts the error out of withRetry's transient set — a budget wall
+        // fails identically on every attempt, so burning the full budget buys nothing.
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['insufficient budget', 'Insufficient budget for this request.'],
+        ['midnight reset', 'You are out of credit. Resets at midnight UTC.'],
+        ['remaining budget', 'Daily budget exceeded — $0 remaining until the reset.'],
+      ])('recognizes the budget shape from its %s wording', async (_label, message) => {
+        mock429(JSON.stringify({ message }));
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works' }, createMockContext()),
+        ).rejects.toMatchObject({ data: { reason: 'upstream_budget_exhausted' } });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('leaves a burst-throttle 429 on the retryable rate_limited reason', async () => {
+        vi.useFakeTimers();
+        mock429(
+          JSON.stringify({
+            message:
+              'Anonymous search is temporarily rate-limited due to heavy load. Try again shortly or use a free API key.',
+          }),
+        );
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, createMockContext());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.RateLimited,
+          data: { reason: 'rate_limited' },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('resolves the budget recovery hint from the caller contract', async () => {
+        mock429(JSON.stringify({ message: 'Insufficient budget. Resets at midnight.' }));
+        const ctx = createMockContext({
+          errors: [
+            {
+              reason: 'upstream_budget_exhausted',
+              code: JsonRpcErrorCode.RateLimited,
+              when: 'the daily usage budget is spent',
+              retryable: false,
+              recovery: 'DISTINCTIVE_BUDGET_HINT the budget refills at midnight UTC.',
+            },
+          ],
+        });
+        const service = await getService();
+        await expect(service.search({ entityType: 'works' }, ctx)).rejects.toMatchObject({
+          data: {
+            reason: 'upstream_budget_exhausted',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_BUDGET_HINT') },
+          },
+        });
+      });
+    });
+
+    // --- Statusless fetch failures: timeout, network, unparseable body (gh #53) ---
+
+    describe('statusless fetch failures (gh #53)', () => {
+      /** Contract covering both transient reasons, so the recovery hint is resolvable. */
+      function transientCtx() {
+        return createMockContext({
+          errors: [
+            {
+              reason: 'upstream_timeout',
+              code: JsonRpcErrorCode.Timeout,
+              when: 'OpenAlex did not respond within the request deadline',
+              retryable: true,
+              recovery: 'DISTINCTIVE_TIMEOUT_HINT retry after a short delay.',
+            },
+            {
+              reason: 'upstream_unavailable',
+              code: JsonRpcErrorCode.ServiceUnavailable,
+              when: 'OpenAlex is unavailable',
+              retryable: true,
+              recovery: 'DISTINCTIVE_UNAVAILABLE_HINT wait and retry.',
+            },
+          ],
+        });
+      }
+
+      it('classifies a client-side request timeout as upstream_timeout with its recovery hint', async () => {
+        vi.useFakeTimers();
+        // Never settles on its own — only the composed abort signal ends it, which is what
+        // the framework's REQUEST_TIMEOUT_MS deadline fires.
+        vi.mocked(globalThis.fetch).mockImplementation(
+          (_input, init) =>
+            new Promise((_resolve, reject) => {
+              const signal = (init as RequestInit | undefined)?.signal;
+              signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+            }),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, transientCtx());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          data: {
+            reason: 'upstream_timeout',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_TIMEOUT_HINT') },
+          },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('states the timeout in OpenAlex terms rather than fetch plumbing', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(
+          (_input, init) =>
+            new Promise((_resolve, reject) => {
+              const signal = (init as RequestInit | undefined)?.signal;
+              signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+            }),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, createMockContext());
+        const rejection = expect(promise).rejects.toMatchObject({
+          message: expect.stringContaining('OpenAlex did not respond within 10s for /works'),
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+      });
+
+      it('classifies a network failure as upstream_unavailable with its recovery hint', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.reject(new TypeError('fetch failed')),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, transientCtx());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining('Could not reach the OpenAlex API for /works'),
+          data: {
+            reason: 'upstream_unavailable',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_UNAVAILABLE_HINT') },
+          },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('attaches the recovery hint to an HTML-instead-of-JSON response', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(
+            new Response('<html><body>503</body></html>', {
+              status: 200,
+              headers: { 'Content-Type': 'text/html' },
+            }),
+          ),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, transientCtx());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining('returned HTML instead of JSON'),
+          data: {
+            reason: 'upstream_unavailable',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_UNAVAILABLE_HINT') },
+          },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+      });
+
+      it('attaches the recovery hint to a truncated-JSON response', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(
+            new Response('{"meta":', {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }),
+          ),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, transientCtx());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining('returned invalid JSON'),
+          data: {
+            reason: 'upstream_unavailable',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_UNAVAILABLE_HINT') },
+          },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+      });
+
+      it('attaches the recovery hint to an empty response body', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(new Response('   ', { status: 200 })),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, transientCtx());
+        const rejection = expect(promise).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringContaining('returned an empty response'),
+          data: {
+            reason: 'upstream_unavailable',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_UNAVAILABLE_HINT') },
+          },
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+      });
+
+      it('keeps the credential out of a network-failure message', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.reject(new TypeError('fetch failed')),
+        );
+
+        const service = await getService();
+        const promise = service.search({ entityType: 'works' }, createMockContext());
+        const rejection = expect(promise).rejects.toMatchObject({
+          message: expect.not.stringMatching(/api_key|mailto|test-key/),
+        });
+
+        await vi.runAllTimersAsync();
+
+        await rejection;
+      });
     });
 
     it('maps 404 responses to notFound without retrying', async () => {

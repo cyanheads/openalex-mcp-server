@@ -135,7 +135,12 @@ export interface AutocompleteResult {
 }
 
 export interface EntityRecord {
-  display_name: string;
+  /**
+   * Null on records OpenAlex chose not to title — paratext works and other untitled entries,
+   * roughly 0.5% of works. A page containing one is data, not a failure, so the type and the
+   * tool output schemas both admit null rather than rejecting the whole page.
+   */
+  display_name: string | null;
   id: string;
   [key: string]: unknown;
 }

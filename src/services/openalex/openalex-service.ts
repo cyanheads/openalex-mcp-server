@@ -494,20 +494,86 @@ const SORT_REQUIRES_SEARCH_RE = /must include a search query/i;
 const UNGROUPABLE_GROUP_BY_RE = /cannot group by/i;
 
 /**
+ * OpenAlex 400 emitted when an entity-ID filter receives something that isn't an ID —
+ * typically a name: "'Albert' is not a valid OpenAlex ID." (upstream splits the value on
+ * whitespace before validating, so only the first token is named). The fix is to resolve
+ * the name to an ID first, which no other 400 shape's recovery says.
+ */
+const INVALID_ID_VALUE_RE = /is not a valid OpenAlex ID/i;
+
+/**
  * A single upstream HTTP 400 spans several distinct failure shapes, each needing a different
  * caller recovery. Pick the declared tool reason from the message shape so the per-tool
  * `recovery` hint (resolved via `ctx.recoveryFor`) matches the actual failure instead of
- * always claiming a rejected field name. Ordering: the field-name check is the most specific
- * (anchored at string start); the rest are keyword probes; anything unmatched falls through
- * to a neutral `_other` reason so no shape inherits the field-name recovery by default.
+ * always claiming a rejected field name. Ordering: the ID-value check runs first because it
+ * is the only shape naming a concrete upstream concept; the field-name check is anchored at
+ * string start; the rest are keyword probes; anything unmatched falls through to a neutral
+ * `_other` reason so no shape inherits the field-name recovery by default.
  */
 function classifyInvalidParamsReason(rawMessage: string | undefined): string {
   if (rawMessage !== undefined) {
+    if (INVALID_ID_VALUE_RE.test(rawMessage)) return 'upstream_invalid_id_value';
     if (REJECTED_FIELD_RE.test(rawMessage)) return 'upstream_invalid_params';
     if (SORT_REQUIRES_SEARCH_RE.test(rawMessage)) return 'upstream_sort_requires_search';
     if (UNGROUPABLE_GROUP_BY_RE.test(rawMessage)) return 'upstream_ungroupable_group_by';
   }
   return 'upstream_invalid_params_other';
+}
+
+/** Reason for a 429 caused by daily-budget exhaustion rather than burst throttling. */
+const BUDGET_EXHAUSTED_REASON = 'upstream_budget_exhausted';
+
+/**
+ * OpenAlex returns 429 for two unrelated conditions: bursting past its per-second ceiling,
+ * and spending the daily usage budget. The recoveries are opposites — one clears in seconds,
+ * the other not until the midnight-UTC reset — so they need separate reasons.
+ *
+ * The literal budget-exhaustion body is not published in OpenAlex's docs, so the match is
+ * deliberately loose: several independent signals, none of them load-bearing on an exact
+ * wording. The burst-throttle bodies carry none of these tokens.
+ */
+const BUDGET_EXHAUSTED_RE = /insufficient budget|resets at midnight|budget[^.]*remaining/i;
+
+/** Discriminate the two upstream 429 shapes on the message; default to burst throttling. */
+function classifyRateLimitReason(rawMessage: string | undefined): string {
+  if (rawMessage !== undefined && BUDGET_EXHAUSTED_RE.test(rawMessage)) {
+    return BUDGET_EXHAUSTED_REASON;
+  }
+  return 'rate_limited';
+}
+
+/**
+ * Pick the reason for a normalized throw. Two upstream statuses carry several distinct
+ * failure shapes under one error code — 400 (rejected field / relevance sort without a
+ * search / ungroupable group_by / non-ID filter value) and 429 (burst throttle vs. spent
+ * daily budget) — and each shape needs its own caller recovery, so both discriminate on the
+ * upstream message. Every other code maps to a single reason.
+ */
+function resolveThrowReason(
+  code: JsonRpcErrorCode,
+  mappedReason: string,
+  rawMessage: string | undefined,
+): string {
+  if (code === JsonRpcErrorCode.InvalidParams) return classifyInvalidParamsReason(rawMessage);
+  if (code === JsonRpcErrorCode.RateLimited) return classifyRateLimitReason(rawMessage);
+  return mappedReason;
+}
+
+/**
+ * Domain-language replacement for the framework's fetch-plumbing message on the failures
+ * that never carry an HTTP status. `fetch GET <url> timed out.` describes this client, not
+ * the upstream; the caller needs to read that OpenAlex did not answer.
+ */
+function domainMessageForFetchFailure(error: McpError, path: string): string | undefined {
+  switch (error.data?.errorSource) {
+    case 'FetchTimeout':
+      return `OpenAlex did not respond within ${REQUEST_TIMEOUT_MS / 1000}s for ${path}`;
+    case 'FetchNetworkError':
+    case 'FetchNetworkErrorWrapper':
+      return `Could not reach the OpenAlex API for ${path}`;
+    default:
+      return;
+  }
 }
 
 /**
@@ -568,11 +634,28 @@ function getSearchParamKey(searchMode?: SearchParams['searchMode']): string {
   }
 }
 
+/**
+ * Translate one sort key to OpenAlex syntax: a leading `-` becomes a `:desc` suffix, and a
+ * bare `relevance_score` is coerced to descending (ascending relevance is never the intent).
+ * Anything else — including a key that already carries `:desc` — passes through.
+ */
+function normalizeSortKey(key: string): string {
+  if (key.startsWith('-')) return `${key.slice(1)}:desc`;
+  if (key === 'relevance_score') return 'relevance_score:desc';
+  return key;
+}
+
+/**
+ * OpenAlex accepts comma-separated sort keys (`publication_year:desc,cited_by_count`), so
+ * each key is normalized independently. Treating the value as a single field moved the
+ * descending marker onto the last key, silently flipping the dash-prefixed one to ascending.
+ */
 function normalizeSort(sort?: string): string | undefined {
   if (!sort) return;
-  if (sort.startsWith('-')) return `${sort.slice(1)}:desc`;
-  if (sort === 'relevance_score') return 'relevance_score:desc';
-  return sort;
+  return sort
+    .split(',')
+    .map((key) => normalizeSortKey(key.trim()))
+    .join(',');
 }
 
 function toRequestContext(ctx: Context, operation: string): RequestContext {
@@ -648,13 +731,19 @@ class OpenAlexService {
 
     const statusCode =
       typeof error.data?.statusCode === 'number' ? error.data.statusCode : undefined;
-    const code = statusCode === undefined ? undefined : httpStatusToErrorCode(statusCode);
+    // Status-mapped failures classify off the HTTP status. Everything else — the client-side
+    // `REQUEST_TIMEOUT_MS` abort, DNS/connection failures, and the `parseResponse` throws
+    // (empty body, HTML, invalid JSON) — never carries a status, so the error's own code is
+    // the signal. Routing both through the same table means the transient paths, which are
+    // the slowest to fail, arrive with the reason and recovery hint their contract declares
+    // instead of an unclassified re-throw.
+    const code = statusCode === undefined ? error.code : httpStatusToErrorCode(statusCode);
     const normalized = code === undefined ? undefined : NORMALIZED_THROW_BY_CODE[code];
 
-    if (normalized === undefined) {
-      // Framework fetch errors (network, timeout, unmapped status) format the message as
-      // `Fetch failed for <URL>. Status: …` — the URL carries the `api_key` credential and
-      // the `mailto` identifier. Redact before bubbling.
+    if (code === undefined || normalized === undefined) {
+      // No mapped reason for this code (a caller-side abort, an upstream 500). Framework
+      // fetch errors format the message as `Fetch failed for <URL>. Status: …` — the URL
+      // carries the `api_key` credential and the `mailto` identifier. Redact before bubbling.
       throw new McpError(error.code, redactUrlsInMessage(error.message), error.data, {
         cause: error,
       });
@@ -663,14 +752,7 @@ class OpenAlexService {
     const { factory } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
-    // Every upstream 400 shares one factory/code, but the useful recovery differs by failure
-    // shape — discriminate on the message so the tool's `recovery` hint matches (invalid field
-    // name → describe_fields; relevance sort without a search → add a query; ungroupable
-    // group_by → pick a categorical field). Non-400 codes keep their single mapped reason.
-    const reason =
-      code === JsonRpcErrorCode.InvalidParams
-        ? classifyInvalidParamsReason(rawMessage)
-        : normalized.reason;
+    const reason = resolveThrowReason(code, normalized.reason, rawMessage);
     // A truncated body's appended valid-fields list is misleading. For an invalid-field
     // 400, replace it with catalog-backed ranked suggestions; otherwise strip it. The two
     // are mutually exclusive — appendFieldSuggestions already drops the partial list, so it
@@ -688,6 +770,7 @@ class OpenAlexService {
     }
     const message =
       sanitizedMessage ??
+      domainMessageForFetchFailure(error, path) ??
       (code === JsonRpcErrorCode.NotFound
         ? `Entity not found at ${path}`
         : redactUrlsInMessage(error.message));
@@ -697,6 +780,11 @@ class OpenAlexService {
       path,
       reason,
       ...ctx.recoveryFor(reason),
+      // `RateLimited` sits in the framework's transient set, so `withRetry` would spend the
+      // full attempt budget against a budget wall that stays up until the daily reset. This
+      // flag is the framework's per-error opt-out from that loop; the contract's own
+      // `retryable` field only informs the client and cannot stop our own retries.
+      ...(reason === BUDGET_EXHAUSTED_REASON ? { retryable: false } : {}),
       ...(upstream?.error ? { upstreamError: upstream.error } : {}),
       ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
     };

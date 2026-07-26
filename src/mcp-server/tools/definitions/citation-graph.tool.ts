@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/citation-graph.tool
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
+import type { HandlerContext } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
@@ -23,12 +23,16 @@ const OPENALEX_URL_PREFIX = 'https://openalex.org/';
 async function resolveSeedToWorkId(
   service: ReturnType<typeof getOpenAlexService>,
   seedId: string,
-  ctx: Context,
+  ctx: HandlerContext<'entity_not_found'>,
 ): Promise<string> {
   const lookup = await service.search({ entityType: 'works', id: seedId, select: ['id'] }, ctx);
   const record = lookup.results[0];
   if (!record?.id) {
-    throw new Error(`Could not resolve seed_id "${seedId}" to an OpenAlex work ID.`);
+    throw ctx.fail(
+      'entity_not_found',
+      `Could not resolve seed_id "${seedId}" to an OpenAlex work ID.`,
+      { ...ctx.recoveryFor('entity_not_found'), seedId },
+    );
   }
   return record.id.replace(OPENALEX_URL_PREFIX, '');
 }
@@ -62,10 +66,18 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'OpenAlex throttled the request (HTTP 429).',
+      when: 'OpenAlex throttled the request for exceeding its per-second ceiling (HTTP 429).',
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_budget_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
+      retryable: false,
+      recovery:
+        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
     },
     {
       reason: 'upstream_timeout',
@@ -78,7 +90,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, or a body that was empty, HTML, or unparseable JSON.',
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
@@ -99,31 +111,38 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     },
     {
       reason: 'comma_in_filter_value',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected an invalid filter or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or use openalex_describe_fields(entity_type, "filter") to browse valid filter fields.',
     },
     {
+      reason: 'upstream_invalid_id_value',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
+      recovery:
+        'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id and primary_topic.id accept IDs only.',
+    },
+    {
       reason: 'upstream_sort_requires_search',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'sort=-relevance_score was used but the citation-graph query has no active search (HTTP 400).',
       recovery:
         'Sorting by relevance_score requires an active search, which a citation-graph walk lacks — choose a concrete sort field such as -cited_by_count or -publication_date, or add a `*.search` filter.',
     },
     {
       reason: 'upstream_invalid_params_other',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
-        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
+        'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
     },
     {
       reason: 'reserved_filter_key',
@@ -162,7 +181,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .optional()
       .describe(
-        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date". Default is OpenAlex relevance.',
+        'Sort field. Prefix with "-" for descending. Comma-separate for a multi-key sort, applied left to right, with the "-" prefix set per key ("-publication_year,cited_by_count" sorts by year descending, then citations ascending). Common: "cited_by_count", "-publication_date". Default is OpenAlex relevance.',
       ),
     select: z
       .array(z.string())
@@ -200,7 +219,12 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         z
           .object({
             id: z.string().describe('OpenAlex work ID.'),
-            display_name: z.string().describe('Work title.'),
+            display_name: z
+              .string()
+              .nullable()
+              .describe(
+                'Work title. null when OpenAlex holds no title for the record (paratext works and other untitled entries) — use `id` to identify it.',
+              ),
           })
           .passthrough()
           .describe(

@@ -18,10 +18,18 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'OpenAlex throttled the autocomplete request (HTTP 429).',
+      when: 'OpenAlex throttled the autocomplete request for exceeding its per-second ceiling (HTTP 429).',
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_budget_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
+      retryable: false,
+      recovery:
+        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
     },
     {
       reason: 'upstream_timeout',
@@ -34,7 +42,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, or a body that was empty, HTML, or unparseable JSON.',
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
@@ -53,11 +61,32 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       recovery: 'Confirm the API key has access to autocomplete, then retry the request.',
     },
     {
-      reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'OpenAlex rejected the autocomplete query as malformed (HTTP 400).',
+      reason: 'comma_in_filter_value',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'A `filters` value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
-        'Trim the query, check filter syntax, and ensure the entity_type is a supported value.',
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a free-text phrase containing commas into the `query` parameter.',
+    },
+    {
+      reason: 'upstream_invalid_params',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected an invalid filter field name on the autocomplete query (HTTP 400).',
+      recovery:
+        'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, "filter") to browse valid filter fields, or drop `filters` entirely.',
+    },
+    {
+      reason: 'upstream_invalid_id_value',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'A `filters` entry expecting an entity ID received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
+      recovery:
+        'Resolve that name to an OpenAlex ID first — run this tool without the ID-valued filter, take the `id` from a match, then re-run with the ID.',
+    },
+    {
+      reason: 'upstream_invalid_params_other',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected the autocomplete request (HTTP 400) for a reason other than an invalid field name.',
+      recovery:
+        'Read the upstream message in the error above and adjust the request — trim the query, check filter value formats, and ensure entity_type is a supported value.',
     },
     {
       reason: 'upstream_validation_failed',

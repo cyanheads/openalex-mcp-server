@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -50,7 +50,8 @@ Primary discovery and lookup tool. Covers all OpenAlex entity types (works, auth
 - Sensible default field selection per entity type, applied to both searches and ID lookups — prevents oversized responses; pass `select` to choose fields, or `["*"]` for the full record
 - Invalid `select` field names produce an error listing the valid fields for that entity type
 - Formatted MCP output is a generic markdown renderer — every returned field is surfaced without per-entity-type hard-coding
-- Cursor pagination, sorting, up to 100 results per page
+- Cursor pagination and up to 100 results per page; `sort` takes a single key or a comma-separated list, with the `-` descending prefix applied per key
+- `display_name` is nullable — OpenAlex holds no title for paratext and other untitled records, which pass through instead of failing the whole page
 
 ---
 
@@ -93,7 +94,7 @@ One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`c
 Discover valid field names before constructing a query — avoids invalid-field 400 errors. Backed by a catalog generated from OpenAlex's own field validation.
 
 - List valid fields for any entity type and context (`filter`, `group_by`, or `select`)
-- `group_by` resolves to the same valid-field set as `filter`
+- `group_by` returns the subset of the `filter` set OpenAlex can aggregate — raw date fields, `*.search` operators, and `from_*`/`to_*` range modifiers are excluded
 - Pass `query` (a partial or guessed name) to rank results by name similarity — surfaces the right field when you only know roughly what you want
 - Complements the ranked "did you mean" suggestions now appended to invalid-field errors on the search, trends, and citation-graph tools
 
@@ -119,7 +120,7 @@ OpenAlex-specific:
 
 - Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex URLs)
 - Abstract reconstruction from inverted indices — plaintext instead of OpenAlex's position-keyed encoding
-- HTTP status codes mapped to specific MCP error classes (400/422 → InvalidParams, 429 → RateLimited, etc.) with upstream messages surfaced
+- HTTP status codes mapped to specific MCP error classes (400 → InvalidParams, 422 → ValidationError, 429 → RateLimited, etc.) with upstream messages surfaced
 - Timeout-aware request retries and cancellation support via `AbortSignal`
 
 ## Getting Started
@@ -158,7 +159,7 @@ Add to your MCP client config (e.g., `claude_desktop_config.json`):
 }
 ```
 
-`OPENALEX_API_KEY` is optional — set it to a free [OpenAlex account key](https://openalex.org/settings/api) for keyed rate limits and budget under OpenAlex's usage-based pricing, or omit it for anonymous access. Set `OPENALEX_MAILTO` to an email if you want to identify yourself to OpenAlex (the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool)).
+`OPENALEX_API_KEY` is optional — set it to a free [OpenAlex account key](https://openalex.org/settings/api) for keyed rate limits and budget under OpenAlex's usage-based pricing, or omit it for anonymous access. Set `OPENALEX_MAILTO` to an email if you want to identify yourself to OpenAlex (the [polite pool](https://developers.openalex.org/guides/authentication)).
 
 ### Prerequisites
 
@@ -186,7 +187,7 @@ bun install
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `OPENALEX_API_KEY` | **Optional.** OpenAlex account API key, sent upstream as `api_key=` (free from [openalex.org/settings/api](https://openalex.org/settings/api)). Without it, anonymous rate limits apply. | — |
-| `OPENALEX_MAILTO` | **Optional.** Email sent upstream as `mailto=` to identify yourself to OpenAlex (the [polite pool](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication#the-polite-pool)). A courtesy identifier, separate from the API key. | — |
+| `OPENALEX_MAILTO` | **Optional.** Email sent upstream as `mailto=` to identify yourself to OpenAlex (the [polite pool](https://developers.openalex.org/guides/authentication)). A courtesy identifier, separate from the API key. | — |
 | `OPENALEX_BASE_URL` | OpenAlex API base URL. | `https://api.openalex.org` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |

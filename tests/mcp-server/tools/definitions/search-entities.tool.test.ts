@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
-import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { invalidParams, JsonRpcErrorCode, rateLimited } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -318,6 +318,137 @@ describe('searchEntitiesTool', () => {
           recovery: { hint: expect.stringMatching(/upstream message/i) },
         },
       });
+    });
+
+    it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      mockSearch.mockRejectedValue(
+        invalidParams("'Albert' is not a valid OpenAlex ID.", {
+          reason: 'upstream_invalid_id_value',
+          ...ctx.recoveryFor('upstream_invalid_id_value'),
+        }),
+      );
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        filters: { 'authorships.author.id': 'Albert Einstein' },
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_invalid_id_value',
+          recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+        },
+      });
+    });
+
+    /**
+     * The 400 family is thrown through the `invalidParams` factory, so a contract entry
+     * declaring `ValidationError` advertises a code the caller never receives.
+     */
+    it('declares InvalidParams for every reason the 400 family delivers (gh #53)', () => {
+      const upstream400Reasons = [
+        'comma_in_filter_value',
+        'upstream_invalid_params',
+        'upstream_invalid_id_value',
+        'upstream_sort_requires_search',
+        'upstream_invalid_params_other',
+      ];
+      for (const reason of upstream400Reasons) {
+        const entry = searchEntitiesTool.errors?.find((e) => e.reason === reason);
+        expect(entry, `${reason} missing from the contract`).toBeDefined();
+        expect(entry?.code, `${reason} declares the wrong code`).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+      }
+    });
+  });
+
+  describe('429 budget exhaustion (gh #54)', () => {
+    it('carries the budget reason with a non-retryable recovery', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      mockSearch.mockRejectedValue(
+        rateLimited('Insufficient budget. Resets at midnight.', {
+          reason: 'upstream_budget_exhausted',
+          retryable: false,
+          ...ctx.recoveryFor('upstream_budget_exhausted'),
+        }),
+      );
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'climate' });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        data: {
+          reason: 'upstream_budget_exhausted',
+          retryable: false,
+          recovery: { hint: expect.stringMatching(/midnight UTC/i) },
+        },
+      });
+    });
+
+    it('declares the budget entry non-retryable and the throttle entry retryable', () => {
+      const budget = searchEntitiesTool.errors?.find(
+        (e) => e.reason === 'upstream_budget_exhausted',
+      );
+      const throttle = searchEntitiesTool.errors?.find((e) => e.reason === 'rate_limited');
+      expect(budget?.retryable).toBe(false);
+      expect(throttle?.retryable).toBe(true);
+    });
+  });
+
+  describe('untitled records (gh #51)', () => {
+    const untitledPage: SearchResult = {
+      meta: { count: 2, per_page: 25, next_cursor: null },
+      results: [
+        { id: 'W4235673932', display_name: null },
+        { id: 'W2741809807', display_name: 'A Titled Paper' },
+      ],
+    };
+
+    it('accepts a null display_name through output validation, keeping the whole page', async () => {
+      mockSearch.mockResolvedValue(untitledPage);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        filters: { openalex: 'W4235673932|W2741809807' },
+      });
+
+      const parsed = searchEntitiesTool.output.parse(await searchEntitiesTool.handler(input, ctx));
+
+      expect(parsed.results).toHaveLength(2);
+      expect(parsed.results[0]).toMatchObject({ id: 'W4235673932', display_name: null });
+      expect(parsed.results[1]).toMatchObject({ display_name: 'A Titled Paper' });
+    });
+
+    it('renders an untitled record under its ID', () => {
+      const blocks = searchEntitiesTool.format?.(untitledPage) ?? [];
+      const output = (blocks[0] as { type: 'text'; text: string }).text;
+      expect(output).toContain('### W4235673932');
+      expect(output).toContain('### A Titled Paper');
+    });
+  });
+
+  describe('multi-key sort (gh #52)', () => {
+    it('forwards a comma-separated sort to the service verbatim', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        sort: '-publication_year,cited_by_count',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ sort: '-publication_year,cited_by_count' }),
+        ctx,
+      );
+    });
+
+    it('documents per-key descending prefixes on the sort parameter', () => {
+      const description = searchEntitiesTool.input.shape.sort.description ?? '';
+      expect(description).toMatch(/comma-separate/i);
+      expect(description).toContain('-publication_year,cited_by_count');
     });
   });
 

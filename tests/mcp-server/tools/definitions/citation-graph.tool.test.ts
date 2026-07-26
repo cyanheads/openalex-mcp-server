@@ -146,6 +146,24 @@ describe('getCitationGraphTool', () => {
     expect(mockSearch).toHaveBeenCalledTimes(1);
   });
 
+  it('fails with entity_not_found when the seed lookup returns no usable record', async () => {
+    mockSearch.mockResolvedValueOnce({
+      meta: { count: 0, per_page: 1, next_cursor: null },
+      results: [],
+    });
+    const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+    const input = getCitationGraphTool.input.parse({
+      seed_id: 'W9999999999999',
+      direction: 'cites',
+    });
+
+    await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'entity_not_found', recovery: expect.anything() },
+    });
+    expect(mockSearch).toHaveBeenCalledTimes(1);
+  });
+
   it('strips the URL prefix when seed_id is a full OpenAlex work URL', async () => {
     mockSearch
       .mockResolvedValueOnce(lookupResponse('W2741809807'))
@@ -320,6 +338,123 @@ describe('getCitationGraphTool', () => {
           recovery: { hint: expect.stringMatching(/upstream message/i) },
         },
       });
+    });
+
+    it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockRejectedValueOnce(
+        invalidParams("'Albert' is not a valid OpenAlex ID.", {
+          reason: 'upstream_invalid_id_value',
+          ...ctx.recoveryFor('upstream_invalid_id_value'),
+        }),
+      );
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        filters: { 'authorships.author.id': 'Albert Einstein' },
+      });
+
+      await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_invalid_id_value',
+          recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+        },
+      });
+    });
+
+    /**
+     * The 400 family is thrown through the `invalidParams` factory, so a contract entry
+     * declaring `ValidationError` advertises a code the caller never receives.
+     */
+    it('declares InvalidParams for every reason the 400 family delivers (gh #53)', () => {
+      const upstream400Reasons = [
+        'comma_in_filter_value',
+        'upstream_invalid_params',
+        'upstream_invalid_id_value',
+        'upstream_sort_requires_search',
+        'upstream_invalid_params_other',
+      ];
+      for (const reason of upstream400Reasons) {
+        const entry = getCitationGraphTool.errors?.find((e) => e.reason === reason);
+        expect(entry, `${reason} missing from the contract`).toBeDefined();
+        expect(entry?.code, `${reason} declares the wrong code`).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+      }
+    });
+
+    it('declares the budget entry non-retryable and the throttle entry retryable (gh #54)', () => {
+      const budget = getCitationGraphTool.errors?.find(
+        (e) => e.reason === 'upstream_budget_exhausted',
+      );
+      const throttle = getCitationGraphTool.errors?.find((e) => e.reason === 'rate_limited');
+      expect(budget?.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(budget?.retryable).toBe(false);
+      expect(throttle?.retryable).toBe(true);
+    });
+  });
+
+  describe('untitled records (gh #51)', () => {
+    const untitledPage: SearchResult = {
+      meta: { count: 2, per_page: 25, next_cursor: null },
+      results: [
+        { id: 'W4235673932', display_name: null },
+        { id: 'W2741809807', display_name: 'A Titled Paper' },
+      ],
+    };
+
+    it('accepts a null display_name through output validation, keeping the whole page', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(untitledPage);
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+      });
+
+      const parsed = getCitationGraphTool.output.parse(
+        await getCitationGraphTool.handler(input, ctx),
+      );
+
+      expect(parsed.results).toHaveLength(2);
+      expect(parsed.results[0]).toMatchObject({ id: 'W4235673932', display_name: null });
+    });
+
+    it('renders an untitled record under its ID', () => {
+      const blocks = getCitationGraphTool.format?.(untitledPage) ?? [];
+      const output = (blocks[0] as { type: 'text'; text: string }).text;
+      expect(output).toContain('### W4235673932');
+      expect(output).toContain('### A Titled Paper');
+    });
+  });
+
+  describe('multi-key sort (gh #52)', () => {
+    it('forwards a comma-separated sort to the service verbatim', async () => {
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockResolvedValueOnce({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        sort: '-publication_year,cited_by_count',
+      });
+
+      await getCitationGraphTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sort: '-publication_year,cited_by_count' }),
+        ctx,
+      );
+    });
+
+    it('documents per-key descending prefixes on the sort parameter', () => {
+      const description = getCitationGraphTool.input.shape.sort.description ?? '';
+      expect(description).toMatch(/comma-separate/i);
+      expect(description).toContain('-publication_year,cited_by_count');
     });
   });
 

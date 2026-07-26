@@ -17,6 +17,13 @@ describe('renderEntityRecord', () => {
     expect(lines).toContain('### W001');
   });
 
+  it('falls back to id for heading when display_name is null (gh #51)', () => {
+    const lines = renderEntityRecord({ id: 'W4235673932', display_name: null, type: 'paratext' });
+    expect(lines).toContain('### W4235673932');
+    expect(lines).toContain('**ID:** W4235673932');
+    expect(lines).toContain('**Type:** paratext');
+  });
+
   it('always renders the ID line', () => {
     const lines = renderEntityRecord({ id: 'W001', display_name: 'Paper' });
     expect(lines).toContain('**ID:** W001');

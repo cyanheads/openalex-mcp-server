@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/resolve-name.tool.test
  */
 
+import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
@@ -18,6 +19,60 @@ const { resolveNameTool } = await import('@/mcp-server/tools/definitions/resolve
 describe('resolveNameTool', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  describe('error contract', () => {
+    /**
+     * `filters` reaches the autocomplete endpoint, so every 400 shape the search tools
+     * see is reachable here too — each needs a declared entry or its recovery hint is
+     * dropped on the floor. The 400 family is thrown through the `invalidParams` factory,
+     * so an entry declaring `ValidationError` advertises a code the caller never receives.
+     */
+    it('declares InvalidParams for every reason the 400 family delivers (gh #53)', () => {
+      const upstream400Reasons = [
+        'comma_in_filter_value',
+        'upstream_invalid_params',
+        'upstream_invalid_id_value',
+        'upstream_invalid_params_other',
+      ];
+      for (const reason of upstream400Reasons) {
+        const entry = resolveNameTool.errors?.find((e) => e.reason === reason);
+        expect(entry, `${reason} missing from the contract`).toBeDefined();
+        expect(entry?.code, `${reason} declares the wrong code`).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+      }
+    });
+
+    it('declares the budget entry non-retryable and the throttle entry retryable (gh #54)', () => {
+      const budget = resolveNameTool.errors?.find((e) => e.reason === 'upstream_budget_exhausted');
+      const throttle = resolveNameTool.errors?.find((e) => e.reason === 'rate_limited');
+      expect(budget?.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(budget?.retryable).toBe(false);
+      expect(throttle?.retryable).toBe(true);
+    });
+
+    it('carries the invalid-ID-value recovery through to the caller (gh #49)', async () => {
+      const ctx = createMockContext({ errors: resolveNameTool.errors });
+      mockAutocomplete.mockRejectedValue(
+        invalidParams("'Einstein' is not a valid OpenAlex ID.", {
+          reason: 'upstream_invalid_id_value',
+          ...ctx.recoveryFor('upstream_invalid_id_value'),
+        }),
+      );
+      const input = resolveNameTool.input.parse({
+        query: 'climate',
+        filters: { 'authorships.author.id': 'Einstein' },
+      });
+
+      await expect(resolveNameTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_invalid_id_value',
+          recovery: { hint: expect.stringMatching(/resolve that name/i) },
+        },
+      });
+    });
   });
 
   const harvard = {

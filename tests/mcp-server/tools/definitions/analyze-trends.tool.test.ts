@@ -21,6 +21,62 @@ describe('analyzeTrendsTool', () => {
     vi.clearAllMocks();
   });
 
+  describe('error contract', () => {
+    /**
+     * The 400 family is thrown through the `invalidParams` factory, so a contract entry
+     * declaring `ValidationError` advertises a code the caller never receives.
+     */
+    it('declares InvalidParams for every reason the 400 family delivers (gh #53)', () => {
+      const upstream400Reasons = [
+        'comma_in_filter_value',
+        'upstream_invalid_params',
+        'upstream_invalid_id_value',
+        'upstream_ungroupable_group_by',
+        'upstream_invalid_params_other',
+      ];
+      for (const reason of upstream400Reasons) {
+        const entry = analyzeTrendsTool.errors?.find((e) => e.reason === reason);
+        expect(entry, `${reason} missing from the contract`).toBeDefined();
+        expect(entry?.code, `${reason} declares the wrong code`).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+      }
+    });
+
+    it('declares the budget entry non-retryable and the throttle entry retryable (gh #54)', () => {
+      const budget = analyzeTrendsTool.errors?.find(
+        (e) => e.reason === 'upstream_budget_exhausted',
+      );
+      const throttle = analyzeTrendsTool.errors?.find((e) => e.reason === 'rate_limited');
+      expect(budget?.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(budget?.retryable).toBe(false);
+      expect(throttle?.retryable).toBe(true);
+    });
+
+    it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
+      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
+      mockAnalyze.mockRejectedValue(
+        invalidParams("'Albert' is not a valid OpenAlex ID.", {
+          reason: 'upstream_invalid_id_value',
+          ...ctx.recoveryFor('upstream_invalid_id_value'),
+        }),
+      );
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        filters: { 'authorships.author.id': 'Albert Einstein' },
+      });
+
+      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'upstream_invalid_id_value',
+          recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+        },
+      });
+    });
+  });
+
   const sampleResult: AnalyzeResult = {
     meta: { count: 50000, groups_count: 3, next_cursor: null },
     groups: [

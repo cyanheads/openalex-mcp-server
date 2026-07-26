@@ -18,10 +18,18 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'OpenAlex throttled the request (HTTP 429).',
+      when: 'OpenAlex throttled the request for exceeding its per-second ceiling (HTTP 429).',
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_budget_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
+      retryable: false,
+      recovery:
+        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
     },
     {
       reason: 'upstream_timeout',
@@ -34,7 +42,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, or a body that was empty, HTML, or unparseable JSON.',
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
@@ -55,31 +63,38 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     },
     {
       reason: 'comma_in_filter_value',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected an invalid group_by or filter field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected key and suggests close matches. Use openalex_describe_fields(entity_type, "group_by") to browse valid group_by fields, or openalex_describe_fields(entity_type, "filter") for filter fields.',
     },
     {
+      reason: 'upstream_invalid_id_value',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
+      recovery:
+        'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id and primary_topic.id accept IDs only.',
+    },
+    {
       reason: 'upstream_ungroupable_group_by',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'group_by targets a raw date, float, or *.search field OpenAlex cannot aggregate (HTTP 400).',
       recovery:
         'Group by a categorical or year field (e.g. publication_year, type, oa_status, or an integer count field) — raw date fields and *.search operators cannot be grouped. Call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
     },
     {
       reason: 'upstream_invalid_params_other',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
-        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and the group_by field.',
+        'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and the group_by field.',
     },
     {
       reason: 'upstream_validation_failed',

@@ -71,10 +71,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'OpenAlex throttled the request (HTTP 429).',
+      when: 'OpenAlex throttled the request for exceeding its per-second ceiling (HTTP 429).',
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+    },
+    {
+      reason: 'upstream_budget_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
+      retryable: false,
+      recovery:
+        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
     },
     {
       reason: 'upstream_timeout',
@@ -87,7 +95,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OpenAlex returned HTTP 503 (service unavailable).',
+      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, or a body that was empty, HTML, or unparseable JSON.',
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
@@ -108,31 +116,38 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     },
     {
       reason: 'comma_in_filter_value',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
     },
     {
       reason: 'upstream_invalid_params',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected an invalid filter, select, or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, context) to browse all valid fields for the given entity type and context.',
     },
     {
+      reason: 'upstream_invalid_id_value',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
+      recovery:
+        'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id, primary_topic.id, and cites accept IDs only.',
+    },
+    {
       reason: 'upstream_sort_requires_search',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'sort=-relevance_score was used without an active search (HTTP 400).',
       recovery:
         'Sorting by relevance_score requires an active search — add a `query` or a `*.search` filter (e.g. title.search), or choose a concrete sort field such as -cited_by_count or -publication_date.',
     },
     {
       reason: 'upstream_invalid_params_other',
-      code: JsonRpcErrorCode.ValidationError,
+      code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
-        'Read the upstream message in this error (surfaced as data.upstreamMessage) and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
+        'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
     },
     {
       reason: 'upstream_validation_failed',
@@ -172,7 +187,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Sort field. Prefix with "-" for descending. Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail.',
+        'Sort field. Prefix with "-" for descending. Comma-separate for a multi-key sort, applied left to right, with the "-" prefix set per key ("-publication_year,cited_by_count" sorts by year descending, then citations ascending). Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail.',
       ),
     select: z
       .array(z.string())
@@ -225,11 +240,16 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         z
           .object({
             id: z.string().describe('OpenAlex ID (e.g., "W2741809807", "A1234567890").'),
-            display_name: z.string().describe('Entity name or work title.'),
+            display_name: z
+              .string()
+              .nullable()
+              .describe(
+                'Entity name or work title. null when OpenAlex holds no title for the record (paratext works and other untitled entries) — use `id` to identify it.',
+              ),
           })
           .passthrough()
           .describe(
-            'A single OpenAlex entity record. Core `id` and `display_name` are guaranteed; additional fields vary by entity_type and `select`.',
+            'A single OpenAlex entity record. `id` is always present and `display_name` is always returned (though it may be null); additional fields vary by entity_type and `select`.',
           ),
       )
       .describe(
