@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.5](changelog/0.7.x/0.7.5.md) — 2026-07-26
+
+Fix: six error-contract gaps (statusless failures, 400-family InvalidParams drift, multi-key sort corruption, nullable display_name, 429 budget vs. throttle, resolve_name's missing comma_in_filter_value entry); mcp-ts-core ^0.11.0, typescript ^7.0.2.
+
 ## [0.7.4](changelog/0.7.x/0.7.4.md) — 2026-07-09
 
 Fix: research_landscape funding step resolves funder IDs correctly; invalid-params 400 recovery branches by upstream failure shape; describe_fields(group_by) no longer advertises non-groupable fields.

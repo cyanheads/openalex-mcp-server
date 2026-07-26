@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-07-10 03:35:15
+Generated on: 2026-07-26 22:18:07
 
 ```text
 openalex-mcp-server/
@@ -16,6 +16,7 @@ openalex-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
