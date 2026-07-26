@@ -35,7 +35,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 |:----------|:------------|
 | `openalex_search_entities` | Search, filter, sort, or retrieve by ID across all 8 entity types. |
 | `openalex_analyze_trends` | Group-by aggregation for trend and distribution analysis. |
-| `openalex_resolve_name` | Resolve a name or partial name to an OpenAlex ID via autocomplete. |
+| `openalex_resolve_name` | Resolve a name or an identifier (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex ID) to an OpenAlex ID. |
 | `openalex_get_citation_graph` | Walk the citation graph one hop from a seed work: cites, cited_by, or related_to. |
 | `openalex_describe_fields` | List valid filter, group_by, and select field names for an entity type — call before building a query to avoid invalid-field errors. |
 
@@ -43,7 +43,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 
 Primary discovery and lookup tool. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders).
 
-- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN)
+- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran
 - Keyword search with boolean operators, quoted phrases, wildcards, and fuzzy matching
 - Exact and AI semantic search modes
 - Rich filter syntax: AND across fields, OR within fields (`us|gb`), NOT (`!us`), ranges (`2020-2024`), comparisons (`>100`)
@@ -68,12 +68,12 @@ Aggregate entities into groups and count them for trend, distribution, and compa
 
 ### `openalex_resolve_name`
 
-Name-to-ID resolution via autocomplete. **Always use this before filtering by entity** — names are ambiguous, IDs are not.
+The front door for turning anything you have into an OpenAlex ID. **Always use this before filtering by entity** — names are ambiguous, IDs are not.
 
-- Returns up to 10 matches with disambiguation hints
-- Accepts partial names and DOIs for direct lookup
-- Optional entity type filter and field-level filters
-- ~200ms response time
+- A name or partial name runs an autocomplete search: up to 10 matches with disambiguation hints, ~200ms
+- An identifier resolves deterministically to the single record it addresses — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form. No `entity_type` needed: the identifier determines its own
+- An identifier that matches nothing returns an empty result naming the scheme, not name-search advice
+- Optional entity type filter and field-level filters, applied to name queries
 
 ---
 
@@ -121,7 +121,7 @@ OpenAlex-specific:
 - Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex URLs)
 - Abstract reconstruction from inverted indices — plaintext instead of OpenAlex's position-keyed encoding
 - HTTP status codes mapped to specific MCP error classes (400 → InvalidParams, 422 → ValidationError, 429 → RateLimited, etc.) with upstream messages surfaced
-- Every API-calling tool reports what the call spent against the OpenAlex daily budget and what is left of it, so a paginated sweep can be priced before it runs instead of ending in a 429
+- Every API-calling tool reports what the call spent against the OpenAlex daily budget and what is left of it, so a paginated sweep can be priced before it runs instead of ending in a 429. An account holding prepaid balance sees that too, since it keeps serving once the day's allowance is gone
 - Timeout-aware request retries and cancellation support via `AbortSignal`
 
 ## Getting Started
