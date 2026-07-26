@@ -25,6 +25,15 @@ const NON_GROUPABLE_DATE_FIELDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Fields OpenAlex lists as valid filters but answers with an HTTP 500 when used as a group_by
+ * target — an upstream defect rather than a documented restriction (the rejections above all
+ * arrive as a 400). A 500 classifies as ServiceUnavailable, whose recovery tells the caller to
+ * wait and retry, so advertising these as groupable sends an agent into a loop that never
+ * clears. Drop an entry once upstream starts answering it.
+ */
+const GROUP_BY_UPSTREAM_FAILURES: ReadonlySet<string> = new Set(['is_preprint_repository']);
+
+/**
  * Whether a filter field is also a valid group_by target. group_by is a subset of filter:
  * OpenAlex rejects (HTTP 400) the `*.search`/`*.search.exact` text operators, the `from_*`/`to_*`
  * range-modifier directives, and the raw date fields — all valid as filters but not as aggregation
@@ -33,6 +42,7 @@ const NON_GROUPABLE_DATE_FIELDS: ReadonlySet<string> = new Set([
 function isGroupableField(field: string): boolean {
   if (field.endsWith('.search') || field.endsWith('.search.exact')) return false;
   if (field.startsWith('from_') || field.startsWith('to_')) return false;
+  if (GROUP_BY_UPSTREAM_FAILURES.has(field)) return false;
   return !NON_GROUPABLE_DATE_FIELDS.has(field);
 }
 

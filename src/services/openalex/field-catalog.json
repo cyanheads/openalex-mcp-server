@@ -288,6 +288,7 @@
       "has_orcid",
       "id",
       "ids.openalex",
+      "last_known_authorships.institutions.lineage",
       "last_known_institutions.continent",
       "last_known_institutions.country_code",
       "last_known_institutions.id",
@@ -306,6 +307,7 @@
       "summary_stats.2yr_mean_citedness",
       "summary_stats.h_index",
       "summary_stats.i10_index",
+      "text.search",
       "to_created_date",
       "to_updated_date",
       "topic_share.id",
@@ -369,6 +371,7 @@
       "is_in_jstage_since_year",
       "is_oa",
       "is_ojs",
+      "is_preprint_repository",
       "issn",
       "issn_l",
       "last_publication_year",
@@ -378,6 +381,7 @@
       "summary_stats.2yr_mean_citedness",
       "summary_stats.h_index",
       "summary_stats.i10_index",
+      "text.search",
       "to_created_date",
       "to_updated_date",
       "topic_share.id",
@@ -408,6 +412,7 @@
       "is_in_jstage_since_year",
       "is_in_scielo",
       "is_ojs",
+      "is_preprint_repository",
       "is_indexed_in_scopus",
       "is_core",
       "oa_flip_year",
@@ -461,6 +466,7 @@
       "summary_stats.2yr_mean_citedness",
       "summary_stats.h_index",
       "summary_stats.i10_index",
+      "text.search",
       "topic_share.id",
       "topics.id",
       "type",
@@ -517,6 +523,7 @@
       "keywords.search",
       "openalex",
       "subfield.id",
+      "text.search",
       "works_count"
     ],
     "select": [
@@ -546,6 +553,7 @@
       "display_name.search",
       "from_created_date",
       "id",
+      "text.search",
       "works_count"
     ],
     "select": [
@@ -582,6 +590,7 @@
       "summary_stats.2yr_mean_citedness",
       "summary_stats.h_index",
       "summary_stats.i10_index",
+      "text.search",
       "wikidata",
       "works_count"
     ],
@@ -633,6 +642,7 @@
       "summary_stats.2yr_mean_citedness",
       "summary_stats.h_index",
       "summary_stats.i10_index",
+      "text.search",
       "wikidata",
       "works_count"
     ],

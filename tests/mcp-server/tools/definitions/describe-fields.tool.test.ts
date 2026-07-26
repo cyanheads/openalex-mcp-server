@@ -108,6 +108,41 @@ describe('describeFieldsTool', () => {
       }
     });
 
+    it('surfaces the recovered catalog fields in filter and select (gh #56)', async () => {
+      const ctx = createMockContext();
+      const sourcesFilter = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({ entity_type: 'sources', context: 'filter' }),
+        ctx,
+      );
+      const sourcesSelect = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({ entity_type: 'sources', context: 'select' }),
+        ctx,
+      );
+      const authorsFilter = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({ entity_type: 'authors', context: 'filter' }),
+        ctx,
+      );
+
+      expect(sourcesFilter.fields).toContain('is_preprint_repository');
+      expect(sourcesFilter.fields).toContain('text.search');
+      expect(sourcesSelect.fields).toContain('is_preprint_repository');
+      expect(authorsFilter.fields).toContain('last_known_authorships.institutions.lineage');
+    });
+
+    it('keeps is_preprint_repository out of group_by, where upstream 500s on it (gh #56)', async () => {
+      // Valid as a filter and a select field, but grouping by it answers HTTP 500 — which
+      // classifies as ServiceUnavailable and tells the caller to retry, forever.
+      const ctx = createMockContext();
+      const groupBy = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({ entity_type: 'sources', context: 'group_by' }),
+        ctx,
+      );
+
+      expect(groupBy.fields).not.toContain('is_preprint_repository');
+      // The sibling booleans still group fine and must stay.
+      expect(groupBy.fields).toContain('is_oa');
+    });
+
     it('does not surface publication_date when querying the group_by context (gh #42 repro)', async () => {
       const ctx = createMockContext();
       const groupByInput = describeFieldsTool.input.parse({
