@@ -37,4 +37,37 @@ describe('renderBudgetTrailer', () => {
   it('renders nothing when no budget was captured', () => {
     expect(renderBudgetTrailer(undefined)).toBe('');
   });
+
+  describe('prepaid balance (gh #60)', () => {
+    it('adds the prepaid segment when the account carries one', () => {
+      expect(
+        renderBudgetTrailer({
+          costUsd: 0.001,
+          remainingUsd: 0,
+          resetsInSeconds: 3600,
+          prepaidRemainingUsd: 4.2,
+        }),
+      ).toBe(
+        '**Budget:** $0.0010 this call · $0.0000 left today + $4.2000 prepaid (resets in 1h 0m)',
+      );
+    });
+
+    it('omits the segment when there is no prepaid balance', () => {
+      expect(
+        renderBudgetTrailer({ costUsd: 0.001, remainingUsd: 0.0689, resetsInSeconds: 5554 }),
+      ).not.toContain('prepaid');
+    });
+
+    it('keeps the daily figure honest — a spent day still reads $0.0000 left today', () => {
+      // The prepaid pool is additional to the daily allowance, not a correction of it.
+      expect(
+        renderBudgetTrailer({
+          costUsd: 0.001,
+          remainingUsd: 0,
+          resetsInSeconds: 3600,
+          prepaidRemainingUsd: 4.2,
+        }),
+      ).toContain('$0.0000 left today');
+    });
+  });
 });

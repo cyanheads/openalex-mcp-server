@@ -199,6 +199,12 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         resetsInSeconds: z
           .number()
           .describe('Seconds until the daily budget refills (midnight UTC).'),
+        prepaidRemainingUsd: z
+          .number()
+          .optional()
+          .describe(
+            'USD left in the prepaid balance — a separate pool OpenAlex draws on only after the daily allowance runs out, and which the daily reset does not refill. Add it to `remainingUsd` for the full spendable amount. Absent when the account holds no prepaid balance.',
+          ),
       })
       .optional()
       .describe(

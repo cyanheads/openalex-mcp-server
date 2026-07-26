@@ -24,10 +24,16 @@ function formatCountdown(seconds: number): string {
 /**
  * One-line budget trailer. `costUsd: 0` renders as "free" rather than `$0.0000` because it
  * carries real signal — it means the call was a singleton ID lookup, which OpenAlex does not
- * bill, so batching by ID beats paging a filtered list.
+ * bill, so batching by ID beats paging a filtered list. The prepaid segment appears only for
+ * an account holding that balance: without it, "left today" is the whole spendable figure;
+ * with it, the daily line alone reads as broke on an account that keeps serving.
  */
 export function renderBudgetTrailer(budget: UpstreamBudget | undefined): string {
   if (!budget) return '';
   const cost = budget.costUsd === 0 ? 'free' : formatUsd(budget.costUsd);
-  return `**Budget:** ${cost} this call · ${formatUsd(budget.remainingUsd)} left today (resets in ${formatCountdown(budget.resetsInSeconds)})`;
+  const prepaid =
+    budget.prepaidRemainingUsd === undefined
+      ? ''
+      : ` + ${formatUsd(budget.prepaidRemainingUsd)} prepaid`;
+  return `**Budget:** ${cost} this call · ${formatUsd(budget.remainingUsd)} left today${prepaid} (resets in ${formatCountdown(budget.resetsInSeconds)})`;
 }
