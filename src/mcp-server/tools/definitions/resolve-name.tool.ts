@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -152,7 +153,9 @@ export const resolveNameTool = tool('openalex_resolve_name', {
   }),
 
   // Agent-facing success-path context — a notice when the query matched nothing so the
-  // caller sees explicit guidance rather than a silent empty array.
+  // caller sees explicit guidance rather than a silent empty array, plus the OpenAlex budget
+  // reading. This tool is the documented first step of most workflows, so its trailer is
+  // where a caller learns what today's budget looks like before committing to a sweep.
   enrichment: {
     notice: z
       .string()
@@ -160,6 +163,26 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .describe(
         'Recovery guidance when no matches were found — echoes the query and suggests corrections. Absent when results are present.',
       ),
+    budget: z
+      .object({
+        costUsd: z
+          .number()
+          .describe(
+            'USD this call spent. Autocomplete is priced at the floor — resolving a name before filtering costs far less than the failed searches an ambiguous name causes.',
+          ),
+        remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
+        resetsInSeconds: z
+          .number()
+          .describe('Seconds until the daily budget refills (midnight UTC).'),
+      })
+      .optional()
+      .describe(
+        'What this call cost against the OpenAlex daily budget and what is left of it. Read `remainingUsd` here to size the search or traversal this resolution feeds. Absent when OpenAlex omitted the accounting headers.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    budget: { render: renderBudgetTrailer },
   },
 
   async handler(input, ctx) {

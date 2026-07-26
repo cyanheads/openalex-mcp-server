@@ -23,6 +23,7 @@ import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/m
 
 import { getServerConfig } from '@/config/server-config.js';
 
+import { mergeUpstreamBudget, parseUpstreamBudget, type UpstreamBudget } from './budget.js';
 import fieldCatalog from './field-catalog.json' with { type: 'json' };
 import { rankFields } from './field-ranker.js';
 import {
@@ -394,24 +395,51 @@ function hasEntries(record?: Record<string, string>): record is Record<string, s
 }
 
 /**
- * Surface OpenAlex's per-request cost and DB latency at debug level. Both live in
- * `meta` on every list/group/single-entity response and stay in the parsed payload
- * — they aren't stripped on the way out because the per-tool output schemas don't
- * declare them, so zod drops them at the MCP boundary regardless. Operators with
- * debug logging on get per-request observability without changing the wire shape.
+ * Running budget total for one tool call, keyed by the request `Context` every request in
+ * that call shares. A tool call can bill several upstream requests, and `ctx.enrich` is
+ * last-wins per key, so the accumulator is what makes the reported cost the sum rather than
+ * the final response's line item. Entries are collected with the context.
  */
-function logResponseMetrics(parsed: unknown, path: string, ctx: Context): void {
-  if (!isRecord(parsed)) return;
-  const meta = parsed.meta;
-  if (!isRecord(meta)) return;
+const budgetByContext = new WeakMap<Context, UpstreamBudget>();
 
-  const cost = typeof meta.cost_usd === 'number' ? meta.cost_usd : undefined;
-  const db = typeof meta.db_response_time_ms === 'number' ? meta.db_response_time_ms : undefined;
-  if (cost === undefined && db === undefined) return;
+/**
+ * Fold one response's accounting into the tool call's total and re-publish it as enrichment.
+ * `ctx.enrich` is callable from the service layer and reaches `structuredContent` exactly as
+ * if the handler had written it, so the four upstream-calling tools get the field by declaring
+ * it — no per-handler plumbing, and multi-request tools report the true total.
+ */
+function recordBudget(budget: UpstreamBudget, ctx: Context): void {
+  const total = mergeUpstreamBudget(budgetByContext.get(ctx), budget);
+  budgetByContext.set(ctx, total);
+  ctx.enrich({ budget: total });
+}
+
+/**
+ * Surface OpenAlex's per-request budget accounting and DB latency at debug level, so
+ * operators get per-request observability alongside what the caller sees. `db_response_time_ms`
+ * has no header equivalent and lives in `meta` — absent on singleton lookups, which carry no
+ * `meta` wrapper — while the budget figures come from the headers, which every shape carries.
+ */
+function logResponseMetrics(
+  parsed: unknown,
+  budget: UpstreamBudget | undefined,
+  path: string,
+  ctx: Context,
+): void {
+  const meta = isRecord(parsed) ? parsed.meta : undefined;
+  const db =
+    isRecord(meta) && typeof meta.db_response_time_ms === 'number'
+      ? meta.db_response_time_ms
+      : undefined;
+  if (budget === undefined && db === undefined) return;
 
   ctx.log.debug('OpenAlex response metrics', {
     path,
-    ...(cost !== undefined && { costUsd: cost }),
+    ...(budget !== undefined && {
+      costUsd: budget.costUsd,
+      budgetRemainingUsd: budget.remainingUsd,
+      budgetResetsInSeconds: budget.resetsInSeconds,
+    }),
     ...(db !== undefined && { dbResponseTimeMs: db }),
   });
 }
@@ -706,9 +734,17 @@ class OpenAlexService {
             headers: { Accept: 'application/json' },
             signal: ctx.signal,
           });
+          // Only 2xx responses reach here — `fetchWithTimeout` throws on anything else, so a
+          // throttled or budget-exhausted call surfaces through the error contract instead.
+          const budget = parseUpstreamBudget(response.headers);
+          // Recorded before the body is parsed: OpenAlex bills a 200 whether or not its
+          // payload survives (it truncates under load), and `parseResponse` throws on a
+          // truncated body. Recording after would drop the cost of every attempt that
+          // gets retried, under-reporting the call's real spend.
+          if (budget) recordBudget(budget, ctx);
           const text = await response.text();
           const parsed = this.parseResponse(text, path);
-          logResponseMetrics(parsed, path, ctx);
+          logResponseMetrics(parsed, budget, path, ctx);
           return parsed;
         } catch (error) {
           this.throwNormalizedRequestError(error, path, ctx);

@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -187,11 +188,28 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .describe(
         'Guidance notice. Set when no groups are returned (recovery suggestions) or when the page is full and more groups likely exist (truncation signal with narrowing advice). Absent otherwise.',
       ),
+    budget: z
+      .object({
+        costUsd: z
+          .number()
+          .describe(
+            'USD this call spent. Aggregation is priced far below paging the same entities, so a group_by is the cheap way to size a population before searching it.',
+          ),
+        remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
+        resetsInSeconds: z
+          .number()
+          .describe('Seconds until the daily budget refills (midnight UTC).'),
+      })
+      .optional()
+      .describe(
+        'What this call cost against the OpenAlex daily budget and what is left of it — weigh `remainingUsd` against `costUsd` before enumerating every group with `order: "key"`. Absent when OpenAlex omitted the accounting headers.',
+      ),
   },
 
   enrichmentTrailer: {
     echo: { label: 'Query' },
     totalCount: { label: 'Entity Total' },
+    budget: { render: renderBudgetTrailer },
   },
 
   async handler(input, ctx) {

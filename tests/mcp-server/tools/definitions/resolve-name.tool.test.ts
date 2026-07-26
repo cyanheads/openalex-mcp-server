@@ -181,6 +181,21 @@ describe('resolveNameTool', () => {
 
       expect(getEnrichment(ctx).notice).toContain('works');
     });
+
+    it('carries the budget reading the service writes through to structuredContent', () => {
+      // The service populates `budget` from the OpenAlex rate-limit headers via ctx.enrich.
+      // structuredContent is built as output.extend(enrichment), which silently strips any
+      // field the tool did not declare.
+      const budget = { costUsd: 0.0001, remainingUsd: 0.0687, resetsInSeconds: 5553 };
+      const structured = resolveNameTool.output
+        .extend(resolveNameTool.enrichment)
+        .parse({ ...sampleResults, budget });
+
+      expect(structured.budget).toEqual(budget);
+      expect(resolveNameTool.enrichmentTrailer?.budget?.render?.(budget)).toContain(
+        '$0.0687 left today',
+      );
+    });
   });
 
   describe('format', () => {

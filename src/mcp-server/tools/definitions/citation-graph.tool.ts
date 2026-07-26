@@ -6,6 +6,7 @@
 import type { HandlerContext } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import type { EntityRecord } from '@/services/openalex/types.js';
@@ -250,11 +251,28 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .describe(
         'Recovery guidance when no edges are returned — suggests verifying the seed_id, broadening filters, or trying a different direction. Absent when results are present.',
       ),
+    budget: z
+      .object({
+        costUsd: z
+          .number()
+          .describe(
+            'USD this call spent, covering both upstream requests — the seed validation lookup (unbilled) and the graph page itself.',
+          ),
+        remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
+        resetsInSeconds: z
+          .number()
+          .describe('Seconds until the daily budget refills (midnight UTC).'),
+      })
+      .optional()
+      .describe(
+        'What this call cost against the OpenAlex daily budget and what is left of it. Price a full walk before committing to it: `totalCount` ÷ `per_page` × `costUsd` against `remainingUsd`. Absent when OpenAlex omitted the accounting headers.',
+      ),
   },
 
   enrichmentTrailer: {
     echo: { label: 'Query' },
     totalCount: { label: 'Total Edges' },
+    budget: { render: renderBudgetTrailer },
   },
 
   async handler(input, ctx) {

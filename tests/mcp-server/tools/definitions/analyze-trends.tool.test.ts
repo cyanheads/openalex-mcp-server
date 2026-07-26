@@ -213,6 +213,21 @@ describe('analyzeTrendsTool', () => {
   });
 
   describe('enrichment', () => {
+    it('carries the budget reading the service writes through to structuredContent', () => {
+      // The service populates `budget` from the OpenAlex rate-limit headers via ctx.enrich.
+      // structuredContent is built as output.extend(enrichment), which silently strips any
+      // field the tool did not declare.
+      const budget = { costUsd: 0.0001, remainingUsd: 0.0688, resetsInSeconds: 5554 };
+      const structured = analyzeTrendsTool.output
+        .extend(analyzeTrendsTool.enrichment)
+        .parse({ ...sampleResult, echo: 'entity_type=works', totalCount: 50000, budget });
+
+      expect(structured.budget).toEqual(budget);
+      expect(analyzeTrendsTool.enrichmentTrailer?.budget?.render?.(budget)).toContain(
+        '$0.0688 left today',
+      );
+    });
+
     it('populates echo and totalCount on success', async () => {
       mockAnalyze.mockResolvedValue(sampleResult);
       const ctx = createMockContext();

@@ -242,6 +242,21 @@ describe('searchEntitiesTool', () => {
       expect(enrichment.notice).toBeUndefined();
     });
 
+    it('carries the budget reading the service writes through to structuredContent', () => {
+      // The service populates `budget` from the OpenAlex rate-limit headers via ctx.enrich.
+      // structuredContent is built as output.extend(enrichment), which silently strips any
+      // field the tool did not declare — the declaration is what makes it reach a client.
+      const budget = { costUsd: 0.001, remainingUsd: 0.0689, resetsInSeconds: 5554 };
+      const structured = searchEntitiesTool.output
+        .extend(searchEntitiesTool.enrichment)
+        .parse({ ...sampleResult, echo: 'entity_type=works', totalCount: 2, budget });
+
+      expect(structured.budget).toEqual(budget);
+      expect(searchEntitiesTool.enrichmentTrailer?.budget?.render?.(budget)).toContain(
+        '$0.0689 left today',
+      );
+    });
+
     it('omits search_mode from echo when keyword (default)', async () => {
       mockSearch.mockResolvedValue(sampleResult);
       const ctx = createMockContext();

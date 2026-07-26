@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-07-26 22:18:07
+Generated on: 2026-07-26 22:36:58
 
 ```text
 openalex-mcp-server/
@@ -150,9 +150,11 @@ openalex-mcp-server/
 │   │       │   ├── describe-fields.tool.ts
 │   │       │   ├── resolve-name.tool.ts
 │   │       │   └── search-entities.tool.ts
+│   │       ├── render-budget.ts
 │   │       └── render-entity-record.ts
 │   ├── services/
 │   │   └── openalex/
+│   │       ├── budget.ts
 │   │       ├── field-catalog.json
 │   │       ├── field-ranker.ts
 │   │       ├── openalex-service.ts
@@ -168,9 +170,11 @@ openalex-mcp-server/
 │   │       │   ├── describe-fields.tool.test.ts
 │   │       │   ├── resolve-name.tool.test.ts
 │   │       │   └── search-entities.tool.test.ts
+│   │       ├── render-budget.test.ts
 │   │       └── render-entity-record.test.ts
 │   └── services/
 │       └── openalex/
+│           ├── budget.test.ts
 │           ├── field-ranker.test.ts
 │           ├── openalex-service.test.ts
 │           ├── security.test.ts

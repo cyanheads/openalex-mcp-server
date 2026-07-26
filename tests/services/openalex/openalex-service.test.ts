@@ -5,9 +5,29 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SELECT } from '@/services/openalex/types.js';
+
+/** The `X-RateLimit-*` header trio OpenAlex emits on every successful response. */
+function budgetHeaders(values: {
+  cost: number;
+  remaining: number;
+  reset: number;
+}): Record<string, string> {
+  return {
+    'x-ratelimit-cost-usd': String(values.cost),
+    'x-ratelimit-remaining-usd': String(values.remaining),
+    'x-ratelimit-reset': String(values.reset),
+  };
+}
+
+/** Payload of the service's debug metrics line, or undefined when it never fired. */
+function findMetricsLog(debug: { mock: { calls: unknown[][] } }): unknown {
+  return debug.mock.calls.find(
+    ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
+  )?.[1];
+}
 
 const mockConfig = vi.hoisted(() => ({
   apiKey: 'test-key',
@@ -1203,13 +1223,34 @@ describe('OpenAlexService', () => {
   // --- Response metrics ---
 
   describe('response metrics logging', () => {
-    it('logs cost_usd and db_response_time_ms from meta at debug level', async () => {
+    it('logs header budget figures and db_response_time_ms from meta at debug level', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(
           JSON.stringify({
             meta: { count: 10, per_page: 25, cost_usd: 0.0002, db_response_time_ms: 42 },
             results: [],
           }),
+          { status: 200, headers: budgetHeaders({ cost: 0.0002, remaining: 0.0688, reset: 5554 }) },
+        ),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+      const debug = vi.spyOn(ctx.log, 'debug');
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      expect(findMetricsLog(debug)).toMatchObject({
+        costUsd: 0.0002,
+        budgetRemainingUsd: 0.0688,
+        budgetResetsInSeconds: 5554,
+        dbResponseTimeMs: 42,
+      });
+    });
+
+    it('logs db latency alone when the response carries no budget headers', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({ meta: { count: 10, db_response_time_ms: 42 }, results: [] }),
           { status: 200 },
         ),
       );
@@ -1219,14 +1260,12 @@ describe('OpenAlexService', () => {
 
       await service.search({ entityType: 'works' }, ctx);
 
-      const metricsCall = debug.mock.calls.find(
-        ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
-      );
-      expect(metricsCall).toBeDefined();
-      expect(metricsCall?.[1]).toMatchObject({ costUsd: 0.0002, dbResponseTimeMs: 42 });
+      const metrics = findMetricsLog(debug);
+      expect(metrics).toMatchObject({ dbResponseTimeMs: 42 });
+      expect(metrics).not.toHaveProperty('costUsd');
     });
 
-    it('does not log metrics when meta lacks both fields', async () => {
+    it('does not log metrics when neither headers nor meta carry them', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ meta: { count: 0 }, results: [] }), { status: 200 }),
       );
@@ -1236,10 +1275,195 @@ describe('OpenAlexService', () => {
 
       await service.search({ entityType: 'works' }, ctx);
 
-      const metricsCall = debug.mock.calls.find(
-        ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
+      expect(findMetricsLog(debug)).toBeUndefined();
+    });
+  });
+
+  // --- Budget enrichment ---
+
+  describe('budget enrichment', () => {
+    it('enriches budget from the rate-limit headers on a list search', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 4260025, per_page: 5 }, results: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.001, remaining: 0.0689, reset: 5554 }),
+        }),
       );
-      expect(metricsCall).toBeUndefined();
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works', query: 'machine learning' }, ctx);
+
+      expect(getEnrichment(ctx).budget).toEqual({
+        costUsd: 0.001,
+        remainingUsd: 0.0689,
+        resetsInSeconds: 5554,
+      });
+    });
+
+    it('enriches budget on a singleton id lookup, whose body carries no meta wrapper', async () => {
+      // The regression this whole mechanism exists for: `/works/{id}` returns a bare entity
+      // record — no `meta`, so `meta.cost_usd` is unavailable. Headers are the only channel,
+      // and `costUsd: 0` is the signal that ID lookups are free.
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({ id: 'https://openalex.org/W2741809807', display_name: 'A' }),
+          {
+            status: 200,
+            headers: budgetHeaders({ cost: 0, remaining: 0.0699, reset: 5557 }),
+          },
+        ),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+
+      const result = await service.search({ entityType: 'works', id: 'W2741809807' }, ctx);
+
+      expect(result.results).toHaveLength(1);
+      expect(getEnrichment(ctx).budget).toEqual({
+        costUsd: 0,
+        remainingUsd: 0.0699,
+        resetsInSeconds: 5557,
+      });
+    });
+
+    it('sums cost across the two requests a sampled search issues', async () => {
+      // Sampling pairs the sample request with a population-count request; both are billed,
+      // so the caller-visible cost has to be the sum, not the last response's line item.
+      const responses = [
+        new Response(JSON.stringify({ meta: { count: 5, per_page: 5 }, results: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.001, remaining: 0.069, reset: 5560 }),
+        }),
+        new Response(JSON.stringify({ meta: { count: 900, per_page: 1 }, results: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.0005, remaining: 0.0685, reset: 5558 }),
+        }),
+      ];
+      let call = 0;
+      vi.mocked(globalThis.fetch).mockImplementation(() => {
+        const response = responses[call++];
+        if (!response) throw new Error('unexpected extra fetch');
+        return Promise.resolve(response);
+      });
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works', sample: 5 }, ctx);
+
+      // Both counters run down, so the merge keeps the smaller (fresher) reading of each.
+      expect(getEnrichment(ctx).budget).toEqual({
+        costUsd: 0.0015,
+        remainingUsd: 0.0685,
+        resetsInSeconds: 5558,
+      });
+    });
+
+    it('counts the cost of an attempt whose body was truncated and retried', async () => {
+      // OpenAlex truncates under load and still bills the 200. Recording the budget only
+      // after a successful parse would drop the failed attempt's cost, under-reporting
+      // what the call actually spent.
+      const responses = [
+        new Response('{"meta": {"count": 5, "per_p', {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.001, remaining: 0.069, reset: 5560 }),
+        }),
+        new Response(JSON.stringify({ meta: { count: 5, per_page: 5 }, results: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.001, remaining: 0.068, reset: 5558 }),
+        }),
+      ];
+      let call = 0;
+      vi.mocked(globalThis.fetch).mockImplementation(() => {
+        const response = responses[call++];
+        if (!response) throw new Error('unexpected extra fetch');
+        return Promise.resolve(response);
+      });
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      expect(getEnrichment(ctx).budget).toEqual({
+        costUsd: 0.002,
+        remainingUsd: 0.068,
+        resetsInSeconds: 5558,
+      });
+    });
+
+    it('enriches budget on analyze', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 120372560 }, group_by: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.0001, remaining: 0.0688, reset: 5554 }),
+        }),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.analyze({ entityType: 'works', groupBy: 'publication_year' }, ctx);
+
+      expect(getEnrichment(ctx).budget).toMatchObject({ costUsd: 0.0001, remainingUsd: 0.0688 });
+    });
+
+    it('enriches budget on autocomplete', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ results: [] }), {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.0001, remaining: 0.0687, reset: 5553 }),
+        }),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.autocomplete({ entityType: 'authors', query: 'einstein' }, ctx);
+
+      expect(getEnrichment(ctx).budget).toMatchObject({ costUsd: 0.0001, remainingUsd: 0.0687 });
+    });
+
+    it('omits budget when the response carries no rate-limit headers', async () => {
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      expect(getEnrichment(ctx)).not.toHaveProperty('budget');
+    });
+
+    it('omits budget when the header set is incomplete', async () => {
+      // A cost with no budget to weigh it against is worse than no reading at all.
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 1, per_page: 25 }, results: [] }), {
+          status: 200,
+          headers: { 'x-ratelimit-cost-usd': '0.001' },
+        }),
+      );
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      expect(getEnrichment(ctx)).not.toHaveProperty('budget');
+    });
+
+    it('keeps each request context on its own running total', async () => {
+      vi.mocked(globalThis.fetch).mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ meta: { count: 1, per_page: 25 }, results: [] }), {
+            status: 200,
+            headers: budgetHeaders({ cost: 0.001, remaining: 0.05, reset: 100 }),
+          }),
+        ),
+      );
+      const service = await getService();
+      const first = createMockContext();
+      const second = createMockContext();
+
+      await service.search({ entityType: 'works' }, first);
+      await service.search({ entityType: 'works' }, second);
+
+      expect(getEnrichment(first).budget).toMatchObject({ costUsd: 0.001 });
+      expect(getEnrichment(second).budget).toMatchObject({ costUsd: 0.001 });
     });
   });
 

@@ -260,6 +260,21 @@ describe('getCitationGraphTool', () => {
       await getCitationGraphTool.handler(input, ctx);
       expect(getEnrichment(ctx).notice).toBeUndefined();
     });
+
+    it('carries the budget reading the service writes through to structuredContent', () => {
+      // A graph walk bills two upstream requests (the seed lookup and the page); the service
+      // sums them into one reading. structuredContent is output.extend(enrichment), which
+      // silently strips any field the tool did not declare.
+      const budget = { costUsd: 0.001, remainingUsd: 0.0685, resetsInSeconds: 5558 };
+      const structured = getCitationGraphTool.output
+        .extend(getCitationGraphTool.enrichment)
+        .parse({ ...sampleResult, echo: 'seed_id=W2741809807', totalCount: 3, budget });
+
+      expect(structured.budget).toEqual(budget);
+      expect(getCitationGraphTool.enrichmentTrailer?.budget?.render?.(budget)).toContain(
+        '$0.0685 left today',
+      );
+    });
   });
 
   describe('reserved filter keys (gh #21)', () => {
