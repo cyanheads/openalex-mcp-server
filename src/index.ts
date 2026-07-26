@@ -36,7 +36,7 @@ await createApp({
     },
     links: [
       { label: 'OpenAlex', href: 'https://openalex.org' },
-      { label: 'API Docs', href: 'https://docs.openalex.org' },
+      { label: 'API Docs', href: 'https://developers.openalex.org' },
     ],
   },
   setup() {
