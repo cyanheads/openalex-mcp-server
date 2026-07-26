@@ -13,7 +13,7 @@ import { ENTITY_TYPES, type EntityRecord } from '@/services/openalex/types.js';
 const SEMANTIC_PER_PAGE_CAP = 50;
 const SAMPLE_MAX = 100;
 
-function buildSearchEcho(input: {
+type SearchEchoInput = {
   entity_type: string;
   id?: string | undefined;
   query?: string | undefined;
@@ -22,20 +22,44 @@ function buildSearchEcho(input: {
   sort?: string | undefined;
   sample?: number | undefined;
   seed?: string | undefined;
-}): string {
-  const parts = [`entity_type=${input.entity_type}`];
-  if (input.id) parts.push(`id=${input.id}`);
-  if (input.query) parts.push(`query="${input.query}"`);
+};
+
+/**
+ * The parameters that shape a *list* query, each paired with its echo rendering. Ground truth
+ * is `OpenAlexService.search()`: its `id` branch requests `/{entity_type}/{id}` with `select`
+ * alone, so every parameter named here is dropped on that path — by OpenAlex itself, which
+ * answers an entity-by-ID URL identically whether or not search params ride along.
+ *
+ * Pagination (`per_page`, `cursor`) is deliberately absent: a singleton lookup is one record by
+ * definition, and `per_page` always carries its schema default, so a caller's intent there
+ * cannot be told apart from the absence of one. Naming it would be noise, not a warning.
+ */
+function searchOnlyParams(input: SearchEchoInput): { name: string; rendered: string }[] {
+  const parts: { name: string; rendered: string }[] = [];
+  if (input.query) parts.push({ name: 'query', rendered: `query="${input.query}"` });
   if (input.search_mode && input.search_mode !== 'keyword') {
-    parts.push(`search_mode=${input.search_mode}`);
+    parts.push({ name: 'search_mode', rendered: `search_mode=${input.search_mode}` });
   }
   if (input.filters && Object.keys(input.filters).length > 0) {
-    parts.push(`filters=${JSON.stringify(input.filters)}`);
+    parts.push({ name: 'filters', rendered: `filters=${JSON.stringify(input.filters)}` });
   }
-  if (input.sort) parts.push(`sort=${input.sort}`);
-  if (input.sample !== undefined) parts.push(`sample=${input.sample}`);
-  if (input.seed !== undefined) parts.push(`seed=${input.seed}`);
-  return parts.join(' | ');
+  if (input.sort) parts.push({ name: 'sort', rendered: `sort=${input.sort}` });
+  if (input.sample !== undefined) {
+    parts.push({ name: 'sample', rendered: `sample=${input.sample}` });
+  }
+  if (input.seed !== undefined) parts.push({ name: 'seed', rendered: `seed=${input.seed}` });
+  return parts;
+}
+
+/**
+ * Echo the criteria that actually ran. An `id` lookup echoes `entity_type` and `id` only —
+ * echoing a filter the singleton path never applied reads as confirmation that it did, which
+ * is the one thing this field exists not to do.
+ */
+function buildSearchEcho(input: SearchEchoInput): string {
+  const parts = [`entity_type=${input.entity_type}`];
+  if (input.id) return [...parts, `id=${input.id}`].join(' | ');
+  return [...parts, ...searchOnlyParams(input).map((part) => part.rendered)].join(' | ');
 }
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
@@ -164,7 +188,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, other search/filter/sort params are ignored — but `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -265,14 +289,14 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     echo: z
       .string()
       .describe(
-        'Compact echo of the input criteria (entity_type, query, filters, sort, search_mode) — surfaces what was actually searched when results are empty.',
+        'Compact echo of the criteria that actually ran (entity_type, query, filters, sort, search_mode) — surfaces what was searched when results are empty. An `id` lookup echoes entity_type and id alone, because the search criteria are not applied on that path.',
       ),
     totalCount: z.number().describe('Total results matching the query/filters across all pages.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery guidance when results are empty — echoes the criteria and suggests how to broaden. Absent on successful result pages.',
+        'Guidance notice. Set when results are empty (echoes the criteria and suggests how to broaden) or when an `id` lookup was passed search criteria it does not apply (names them). Absent otherwise.',
       ),
     budget: z
       .object({
@@ -285,6 +309,12 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         resetsInSeconds: z
           .number()
           .describe('Seconds until the daily budget refills (midnight UTC).'),
+        prepaidRemainingUsd: z
+          .number()
+          .optional()
+          .describe(
+            'USD left in the prepaid balance — a separate pool OpenAlex draws on only after the daily allowance runs out, and which the daily reset does not refill. Add it to `remainingUsd` for the full spendable amount. Absent when the account holds no prepaid balance.',
+          ),
       })
       .optional()
       .describe(
@@ -356,7 +386,17 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
 
     const echo = buildSearchEcho(input);
     ctx.enrich({ echo, totalCount: result.meta.count });
-    if (result.results.length === 0) {
+
+    // An `id` lookup always returns its one record or throws, so it never reaches the
+    // empty-results notice — the two branches are exclusive, and the dropped-parameter
+    // warning is the more useful of the two on that path.
+    const ignored = input.id ? searchOnlyParams(input).map((part) => part.name) : [];
+    if (ignored.length > 0) {
+      const [verb, pronoun] = ignored.length === 1 ? ['was', 'it'] : ['were', 'them'];
+      ctx.enrich.notice(
+        `\`id\` takes precedence — ${ignored.join(', ')} ${verb} not applied, and the record below is the entity at that ID regardless of ${pronoun}. Drop \`id\` to run ${pronoun} as a search.`,
+      );
+    } else if (result.results.length === 0) {
       ctx.enrich.notice(
         `No matches for ${echo}. Try broadening the query, removing filters, or switching search_mode.`,
       );

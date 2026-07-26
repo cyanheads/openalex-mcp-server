@@ -294,6 +294,110 @@ describe('searchEntitiesTool', () => {
     });
   });
 
+  describe('id precedence (gh #55)', () => {
+    const single: SearchResult = {
+      meta: { count: 1, per_page: 1, next_cursor: null },
+      results: [{ id: 'W2741809807', display_name: 'The state of OA' }],
+    };
+
+    /** Every param `search()`'s `id` branch drops, passed together. */
+    const idWithSearchParams = {
+      entity_type: 'works',
+      id: 'W2741809807',
+      query: 'quantum computing',
+      search_mode: 'semantic',
+      filters: { publication_year: '1900' },
+      sort: '-cited_by_count',
+      sample: 5,
+      seed: 'abc',
+    };
+
+    it('echoes only entity_type and id, never the dropped search params', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse(idWithSearchParams);
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { echo } = getEnrichment(ctx);
+      expect(echo).toBe('entity_type=works | id=W2741809807');
+      for (const dropped of ['query', 'filters', 'sort', 'sample', 'seed', 'search_mode']) {
+        expect(echo, `echo still advertises ${dropped}`).not.toContain(dropped);
+      }
+    });
+
+    it('notices every dropped param by name, sample and seed included', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse(idWithSearchParams);
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      for (const dropped of ['query', 'search_mode', 'filters', 'sort', 'sample', 'seed']) {
+        expect(notice, `${dropped} is dropped but unnamed in the notice`).toContain(dropped);
+      }
+      expect(notice).toMatch(/not applied/i);
+    });
+
+    it('stays silent when an id lookup carries no search params', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', id: 'W2741809807' });
+
+      await searchEntitiesTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('does not notice pagination params, which carry no caller intent here', async () => {
+      // `per_page` always arrives with its schema default, so a caller's intent cannot be
+      // told apart from its absence — naming it would be noise on every id lookup.
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: 'W2741809807',
+        per_page: 50,
+        cursor: 'abc',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('still accepts the combination rather than rejecting it', async () => {
+      // Rejecting id + filters would break callers passing a harmless leftover today.
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: 'W2741809807',
+        filters: { is_oa: 'true' },
+      });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+      expect(result.results).toHaveLength(1);
+    });
+
+    it('leaves the echo untouched on a search with no id', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'climate',
+        filters: { is_oa: 'true' },
+        sort: '-cited_by_count',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { echo } = getEnrichment(ctx);
+      expect(echo).toContain('query="climate"');
+      expect(echo).toContain('filters={"is_oa":"true"}');
+      expect(echo).toContain('sort=-cited_by_count');
+    });
+  });
+
   describe('upstream 400 recovery (gh #43)', () => {
     it('carries the sort-requires-search reason and recovery from the service', async () => {
       const ctx = createMockContext({ errors: searchEntitiesTool.errors });
