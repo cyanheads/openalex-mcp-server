@@ -9,10 +9,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
 
 const mockAutocomplete = vi.fn<() => Promise<AutocompleteResult>>();
+const mockResolveIdentifier = vi.fn<() => Promise<AutocompleteResult>>();
 
-vi.mock('@/services/openalex/openalex-service.js', () => ({
-  getOpenAlexService: () => ({ autocomplete: mockAutocomplete }),
-}));
+/**
+ * Only the service accessor is faked. `inferIdentifier` stays real so these cases exercise
+ * the actual name-vs-identifier routing rather than a restatement of it.
+ */
+vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/openalex/openalex-service.js')>();
+  return {
+    ...actual,
+    getOpenAlexService: () => ({
+      autocomplete: mockAutocomplete,
+      resolveIdentifier: mockResolveIdentifier,
+    }),
+  };
+});
 
 const { resolveNameTool } = await import('@/mcp-server/tools/definitions/resolve-name.tool.js');
 
@@ -198,6 +210,142 @@ describe('resolveNameTool', () => {
     });
   });
 
+  describe('identifier front door (gh #50)', () => {
+    const schutz = {
+      id: 'https://openalex.org/A5022021627',
+      external_id: 'https://orcid.org/0000-0001-9487-6983',
+      display_name: 'B. F. Schutz',
+      entity_type: 'author',
+      cited_by_count: 114591,
+      works_count: 680,
+      hint: 'Leibniz University Hannover',
+    } as const;
+
+    /** Shapes that resolve today only by accident, or not at all, through autocomplete. */
+    const identifiers: [label: string, query: string, entityType: string][] = [
+      ['bare ORCID', '0000-0001-9487-6983', 'authors'],
+      ['ORCID URL', 'https://orcid.org/0000-0001-9487-6983', 'authors'],
+      ['bare DOI', '10.1038/nature12373', 'works'],
+      ['DOI URL', 'https://doi.org/10.1038/nature12373', 'works'],
+      ['ROR URL', 'https://ror.org/013meh722', 'institutions'],
+      ['bare ROR', '013meh722', 'institutions'],
+      ['bare PMID', '23903748', 'works'],
+      ['PMCID', 'PMC1234567', 'works'],
+      ['ISSN', '1234-5678', 'sources'],
+      ['OpenAlex work ID', 'W2159974629', 'works'],
+      ['OpenAlex funder ID', 'F4320332161', 'funders'],
+      ['OpenAlex ID URL', 'https://openalex.org/I241749', 'institutions'],
+    ];
+
+    it.each(identifiers)(
+      'routes a %s to the deterministic lookup, not autocomplete',
+      async (_label, query, entityType) => {
+        mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+        const ctx = createMockContext();
+        const input = resolveNameTool.input.parse({ query });
+
+        await resolveNameTool.handler(input, ctx);
+
+        expect(mockAutocomplete).not.toHaveBeenCalled();
+        expect(mockResolveIdentifier).toHaveBeenCalledWith(
+          expect.objectContaining({ entityType }),
+          ctx,
+        );
+      },
+    );
+
+    it('sends real names to autocomplete', async () => {
+      mockAutocomplete.mockResolvedValue(sampleResults);
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'Albert Einstein' });
+
+      await resolveNameTool.handler(input, ctx);
+
+      expect(mockResolveIdentifier).not.toHaveBeenCalled();
+      expect(mockAutocomplete).toHaveBeenCalled();
+    });
+
+    it('sends a name containing a colon to autocomplete, not the identifier path', async () => {
+      // The scheme prefix is read off the first colon — a titled name must not look like one.
+      mockAutocomplete.mockResolvedValue(sampleResults);
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'Nature: a weekly journal' });
+
+      await resolveNameTool.handler(input, ctx);
+      expect(mockResolveIdentifier).not.toHaveBeenCalled();
+    });
+
+    it('resolves an identifier without entity_type', async () => {
+      mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: '0000-0001-9487-6983' });
+
+      const result = await resolveNameTool.handler(input, ctx);
+      expect(result.results[0]).toHaveProperty('id', 'https://openalex.org/A5022021627');
+    });
+
+    it('notices a conflicting entity_type rather than silently overriding it', async () => {
+      mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({
+        entity_type: 'works',
+        query: '0000-0001-9487-6983',
+      });
+
+      await resolveNameTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('entity_type="works"');
+      expect(notice).toContain('ORCID');
+      expect(notice).toContain('author');
+    });
+
+    it('notices filters, which the identifier path cannot apply', async () => {
+      mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({
+        query: '10.1038/nature12373',
+        filters: { publication_year: '2020' },
+      });
+
+      await resolveNameTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toContain('filters');
+    });
+
+    it('stays silent when the identifier query carries nothing extra', async () => {
+      mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'W2159974629' });
+
+      await resolveNameTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('returns an empty result with an identifier-specific notice on a miss', async () => {
+      // Not "try a shorter name" — an identifier is not a name, and shortening it is
+      // never the fix.
+      mockResolveIdentifier.mockResolvedValue({ results: [] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: '10.1038/thisdoesnotexist999999' });
+
+      const result = await resolveNameTool.handler(input, ctx);
+
+      expect(result.results).toHaveLength(0);
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('DOI');
+      expect(notice).not.toMatch(/shorter name/i);
+    });
+
+    it('keeps the name-miss notice unchanged', async () => {
+      mockAutocomplete.mockResolvedValue({ results: [] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'xyzzy_nonexistent_entity_abc' });
+
+      await resolveNameTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toMatch(/shorter name/i);
+    });
+  });
+
   describe('format', () => {
     const text = (result: AutocompleteResult) => {
       const blocks = resolveNameTool.format?.(result) ?? [];
@@ -218,6 +366,12 @@ describe('resolveNameTool', () => {
 
     it('returns "No matches" for empty results', () => {
       expect(text({ results: [] })).toBe('No matches found.');
+    });
+
+    it('labels an untitled record rather than printing null (gh #50)', () => {
+      const output = text({ results: [{ ...harvard, display_name: null }] });
+      expect(output).toContain('(untitled)');
+      expect(output).not.toContain('null');
     });
   });
 });

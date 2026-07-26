@@ -1,17 +1,18 @@
 /**
- * @fileoverview Tool for resolving names to OpenAlex IDs via autocomplete.
+ * @fileoverview Tool for resolving a name or an identifier to an OpenAlex ID — names go to
+ * autocomplete, identifiers to the deterministic by-ID lookup.
  * @module mcp-server/tools/definitions/resolve-name.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
+import { getOpenAlexService, inferIdentifier } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const resolveNameTool = tool('openalex_resolve_name', {
   description:
-    'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. Also accepts DOIs directly for quick lookup.',
+    'Resolve a name or an identifier to an OpenAlex ID. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. A name returns up to 10 autocomplete matches with disambiguation hints. An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form — resolves directly to the one record it addresses, and needs no entity_type.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/resolve-name.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -102,17 +103,19 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .enum(ENTITY_TYPES)
       .optional()
       .describe(
-        'Entity type to search. Omit for cross-entity search (useful when entity type is unknown).',
+        'Entity type to search. Omit for cross-entity search (useful when entity type is unknown). Not applied when `query` is an identifier — an identifier determines its own entity type.',
       ),
     query: z
       .string()
       .min(1)
-      .describe('Name or partial name to resolve. Also accepts DOIs for quick lookup.'),
+      .describe(
+        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search.',
+      ),
     filters: z
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Narrow autocomplete results with filters. Example: restrict to a specific country or publication year range.',
+        'Narrow autocomplete results with filters. Example: restrict to a specific country or publication year range. Applies to name queries only — an identifier already addresses a single record.',
       ),
   }),
   output: z.object({
@@ -125,7 +128,12 @@ export const resolveNameTool = tool('openalex_resolve_name', {
               .string()
               .nullable()
               .describe('Canonical external ID (DOI, ORCID, ROR, ISSN).'),
-            display_name: z.string().describe('Human-readable name.'),
+            display_name: z
+              .string()
+              .nullable()
+              .describe(
+                'Human-readable name. null only for an identifier lookup that landed on a record OpenAlex holds no title for (paratext works and other untitled entries) — use `id` to identify it.',
+              ),
             entity_type: z
               .string()
               .describe(
@@ -142,7 +150,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
               .string()
               .nullable()
               .describe(
-                'Disambiguation context: author names (works), last institution (authors), host org (sources), location (institutions).',
+                'Disambiguation context — last institution (authors), host organization (sources), place or country (institutions); author names (works) from a name search, publication year from an identifier lookup. null when the record carries none.',
               ),
           })
           .describe(
@@ -161,7 +169,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .optional()
       .describe(
-        'Recovery guidance when no matches were found — echoes the query and suggests corrections. Absent when results are present.',
+        'Guidance notice. Set when nothing matched (echoes the query and suggests corrections) or when an identifier query was passed name-search parameters that do not apply to it. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -174,6 +182,12 @@ export const resolveNameTool = tool('openalex_resolve_name', {
         resetsInSeconds: z
           .number()
           .describe('Seconds until the daily budget refills (midnight UTC).'),
+        prepaidRemainingUsd: z
+          .number()
+          .optional()
+          .describe(
+            'USD left in the prepaid balance — a separate pool OpenAlex draws on only after the daily allowance runs out, and which the daily reset does not refill. Add it to `remainingUsd` for the full spendable amount. Absent when the account holds no prepaid balance.',
+          ),
       })
       .optional()
       .describe(
@@ -187,27 +201,55 @@ export const resolveNameTool = tool('openalex_resolve_name', {
 
   async handler(input, ctx) {
     const service = getOpenAlexService();
-    const result = await service.autocomplete(
-      {
-        entityType: input.entity_type,
-        query: input.query,
-        filters: input.filters,
-      },
-      ctx,
-    );
+    // An identifier addresses one record and carries its own entity type, so it goes to the
+    // deterministic by-ID lookup. Autocomplete only ever matched identifiers by accident — it
+    // indexes the external-ID URL, so the bare forms and several native OpenAlex IDs miss.
+    const identifier = inferIdentifier(input.query);
+
+    const result = identifier
+      ? await service.resolveIdentifier(identifier, ctx)
+      : await service.autocomplete(
+          {
+            entityType: input.entity_type,
+            query: input.query,
+            filters: input.filters,
+          },
+          ctx,
+        );
 
     ctx.log.info('Name resolved', {
       query: input.query,
-      entityType: input.entity_type ?? 'all',
+      entityType: identifier?.entityType ?? input.entity_type ?? 'all',
+      resolvedVia: identifier ? identifier.scheme : 'autocomplete',
       matchCount: result.results.length,
     });
 
-    if (result.results.length === 0) {
-      const scope = input.entity_type ? ` among ${input.entity_type}` : '';
-      ctx.enrich.notice(
-        `No matches for "${input.query}"${scope}. Try a shorter name, alternate spelling, or omit entity_type to search across all types.`,
+    const notices: string[] = [];
+    if (identifier) {
+      const scheme =
+        identifier.scheme === 'openalex' ? 'OpenAlex ID' : identifier.scheme.toUpperCase();
+      const entity = identifier.entityType.replace(/s$/, '');
+      const ignored: string[] = [];
+      if (input.entity_type && input.entity_type !== identifier.entityType) {
+        ignored.push(`entity_type="${input.entity_type}"`);
+      }
+      if (input.filters && Object.keys(input.filters).length > 0) ignored.push('filters');
+      if (ignored.length > 0) {
+        notices.push(
+          `Resolved "${input.query}" by ${scheme} — it identifies one ${entity} directly, so ${ignored.join(' and ')} did not apply.`,
+        );
+      }
+      if (result.results.length === 0) {
+        notices.push(
+          `No ${entity} in OpenAlex for ${scheme} "${input.query}". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.`,
+        );
+      }
+    } else if (result.results.length === 0) {
+      notices.push(
+        `No matches for "${input.query}"${input.entity_type ? ` among ${input.entity_type}` : ''}. Try a shorter name, alternate spelling, or omit entity_type to search across all types.`,
       );
     }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return result;
   },
@@ -218,7 +260,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     }
     const lines: string[] = [];
     for (const r of result.results) {
-      lines.push(`**${r.display_name}** (${r.entity_type})`);
+      lines.push(`**${r.display_name ?? '(untitled)'}** (${r.entity_type})`);
       const details: string[] = [r.id];
       if (r.external_id) details.push(r.external_id);
       details.push(`${r.cited_by_count} citations`);

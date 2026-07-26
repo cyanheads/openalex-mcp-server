@@ -153,7 +153,12 @@ export interface GroupRecord {
 
 export interface AutocompleteRecord {
   cited_by_count: number;
-  display_name: string;
+  /**
+   * Never null from the autocomplete endpoint, which matches on this field. Null is reachable
+   * only through the identifier path, which fetches the entity record directly and so inherits
+   * `EntityRecord`'s untitled case.
+   */
+  display_name: string | null;
   entity_type: string;
   external_id: string | null;
   hint: string | null;

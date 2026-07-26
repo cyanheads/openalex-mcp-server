@@ -30,6 +30,7 @@ import {
   type AnalyzeParams,
   type AnalyzeResult,
   type AutocompleteParams,
+  type AutocompleteRecord,
   type AutocompleteResult,
   DEFAULT_SELECT,
   ENTITY_TYPES,
@@ -92,11 +93,23 @@ function buildFilterString(filters: Record<string, string>, ctx: Context): strin
 }
 
 /**
+ * A bare ROR: a leading `0`, six base32 characters, then two check digits.
+ *
+ * The leading zero is what separates this from a PMID — PMIDs are assigned sequentially and
+ * never carry one, so no value matching this pattern is a reachable PMID. All-digit RORs are
+ * ordinary (Baylor `005781934`, Istanbul Technical `059636586`), which is why the pattern
+ * must not additionally require a letter to be present.
+ */
+const BARE_ROR_PATTERN = /^0[0-9a-hj-km-np-tv-z]{6}\d{2}$/;
+
+/**
  * Detect ID format and return the API path segment.
  * "10.1038/nature12373" → "doi:10.1038/nature12373"
  * "https://doi.org/10.1038/nature12373" → "doi:10.1038/nature12373"
  * "0000-0002-1825-0097" → "orcid:0000-0002-1825-0097"
+ * "https://orcid.org/0000-0002-1825-0097" → "orcid:https://orcid.org/0000-0002-1825-0097"
  * "https://ror.org/00hx57361" → "ror:https://ror.org/00hx57361"
+ * "013meh722" → "ror:013meh722"
  * "PMC1234567" → "pmcid:PMC1234567"
  * "W2741809807" → "W2741809807"
  */
@@ -118,8 +131,18 @@ export function normalizeId(id: string): string {
     return `doi:${trimmed}`;
   }
 
+  // ORCID URL — upstream accepts the URL after the scheme prefix, as it does for ROR
+  if (trimmed.startsWith('https://orcid.org/')) {
+    return `orcid:${trimmed}`;
+  }
+
   // ROR URL
   if (trimmed.startsWith('https://ror.org/')) {
+    return `ror:${trimmed}`;
+  }
+
+  // Bare ROR — see BARE_ROR_PATTERN for why the leading zero settles the PMID overlap
+  if (BARE_ROR_PATTERN.test(trimmed)) {
     return `ror:${trimmed}`;
   }
 
@@ -145,6 +168,72 @@ export function normalizeId(id: string): string {
 
   // OpenAlex ID or already prefixed — pass through
   return trimmed;
+}
+
+/**
+ * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
+ * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
+ * lets an identifier resolve without the caller naming a type.
+ */
+const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
+  doi: 'works',
+  issn: 'sources',
+  orcid: 'authors',
+  pmcid: 'works',
+  pmid: 'works',
+  ror: 'institutions',
+};
+
+/** Native OpenAlex ID letter → entity type. */
+const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
+  A: 'authors',
+  F: 'funders',
+  I: 'institutions',
+  K: 'keywords',
+  P: 'publishers',
+  S: 'sources',
+  T: 'topics',
+  W: 'works',
+};
+
+/**
+ * Native OpenAlex IDs this server can route. `C` (the deprecated Concepts entity) and `G` are
+ * deliberately absent even though `OPENALEX_ID_VALUE_PATTERN` accepts them as *filter values*:
+ * neither is in `ENTITY_TYPES`, so there is no endpoint to fetch one from. They fall through to
+ * autocomplete rather than being routed to a path that would 404.
+ */
+const ROUTABLE_OPENALEX_ID = /^([AFIKPSTW])\d+$/;
+
+/** An identifier the deterministic by-ID path can resolve, with the scheme it was read as. */
+export interface ResolvedIdentifier {
+  entityType: EntityType;
+  /** The value in the form the OpenAlex path segment expects (`doi:10.1038/…`, `W2741809807`). */
+  id: string;
+  /** Identifier scheme, for caller-facing messages: `doi`, `orcid`, `openalex`, … */
+  scheme: string;
+}
+
+/**
+ * Classify a query as an identifier, or return `undefined` for a name.
+ *
+ * `normalizeId()` already knows every shape the by-ID lookup accepts, bare and URL-form alike,
+ * and stamps external ones with their scheme prefix — so detection reduces to reading back what
+ * it produced. Names never survive that: a name with a colon in it yields a prefix that is in no
+ * scheme table, and anything else fails the native-ID pattern.
+ */
+export function inferIdentifier(query: string): ResolvedIdentifier | undefined {
+  const normalized = normalizeId(query);
+
+  const colon = normalized.indexOf(':');
+  if (colon > 0) {
+    const scheme = normalized.slice(0, colon).toLowerCase();
+    const entityType = ENTITY_TYPE_BY_ID_PREFIX[scheme];
+    return entityType ? { entityType, id: normalized, scheme } : undefined;
+  }
+
+  const letter = ROUTABLE_OPENALEX_ID.exec(normalized)?.[1];
+  const entityType = letter ? ENTITY_TYPE_BY_ID_LETTER[letter] : undefined;
+  return entityType ? { entityType, id: normalized, scheme: 'openalex' } : undefined;
 }
 
 /**
@@ -249,6 +338,72 @@ function normalizeAutocompleteRecords(
   results: AutocompleteResult['results'],
 ): AutocompleteResult['results'] {
   return results.map((r) => deepDecodeHtmlEntities(r));
+}
+
+/** Entity type → the record field holding its canonical external identifier. */
+const EXTERNAL_ID_FIELD: Partial<Record<EntityType, string>> = {
+  authors: 'orcid',
+  institutions: 'ror',
+  sources: 'issn_l',
+  works: 'doi',
+};
+
+function stringField(record: EntityRecord, field: string | undefined): string | null {
+  const value = field === undefined ? undefined : record[field];
+  return typeof value === 'string' ? value : null;
+}
+
+function numberField(record: EntityRecord, field: string): number | null {
+  const value = record[field];
+  return typeof value === 'number' ? value : null;
+}
+
+/**
+ * Autocomplete ships a one-line disambiguation hint that a singleton entity record has no field
+ * for. Rebuild the closest equivalent from the curated default projection the lookup already
+ * returns, so no extra field has to be requested. Types whose default projection carries nothing
+ * comparable get `null` rather than a filler string — and losing the hint costs little here,
+ * since an exact identifier leaves nothing to disambiguate.
+ */
+function deriveHint(entityType: EntityType, record: EntityRecord): string | null {
+  switch (entityType) {
+    case 'authors': {
+      const institutions = record.last_known_institutions;
+      const first = Array.isArray(institutions) ? institutions[0] : undefined;
+      return isRecord(first) && typeof first.display_name === 'string' ? first.display_name : null;
+    }
+    case 'institutions':
+      return stringField(record, 'country_code');
+    case 'sources':
+      return stringField(record, 'host_organization_name');
+    case 'works': {
+      const year = numberField(record, 'publication_year');
+      return year === null ? null : String(year);
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Shape a singleton entity record like an autocomplete match, so both resolution paths of
+ * `openalex_resolve_name` return one result type. `entity_type` is singularized to match what
+ * the autocomplete endpoint emits (`work`, not `works`), and `works_count` stays null on works —
+ * a work has no works of its own, which is the same thing autocomplete reports.
+ */
+export function toAutocompleteRecord(
+  entityType: EntityType,
+  record: EntityRecord,
+): AutocompleteRecord {
+  return {
+    cited_by_count: numberField(record, 'cited_by_count') ?? 0,
+    display_name: record.display_name,
+    entity_type: entityType.replace(/s$/, ''),
+    external_id: stringField(record, EXTERNAL_ID_FIELD[entityType]),
+    hint: deriveHint(entityType, record),
+    id: record.id,
+    works_count: numberField(record, 'works_count'),
+  };
 }
 
 /**
@@ -1009,6 +1164,42 @@ class OpenAlexService {
       },
       groups: deepDecodeHtmlEntities(data.group_by ?? []),
     };
+  }
+
+  /**
+   * Resolve an identifier to the single entity it addresses, shaped as an autocomplete match.
+   *
+   * Autocomplete matches on `display_name` and the external-ID URL, so whether an identifier
+   * resolves through it depends on scheme, bare-vs-URL form, and entity type — a bare ORCID or
+   * a funder's own OpenAlex ID find nothing, while the identical query on works succeeds. This
+   * path goes to `/{entity_type}/{id}` instead, where every accepted shape resolves or does not,
+   * with no in-between.
+   *
+   * A miss returns no results rather than throwing. Autocomplete answers an unmatched query with
+   * an empty list, and routing identifiers through here is meant to make them behave *more* like
+   * the front door, not to hand one class of query a hard failure the rest never sees.
+   */
+  async resolveIdentifier(
+    identifier: ResolvedIdentifier,
+    ctx: Context,
+  ): Promise<AutocompleteResult> {
+    try {
+      const { results } = await this.search(
+        { entityType: identifier.entityType, id: identifier.id },
+        ctx,
+      );
+      const record = results[0];
+      return { results: record ? [toAutocompleteRecord(identifier.entityType, record)] : [] };
+    } catch (error) {
+      if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) {
+        ctx.log.debug('Identifier resolved to no entity', {
+          identifier: identifier.id,
+          entityType: identifier.entityType,
+        });
+        return { results: [] };
+      }
+      throw error;
+    }
   }
 
   /** Autocomplete name resolution. */

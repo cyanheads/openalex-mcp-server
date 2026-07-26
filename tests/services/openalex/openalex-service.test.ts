@@ -129,6 +129,29 @@ describe('OpenAlexService', () => {
       expect(filter).toContain('is_oa');
       expect(filter).toContain('awards.funder_id');
     });
+
+    /**
+     * Fields OpenAlex accepts that the catalog had drifted away from. Regenerating recovers
+     * them; asserting them here makes a future regression a test failure rather than a silent
+     * gap in what `openalex_describe_fields` advertises.
+     */
+    it('carries the text.search filter on every non-works entity type (gh #56)', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const catalog = getFieldCatalog();
+      for (const entityType of ENTITY_TYPES_UNDER_TEST.filter((t) => t !== 'works')) {
+        expect(catalog[entityType].filter, `${entityType} is missing text.search`).toContain(
+          'text.search',
+        );
+      }
+    });
+
+    it('carries the recovered authors and sources fields (gh #56)', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const catalog = getFieldCatalog();
+      expect(catalog.authors.filter).toContain('last_known_authorships.institutions.lineage');
+      expect(catalog.sources.filter).toContain('is_preprint_repository');
+      expect(catalog.sources.select).toContain('is_preprint_repository');
+    });
   });
 
   // --- ID normalization (tested through search with id param) ---
@@ -186,6 +209,201 @@ describe('OpenAlexService', () => {
     it('normalizes PMID (pure numeric)', async () => {
       const url = await searchById('12345678');
       expect(url.pathname).toBe('/works/pmid:12345678');
+    });
+
+    it('normalizes an ORCID URL (gh #50)', async () => {
+      const url = await searchById('https://orcid.org/0000-0001-9487-6983');
+      expect(url.pathname).toBe('/works/orcid:https://orcid.org/0000-0001-9487-6983');
+    });
+
+    it('normalizes a bare ROR (gh #50)', async () => {
+      const url = await searchById('013meh722');
+      expect(url.pathname).toBe('/works/ror:013meh722');
+    });
+
+    /**
+     * Bare RORs and PMIDs overlap at nine characters, and all-digit RORs are ordinary —
+     * Baylor is `005781934`. The leading zero settles it: PMIDs are assigned sequentially
+     * and never carry one, so nothing matching the ROR shape is a reachable PMID.
+     */
+    it('routes an all-digit ROR to ror, not the overlapping PMID shape (gh #62)', async () => {
+      const url = await searchById('005781934');
+      expect(url.pathname).toBe('/works/ror:005781934');
+    });
+
+    it('keeps a PMID on the PMID branch — no leading zero', async () => {
+      const url = await searchById('23903748');
+      expect(url.pathname).toBe('/works/pmid:23903748');
+    });
+  });
+
+  // --- Identifier shape → entity type inference (gh #50) ---
+
+  describe('inferIdentifier', () => {
+    async function infer(query: string) {
+      const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+      return inferIdentifier(query);
+    }
+
+    it.each([
+      ['bare DOI', '10.1038/nature12373', 'works', 'doi'],
+      ['DOI URL', 'https://doi.org/10.1038/nature12373', 'works', 'doi'],
+      ['bare ORCID', '0000-0002-1825-0097', 'authors', 'orcid'],
+      ['ORCID URL', 'https://orcid.org/0000-0001-9487-6983', 'authors', 'orcid'],
+      ['ROR URL', 'https://ror.org/00hx57361', 'institutions', 'ror'],
+      ['bare ROR', '013meh722', 'institutions', 'ror'],
+      ['all-digit bare ROR', '005781934', 'institutions', 'ror'],
+      ['ISSN', '0028-0836', 'sources', 'issn'],
+      ['PMCID', 'PMC1234567', 'works', 'pmcid'],
+      ['PMID', '23903748', 'works', 'pmid'],
+      ['already-prefixed DOI', 'doi:10.1038/nature12373', 'works', 'doi'],
+    ])('maps a %s to %s', async (_label, query, entityType, scheme) => {
+      expect(await infer(query)).toEqual({
+        entityType,
+        scheme,
+        id: expect.stringContaining(':'),
+      });
+    });
+
+    it.each([
+      ['W2159974629', 'works'],
+      ['A5022021627', 'authors'],
+      ['S137773608', 'sources'],
+      ['I241749', 'institutions'],
+      ['T10159', 'topics'],
+      ['K12345', 'keywords'],
+      ['P4310320595', 'publishers'],
+      ['F4320332161', 'funders'],
+    ])('derives %s → %s from the native ID letter', async (query, entityType) => {
+      expect(await infer(query)).toEqual({ entityType, id: query, scheme: 'openalex' });
+    });
+
+    it('strips the OpenAlex URL form before reading the letter', async () => {
+      expect(await infer('https://openalex.org/I241749')).toEqual({
+        entityType: 'institutions',
+        id: 'I241749',
+        scheme: 'openalex',
+      });
+    });
+
+    it.each([
+      ['a plain name', 'Albert Einstein'],
+      ['a name with a colon', 'Nature: a weekly journal'],
+      ['a short numeric string', '1234'],
+      ['an empty-ish query', '   '],
+    ])('leaves %s to autocomplete', async (_label, query) => {
+      expect(await infer(query)).toBeUndefined();
+    });
+
+    it.each([
+      ['C71924100', 'the deprecated Concepts entity'],
+      ['G12345', 'an entity type this server does not model'],
+    ])('does not route %s — %s', async (query) => {
+      // No endpoint exists for these, so routing them would turn a name search into a 404.
+      expect(await infer(query)).toBeUndefined();
+    });
+  });
+
+  // --- Deterministic identifier resolution (gh #50) ---
+
+  describe('resolveIdentifier', () => {
+    async function resolve(entityType: string, id: string, body: unknown, status = 200) {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(status === 200 ? JSON.stringify(body) : '<!doctype html><title>404</title>', {
+          status,
+          headers: { 'Content-Type': status === 200 ? 'application/json' : 'text/html' },
+        }),
+      );
+      const service = await getService();
+      return service.resolveIdentifier(
+        { entityType: entityType as 'works', id, scheme: 'doi' },
+        createMockContext(),
+      );
+    }
+
+    it('shapes an author record like an autocomplete match', async () => {
+      const result = await resolve('authors', 'orcid:0000-0001-9487-6983', {
+        id: 'https://openalex.org/A5022021627',
+        display_name: 'B. F. Schutz',
+        orcid: 'https://orcid.org/0000-0001-9487-6983',
+        works_count: 680,
+        cited_by_count: 114591,
+        last_known_institutions: [{ display_name: 'Leibniz University Hannover' }],
+      });
+
+      expect(result.results).toEqual([
+        {
+          id: 'https://openalex.org/A5022021627',
+          display_name: 'B. F. Schutz',
+          entity_type: 'author',
+          external_id: 'https://orcid.org/0000-0001-9487-6983',
+          works_count: 680,
+          cited_by_count: 114591,
+          hint: 'Leibniz University Hannover',
+        },
+      ]);
+    });
+
+    it('reports a work with no works of its own as null, matching autocomplete', async () => {
+      const result = await resolve('works', 'doi:10.1038/nature12373', {
+        id: 'https://openalex.org/W2159974629',
+        display_name: 'A paper',
+        doi: 'https://doi.org/10.1038/nature12373',
+        cited_by_count: 12,
+        publication_year: 2013,
+      });
+
+      expect(result.results[0]).toMatchObject({
+        entity_type: 'work',
+        works_count: null,
+        hint: '2013',
+      });
+    });
+
+    it('leaves external_id and hint null when the record carries neither', async () => {
+      const result = await resolve('funders', 'F4320332161', {
+        id: 'https://openalex.org/F4320332161',
+        display_name: 'National Institutes of Health',
+        works_count: 1770852,
+        cited_by_count: 107411673,
+        country_code: 'US',
+      });
+
+      expect(result.results[0]).toMatchObject({
+        entity_type: 'funder',
+        external_id: null,
+        hint: null,
+      });
+    });
+
+    it('preserves an untitled record rather than inventing a name', async () => {
+      const result = await resolve('works', 'doi:10.1000/paratext', {
+        id: 'https://openalex.org/W999',
+        display_name: null,
+        cited_by_count: 0,
+      });
+
+      expect(result.results[0]?.display_name).toBeNull();
+    });
+
+    it('returns no results on a 404 instead of throwing', async () => {
+      // A mistyped identifier gets the same soft empty result a mistyped name already gets.
+      const result = await resolve('works', 'doi:10.1038/nope', undefined, 404);
+      expect(result.results).toEqual([]);
+    });
+
+    it('still throws on a non-404 upstream failure', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ error: 'nope' }), { status: 401 }),
+      );
+      const service = await getService();
+
+      await expect(
+        service.resolveIdentifier(
+          { entityType: 'works', id: 'doi:10.1038/x', scheme: 'doi' },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({ code: JsonRpcErrorCode.Unauthorized });
     });
   });
 
