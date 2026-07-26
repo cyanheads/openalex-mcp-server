@@ -8,8 +8,9 @@ Thumbs.db
 # IDE AND EDITOR FILES
 # =============================================================================
 .idea/
-.vscode/!settings.json
-.vscode/!extensions.json
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 *.swp
 *.swo
 *~
@@ -69,7 +70,7 @@ worker-configuration.d.ts
 # =============================================================================
 .storage/
 repomix-output*
-data/
+/data/
 docs/api/
 docs/devdocs.md
 .mcp.json
