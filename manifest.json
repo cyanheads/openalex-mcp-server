@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "openalex-mcp-server",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "author": {
     "name": "cyanheads"

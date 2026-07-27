@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.8](changelog/0.7.x/0.7.8.md) — 2026-07-26
+
+Fixed: search_entities pre-flight validations no longer reject an id lookup over search-only constraints it never applies.
+
 ## [0.7.7](changelog/0.7.x/0.7.7.md) — 2026-07-26
 
 Added: openalex_resolve_name resolves identifiers directly; prepaid budget balance. Fixed: search_entities id lookup echoing ignored params, field catalog gaps, an all-digit ROR resolving as neither ROR nor PMID.
