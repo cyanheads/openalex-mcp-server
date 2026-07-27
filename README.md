@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -43,7 +43,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 
 Primary discovery and lookup tool. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders).
 
-- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran
+- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran. The search-only validations (semantic page cap, `sample` with `cursor`, `seed` without `sample`) are skipped too — a lookup is never rejected over parameters it ignores
 - Keyword search with boolean operators, quoted phrases, wildcards, and fuzzy matching
 - Exact and AI semantic search modes
 - Rich filter syntax: AND across fields, OR within fields (`us|gb`), NOT (`!us`), ranges (`2020-2024`), comparisons (`>100`)

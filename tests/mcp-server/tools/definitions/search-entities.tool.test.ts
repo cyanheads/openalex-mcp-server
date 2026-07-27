@@ -398,6 +398,78 @@ describe('searchEntitiesTool', () => {
     });
   });
 
+  describe('search-only validations skipped on an id lookup (gh #61)', () => {
+    const single: SearchResult = {
+      meta: { count: 1, per_page: 1, next_cursor: null },
+      results: [{ id: 'W2741809807', display_name: 'The state of OA' }],
+    };
+
+    it('accepts a semantic per_page over the cap, which the lookup never paginates', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: 'W2741809807',
+        search_mode: 'semantic',
+        per_page: 100,
+      });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+
+      expect(result.results).toHaveLength(1);
+      expect(mockSearch).toHaveBeenCalled();
+      expect(getEnrichment(ctx).notice).toContain('search_mode');
+    });
+
+    it('accepts sample alongside cursor, neither of which reaches the lookup', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: 'W2741809807',
+        sample: 5,
+        cursor: '*',
+      });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+
+      expect(result.results).toHaveLength(1);
+      expect(mockSearch).toHaveBeenCalled();
+      expect(getEnrichment(ctx).notice).toContain('sample');
+    });
+
+    it('accepts seed without sample, which the lookup never seeds', async () => {
+      mockSearch.mockResolvedValue(single);
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: 'W2741809807',
+        seed: 'abc',
+      });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+
+      expect(result.results).toHaveLength(1);
+      expect(mockSearch).toHaveBeenCalled();
+      expect(getEnrichment(ctx).notice).toContain('seed');
+    });
+
+    it('still validates when id is an empty string, which lists rather than looks up', async () => {
+      // `search()` branches on truthiness, so "" takes the list path — the checks must too.
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        id: '',
+        seed: 'abc',
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        data: expect.objectContaining({ reason: 'seed_without_sample' }),
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+  });
+
   describe('upstream 400 recovery (gh #43)', () => {
     it('carries the sort-requires-search reason and recovery from the service', async () => {
       const ctx = createMockContext({ errors: searchEntitiesTool.errors });

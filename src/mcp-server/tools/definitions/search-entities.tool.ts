@@ -72,19 +72,19 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'semantic_per_page_cap',
       code: JsonRpcErrorCode.ValidationError,
-      when: `per_page exceeds the semantic-search cap of ${SEMANTIC_PER_PAGE_CAP}.`,
+      when: `A search (no \`id\`) set per_page above the semantic-search cap of ${SEMANTIC_PER_PAGE_CAP}.`,
       recovery: `Reduce per_page to ${SEMANTIC_PER_PAGE_CAP} or less, or switch search_mode to keyword.`,
     },
     {
       reason: 'sample_with_cursor',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Both `sample` and `cursor` were provided.',
+      when: 'A search (no `id`) provided both `sample` and `cursor`.',
       recovery: 'Sampling returns a single page only; remove `cursor` or remove `sample`.',
     },
     {
       reason: 'seed_without_sample',
       code: JsonRpcErrorCode.ValidationError,
-      when: '`seed` was provided without `sample`.',
+      when: 'A search (no `id`) provided `seed` without `sample`.',
       recovery: 'Pass `sample` to enable random sampling, or remove `seed`.',
     },
     {
@@ -227,7 +227,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .max(100)
       .default(25)
       .describe(
-        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream).',
+        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The cap applies to searches only; an `id` lookup returns its one record regardless of both.',
       ),
     cursor: z
       .string()
@@ -246,7 +246,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Deterministic seed for `sample`. Same seed + same filters = same results — pass when reproducibility matters. Has no effect (and is rejected) without `sample`.',
+        'Deterministic seed for `sample`. Same seed + same filters = same results — pass when reproducibility matters. Has no effect without `sample`, and a search that passes it alone is rejected.',
       ),
   }),
   output: z.object({
@@ -329,33 +329,43 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   },
 
   async handler(input, ctx) {
-    if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
-      throw ctx.fail(
-        'semantic_per_page_cap',
-        `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-        {
-          ...ctx.recoveryFor('semantic_per_page_cap'),
-          searchMode: input.search_mode,
-          perPage: input.per_page,
-          cap: SEMANTIC_PER_PAGE_CAP,
-        },
-      );
-    }
+    /**
+     * All three checks below constrain a *list* query. `id` takes the singleton path in
+     * `OpenAlexService.search()`, which reads only `entity_type`, `id`, and `select` — so
+     * search_mode, per_page, cursor, sample, and seed are unread there, and rejecting an ID
+     * lookup over how they relate to each other fails it on constraints it never met. The
+     * dropped-parameter notice below reports them instead. The `id` predicate is truthiness,
+     * not `!== undefined`, to match the service branch: an empty-string `id` parses and lists.
+     */
+    if (!input.id) {
+      if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
+        throw ctx.fail(
+          'semantic_per_page_cap',
+          `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
+          {
+            ...ctx.recoveryFor('semantic_per_page_cap'),
+            searchMode: input.search_mode,
+            perPage: input.per_page,
+            cap: SEMANTIC_PER_PAGE_CAP,
+          },
+        );
+      }
 
-    if (input.sample !== undefined && input.cursor !== undefined) {
-      throw ctx.fail(
-        'sample_with_cursor',
-        'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
-        { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
-      );
-    }
+      if (input.sample !== undefined && input.cursor !== undefined) {
+        throw ctx.fail(
+          'sample_with_cursor',
+          'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
+          { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
+        );
+      }
 
-    if (input.seed !== undefined && input.sample === undefined) {
-      throw ctx.fail(
-        'seed_without_sample',
-        '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
-        { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
-      );
+      if (input.seed !== undefined && input.sample === undefined) {
+        throw ctx.fail(
+          'seed_without_sample',
+          '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
+          { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
+        );
+      }
     }
 
     const service = getOpenAlexService();
