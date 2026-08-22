@@ -60,6 +60,7 @@ logs/
 # ENVIRONMENT & CONFIGURATION
 # =============================================================================
 .env
+.env.bak-*
 .env.local
 .env.*.local
 .wrangler
