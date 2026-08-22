@@ -11,7 +11,7 @@ to the current release.
 Please do not open a public issue for security reports. Instead:
 
 - Report privately via GitHub: **Security** tab → **Report a vulnerability**, or
-- Email **casey@caseyjhand.com**
+- Email **security@caseyjhand.com**
 
 Include a minimal reproduction where possible. You'll receive an
 acknowledgment within a few days, and credit in the release notes if the
