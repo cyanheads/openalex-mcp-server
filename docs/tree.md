@@ -1,11 +1,9 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-07-26 22:36:58
+Generated on: 2026-08-22 13:52:01
 
 ```text
 openalex-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ openalex-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/

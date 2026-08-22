@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.9](changelog/0.7.x/0.7.9.md) — 2026-08-22
+
+Adopts mcp-ts-core 0.12 with strict tool inputs and advertised structured error envelopes.
+
 ## [0.7.8](changelog/0.7.x/0.7.8.md) — 2026-07-26
 
 Fixed: search_entities pre-flight validations no longer reject an id lookup over search-only constraints it never applies.
