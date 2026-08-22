@@ -18,7 +18,6 @@ import {
   unauthorized,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
@@ -608,6 +607,7 @@ function logResponseMetrics(
  */
 const TRUNCATED_ERROR_FIELD_RE = /"error"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|…|$)/;
 const TRUNCATED_MESSAGE_FIELD_RE = /"message"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|…|$)/;
+const ELIDED_BODY_MARKER_RE = /…\[\d+ bytes? elided\]…/;
 
 /**
  * Extract OpenAlex's `error` and `message` fields from a response body. JSON.parse
@@ -628,7 +628,7 @@ function parseOpenAlexErrorBody(
     return {
       error: typeof parsed.error === 'string' ? parsed.error : undefined,
       message: typeof parsed.message === 'string' ? parsed.message : undefined,
-      truncated: false,
+      truncated: ELIDED_BODY_MARKER_RE.test(responseBody),
     };
   } catch {
     const error = TRUNCATED_ERROR_FIELD_RE.exec(responseBody)?.[1];
@@ -841,18 +841,6 @@ function normalizeSort(sort?: string): string | undefined {
     .join(',');
 }
 
-function toRequestContext(ctx: Context, operation: string): RequestContext {
-  return {
-    requestId: ctx.requestId,
-    timestamp: ctx.timestamp,
-    operation,
-    ...(ctx.auth !== undefined && { auth: ctx.auth }),
-    ...(ctx.spanId !== undefined && { spanId: ctx.spanId }),
-    ...(ctx.tenantId !== undefined && { tenantId: ctx.tenantId }),
-    ...(ctx.traceId !== undefined && { traceId: ctx.traceId }),
-  };
-}
-
 class OpenAlexService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -868,7 +856,6 @@ class OpenAlexService {
   /** Execute an HTTP request against the OpenAlex API with retry on transient failures. */
   private request(path: string, params: Record<string, string>, ctx: Context): Promise<unknown> {
     const operation = `OpenAlex ${path}`;
-    const requestContext = toRequestContext(ctx, operation);
     const url = new URL(`${this.baseUrl}${path}`);
     // OpenAlex usage-based pricing (Feb 2026): the account credential authenticates as
     // `api_key=`. `mailto=` is now only a courtesy identifier (no budget/rate effect), sent
@@ -885,7 +872,7 @@ class OpenAlexService {
     return withRetry(
       async () => {
         try {
-          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, requestContext, {
+          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx, {
             headers: { Accept: 'application/json' },
             signal: ctx.signal,
           });
@@ -907,7 +894,7 @@ class OpenAlexService {
       },
       {
         operation,
-        context: requestContext,
+        context: ctx,
         baseDelayMs: BASE_BACKOFF_MS,
         maxRetries: MAX_ATTEMPTS - 1,
         signal: ctx.signal,

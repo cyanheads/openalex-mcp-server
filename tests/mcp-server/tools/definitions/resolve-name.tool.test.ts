@@ -4,7 +4,10 @@
  */
 
 import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext as createCoreMockContext,
+  getEnrichment,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
 
@@ -27,6 +30,9 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
 });
 
 const { resolveNameTool } = await import('@/mcp-server/tools/definitions/resolve-name.tool.js');
+
+const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]) =>
+  createCoreMockContext({ ...options, errors: resolveNameTool.errors });
 
 describe('resolveNameTool', () => {
   beforeEach(() => {
@@ -200,7 +206,7 @@ describe('resolveNameTool', () => {
       // field the tool did not declare.
       const budget = { costUsd: 0.0001, remainingUsd: 0.0687, resetsInSeconds: 5553 };
       const structured = resolveNameTool.output
-        .extend(resolveNameTool.enrichment)
+        .extend(resolveNameTool.enrichment!)
         .parse({ ...sampleResults, budget });
 
       expect(structured.budget).toEqual(budget);

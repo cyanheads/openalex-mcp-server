@@ -220,15 +220,16 @@ describe('describeFieldsTool', () => {
 
   describe('format()', () => {
     it('renders a header with entity_type, context, and total count', () => {
-      const content = describeFieldsTool.format({
-        entity_type: 'works',
-        context: 'filter',
-        fields: ['publication_year', 'type', 'is_oa'],
-        total: 206,
-      });
+      const content =
+        describeFieldsTool.format?.({
+          entity_type: 'works',
+          context: 'filter',
+          fields: ['publication_year', 'type', 'is_oa'],
+          total: 206,
+        }) ?? [];
 
       expect(content).toHaveLength(1);
-      const text = content[0]!.text;
+      const text = content[0]?.type === 'text' ? content[0].text : '';
       expect(text).toContain('works');
       expect(text).toContain('filter');
       expect(text).toContain('206');
@@ -236,13 +237,15 @@ describe('describeFieldsTool', () => {
     });
 
     it('renders "No matches." when fields is empty', () => {
-      const content = describeFieldsTool.format({
-        entity_type: 'authors',
-        context: 'select',
-        fields: [],
-        total: 21,
-      });
-      expect(content[0]!.text).toContain('No matches.');
+      const content =
+        describeFieldsTool.format?.({
+          entity_type: 'authors',
+          context: 'select',
+          fields: [],
+          total: 21,
+        }) ?? [];
+      const text = content[0]?.type === 'text' ? content[0].text : '';
+      expect(text).toContain('No matches.');
     });
   });
 });

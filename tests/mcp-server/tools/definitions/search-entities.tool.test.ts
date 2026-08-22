@@ -4,7 +4,10 @@
  */
 
 import { invalidParams, JsonRpcErrorCode, rateLimited } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext as createCoreMockContext,
+  getEnrichment,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
 
@@ -17,6 +20,9 @@ vi.mock('@/services/openalex/openalex-service.js', () => ({
 const { searchEntitiesTool } = await import(
   '@/mcp-server/tools/definitions/search-entities.tool.js'
 );
+
+const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]) =>
+  createCoreMockContext({ ...options, errors: searchEntitiesTool.errors });
 
 describe('searchEntitiesTool', () => {
   beforeEach(() => {
@@ -248,7 +254,7 @@ describe('searchEntitiesTool', () => {
       // field the tool did not declare — the declaration is what makes it reach a client.
       const budget = { costUsd: 0.001, remainingUsd: 0.0689, resetsInSeconds: 5554 };
       const structured = searchEntitiesTool.output
-        .extend(searchEntitiesTool.enrichment)
+        .extend(searchEntitiesTool.enrichment!)
         .parse({ ...sampleResult, echo: 'entity_type=works', totalCount: 2, budget });
 
       expect(structured.budget).toEqual(budget);

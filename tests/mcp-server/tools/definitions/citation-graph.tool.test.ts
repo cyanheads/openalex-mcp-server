@@ -4,7 +4,10 @@
  */
 
 import { invalidParams, JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext as createCoreMockContext,
+  getEnrichment,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
 
@@ -17,6 +20,9 @@ vi.mock('@/services/openalex/openalex-service.js', () => ({
 const { getCitationGraphTool } = await import(
   '@/mcp-server/tools/definitions/citation-graph.tool.js'
 );
+
+const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]) =>
+  createCoreMockContext({ ...options, errors: getCitationGraphTool.errors });
 
 /**
  * Seed-lookup response factory — every handler call now starts with a `/works/{id}`
@@ -267,7 +273,7 @@ describe('getCitationGraphTool', () => {
       // silently strips any field the tool did not declare.
       const budget = { costUsd: 0.001, remainingUsd: 0.0685, resetsInSeconds: 5558 };
       const structured = getCitationGraphTool.output
-        .extend(getCitationGraphTool.enrichment)
+        .extend(getCitationGraphTool.enrichment!)
         .parse({ ...sampleResult, echo: 'seed_id=W2741809807', totalCount: 3, budget });
 
       expect(structured.budget).toEqual(budget);

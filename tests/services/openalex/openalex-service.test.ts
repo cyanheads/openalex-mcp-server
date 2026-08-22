@@ -2430,6 +2430,31 @@ describe('OpenAlexService', () => {
       });
     });
 
+    it('marks a syntactically valid head-tail elision as truncated', async () => {
+      const longMessage =
+        'This combination of fields is not allowed. Valid fields are: ' +
+        'publication_year, cited_by_count, '.repeat(40);
+      const fullBody = JSON.stringify({
+        error: 'Invalid query parameters error.',
+        message: longMessage,
+      });
+      expect(fullBody.length).toBeGreaterThan(500);
+
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(fullBody, { status: 400, statusText: 'Bad Request' }),
+      );
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message:
+          'This combination of fields is not allowed. (list of valid fields omitted — was truncated upstream; see OpenAlex docs)',
+        data: { reason: 'upstream_invalid_params_other' },
+      });
+    });
+
     it('still surfaces the full message when body fits within the truncation cap', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(

@@ -270,7 +270,7 @@ describe('Security — env var non-leakage through tool layer', () => {
     const { analyzeTrendsTool } = await import(
       '@/mcp-server/tools/definitions/analyze-trends.tool.js'
     );
-    type AnalyzeResult = Parameters<typeof analyzeTrendsTool.format>[0];
+    type AnalyzeResult = Parameters<NonNullable<typeof analyzeTrendsTool.format>>[0];
 
     const fakeResult: AnalyzeResult = {
       meta: { count: 100, groups_count: 2, next_cursor: null },
@@ -293,7 +293,7 @@ describe('Security — env var non-leakage through tool layer', () => {
     const { searchEntitiesTool } = await import(
       '@/mcp-server/tools/definitions/search-entities.tool.js'
     );
-    type SearchResult = Parameters<typeof searchEntitiesTool.format>[0];
+    type SearchResult = Parameters<NonNullable<typeof searchEntitiesTool.format>>[0];
 
     const fakeResult: SearchResult = {
       meta: { count: 1, per_page: 25, next_cursor: null },
@@ -309,7 +309,7 @@ describe('Security — env var non-leakage through tool layer', () => {
 
   it('never surfaces OPENALEX_API_KEY in the resolve-name tool format output', async () => {
     const { resolveNameTool } = await import('@/mcp-server/tools/definitions/resolve-name.tool.js');
-    type AutocompleteResult = Parameters<typeof resolveNameTool.format>[0];
+    type AutocompleteResult = Parameters<NonNullable<typeof resolveNameTool.format>>[0];
 
     const fakeResult: AutocompleteResult = {
       results: [

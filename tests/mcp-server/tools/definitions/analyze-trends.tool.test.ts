@@ -4,7 +4,10 @@
  */
 
 import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext as createCoreMockContext,
+  getEnrichment,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
 
@@ -15,6 +18,9 @@ vi.mock('@/services/openalex/openalex-service.js', () => ({
 }));
 
 const { analyzeTrendsTool } = await import('@/mcp-server/tools/definitions/analyze-trends.tool.js');
+
+const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]) =>
+  createCoreMockContext({ ...options, errors: analyzeTrendsTool.errors });
 
 describe('analyzeTrendsTool', () => {
   beforeEach(() => {
@@ -219,7 +225,7 @@ describe('analyzeTrendsTool', () => {
       // field the tool did not declare.
       const budget = { costUsd: 0.0001, remainingUsd: 0.0688, resetsInSeconds: 5554 };
       const structured = analyzeTrendsTool.output
-        .extend(analyzeTrendsTool.enrichment)
+        .extend(analyzeTrendsTool.enrichment!)
         .parse({ ...sampleResult, echo: 'entity_type=works', totalCount: 50000, budget });
 
       expect(structured.budget).toEqual(budget);
