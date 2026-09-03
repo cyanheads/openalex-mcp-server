@@ -919,9 +919,10 @@ class OpenAlexService {
     const normalized = code === undefined ? undefined : NORMALIZED_THROW_BY_CODE[code];
 
     if (code === undefined || normalized === undefined) {
-      // No mapped reason for this code (a caller-side abort, an upstream 500). Framework
-      // fetch errors format the message as `Fetch failed for <URL>. Status: …` — the URL
-      // carries the `api_key` credential and the `mailto` identifier. Redact before bubbling.
+      // No mapped reason for this code (a caller-side abort — an upstream 500 now maps to
+      // ServiceUnavailable above). Framework fetch errors format the message as `Fetch failed
+      // for <URL>. Status: …` — the URL carries the `api_key` credential and the `mailto`
+      // identifier. Redact before bubbling.
       throw new McpError(error.code, redactUrlsInMessage(error.message), error.data, {
         cause: error,
       });
