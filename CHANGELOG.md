@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.10](changelog/0.7.x/0.7.10.md) — 2026-09-02
+
+An OpenAlex 500 now retries instead of failing on the first attempt, and a caller that disconnects mid-call surfaces as a cancellation rather than an internal error.
+
 ## [0.7.9](changelog/0.7.x/0.7.9.md) — 2026-08-22
 
 Adopts mcp-ts-core 0.12 with strict tool inputs and advertised structured error envelopes.
