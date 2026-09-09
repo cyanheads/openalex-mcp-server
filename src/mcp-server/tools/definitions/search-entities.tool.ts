@@ -188,7 +188,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -218,7 +218,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()

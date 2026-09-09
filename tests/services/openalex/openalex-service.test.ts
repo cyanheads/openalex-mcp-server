@@ -235,6 +235,61 @@ describe('OpenAlexService', () => {
       const url = await searchById('23903748');
       expect(url.pathname).toBe('/works/pmid:23903748');
     });
+
+    /**
+     * OpenAlex's bare external-ID schemes are case-sensitive: `/works/PMID:21491125` answers
+     * 404 while `/works/pmid:21491125` resolves. Only the scheme segment is folded — the value
+     * belongs to the caller and is forwarded byte-for-byte.
+     */
+    it.each([
+      ['PMID:21491125', '/works/pmid:21491125'],
+      ['DOI:10.1136/bmj.f5137', '/works/doi:10.1136/bmj.f5137'],
+      ['ORCID:0000-0002-1825-0097', '/works/orcid:0000-0002-1825-0097'],
+      ['ISSN:0028-0836', '/works/issn:0028-0836'],
+      ['ROR:013meh722', '/works/ror:013meh722'],
+      ['PMCID:PMC1234567', '/works/pmcid:PMC1234567'],
+      ['Pmid:21491125', '/works/pmid:21491125'],
+      ['dOi:10.1038/nature12373', '/works/doi:10.1038/nature12373'],
+    ])('lowercases the recognized scheme prefix of %s (gh #66)', async (id, expected) => {
+      const url = await searchById(id);
+      expect(url.pathname).toBe(expected);
+    });
+
+    it.each([
+      ['an uppercase DOI value', 'DOI:10.1136/BMJ.F5137', '/works/doi:10.1136/BMJ.F5137'],
+      ['an ORCID check digit', 'ORCID:0000-0002-1825-009X', '/works/orcid:0000-0002-1825-009X'],
+      ['a ROR URL value', 'ROR:https://ror.org/00HX57361', '/works/ror:https://ror.org/00HX57361'],
+      ['a PMCID value', 'PMCID:PMC1234567', '/works/pmcid:PMC1234567'],
+    ])(
+      'leaves the value untouched when folding the scheme — %s (gh #66)',
+      async (_label, id, expected) => {
+        const url = await searchById(id);
+        expect(url.pathname).toBe(expected);
+      },
+    );
+
+    it.each([
+      ['an unknown scheme', 'FOO:Bar', '/works/FOO:Bar'],
+      ['a colon-less uppercase token', 'PMID', '/works/PMID'],
+    ])('passes %s through unchanged (gh #66)', async (_label, id, expected) => {
+      const url = await searchById(id);
+      expect(url.pathname).toBe(expected);
+    });
+
+    it.each([
+      ['https://pubmed.ncbi.nlm.nih.gov/21491125', '/works/pmid:21491125'],
+      ['https://pubmed.ncbi.nlm.nih.gov/21491125/', '/works/pmid:21491125'],
+      ['https://www.pubmed.ncbi.nlm.nih.gov/21491125', '/works/pmid:21491125'],
+      ['http://pubmed.ncbi.nlm.nih.gov/21491125', '/works/pmid:21491125'],
+    ])('resolves the PubMed URL %s to the bare PMID form (gh #66)', async (id, expected) => {
+      const url = await searchById(id);
+      expect(url.pathname).toBe(expected);
+    });
+
+    it('leaves a non-numeric PubMed URL path to the pass-through branch (gh #66)', async () => {
+      const url = await searchById('https://pubmed.ncbi.nlm.nih.gov/advanced');
+      expect(url.pathname).toBe('/works/https://pubmed.ncbi.nlm.nih.gov/advanced');
+    });
   });
 
   // --- Identifier shape → entity type inference (gh #50) ---
@@ -257,6 +312,10 @@ describe('OpenAlexService', () => {
       ['PMCID', 'PMC1234567', 'works', 'pmcid'],
       ['PMID', '23903748', 'works', 'pmid'],
       ['already-prefixed DOI', 'doi:10.1038/nature12373', 'works', 'doi'],
+      ['uppercase-scheme PMID', 'PMID:21491125', 'works', 'pmid'],
+      ['uppercase-scheme ORCID', 'ORCID:0000-0002-1825-0097', 'authors', 'orcid'],
+      ['uppercase-scheme ROR', 'ROR:013meh722', 'institutions', 'ror'],
+      ['PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/21491125', 'works', 'pmid'],
     ])('maps a %s to %s', async (_label, query, entityType, scheme) => {
       expect(await infer(query)).toEqual({
         entityType,
@@ -293,6 +352,22 @@ describe('OpenAlexService', () => {
       ['an empty-ish query', '   '],
     ])('leaves %s to autocomplete', async (_label, query) => {
       expect(await infer(query)).toBeUndefined();
+    });
+
+    it('stamps the folded scheme onto the id it hands the by-ID lookup (gh #66)', async () => {
+      expect(await infer('PMID:21491125')).toEqual({
+        entityType: 'works',
+        id: 'pmid:21491125',
+        scheme: 'pmid',
+      });
+    });
+
+    it('reads a bare PubMed URL as a PMID instead of falling through (gh #66)', async () => {
+      expect(await infer('https://pubmed.ncbi.nlm.nih.gov/21491125')).toEqual({
+        entityType: 'works',
+        id: 'pmid:21491125',
+        scheme: 'pmid',
+      });
     });
 
     it.each([
@@ -815,6 +890,98 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,year');
+    });
+
+    /**
+     * Bibliometrics live under `summary_stats` upstream, and `select` projects top-level
+     * fields only — so `select: ["h_index"]` was a 400 that named 21 valid fields, none of
+     * them resembling what the caller asked for. Aliasing the leaf to its parent makes the
+     * first call succeed. (gh #64)
+     */
+    it.each([
+      ['authors', 'h_index'],
+      ['sources', 'i10_index'],
+      ['institutions', '2yr_mean_citedness'],
+      ['publishers', 'h_index'],
+      ['funders', 'h_index'],
+    ])('aliases a summary_stats leaf to its parent on %s', async (entityType, leaf) => {
+      const service = await getService();
+      await service.search(
+        {
+          entityType: entityType as Parameters<typeof service.search>[0]['entityType'],
+          select: ['id', 'display_name', leaf],
+        },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,summary_stats');
+    });
+
+    it('projects summary_stats once when several of its leaves are requested (gh #64)', async () => {
+      const service = await getService();
+      await service.search(
+        {
+          entityType: 'authors',
+          select: ['h_index', 'i10_index', '2yr_mean_citedness'],
+        },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,summary_stats');
+    });
+
+    it('leaves the canonical summary_stats name untouched (gh #64)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', select: ['id', 'display_name', 'summary_stats'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,summary_stats');
+    });
+
+    it('collapses a leaf requested alongside its canonical parent (gh #64)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', select: ['summary_stats', 'h_index'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,summary_stats');
+    });
+
+    it.each([
+      ['works', 'works keeps only its own alias map'],
+      ['topics', 'topics expose no summary_stats upstream'],
+      ['keywords', 'keywords expose no summary_stats upstream'],
+    ])('does not alias h_index on %s — %s (gh #64)', async (entityType) => {
+      const service = await getService();
+      await service.search(
+        {
+          entityType: entityType as Parameters<typeof service.search>[0]['entityType'],
+          select: ['id', 'display_name', 'h_index'],
+        },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,h_index');
+    });
+
+    it('fails open on an unmapped field name for an aliased entity type (gh #64)', async () => {
+      // #17's rule: a miss passes through untranslated so upstream's 400 names the valid fields.
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', select: ['id', 'display_name', 'h_indx'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,h_indx');
+    });
+
+    it('aliases a summary_stats leaf on a singleton id lookup too (gh #64)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'A1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search(
+        { entityType: 'authors', id: 'A5022021627', select: ['h_index'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,summary_stats');
     });
 
     it('reconstructs abstract end-to-end when select uses the alias', async () => {

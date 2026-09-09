@@ -13,9 +13,19 @@ import type { SearchResult } from '@/services/openalex/types.js';
 
 const mockSearch = vi.fn<() => Promise<SearchResult>>();
 
-vi.mock('@/services/openalex/openalex-service.js', () => ({
-  getOpenAlexService: () => ({ search: mockSearch }),
-}));
+/**
+ * Only the service accessor is faked. `normalizeId` stays real, so the id cases can check the
+ * path segment the service will actually request rather than restating the tool's own input.
+ */
+vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/openalex/openalex-service.js')>();
+  return {
+    ...actual,
+    getOpenAlexService: () => ({ search: mockSearch }),
+  };
+});
+
+const { normalizeId } = await import('@/services/openalex/openalex-service.js');
 
 const { searchEntitiesTool } = await import(
   '@/mcp-server/tools/definitions/search-entities.tool.js'
@@ -79,6 +89,77 @@ describe('searchEntitiesTool', () => {
       ctx,
     );
     expect(result.results).toHaveLength(1);
+  });
+
+  /**
+   * The tool hands `id` to the service verbatim; the service's `normalizeId` is what settles
+   * the upstream path segment. Both halves are asserted so the chain a caller depends on —
+   * the spelling they typed reaching OpenAlex in the one casing it answers — is pinned here.
+   */
+  it.each([
+    ['an uppercase scheme', 'PMID:21491125', 'pmid:21491125'],
+    ['a mixed-case scheme', 'Doi:10.1136/bmj.f5137', 'doi:10.1136/bmj.f5137'],
+    ['a PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/21491125', 'pmid:21491125'],
+  ])(
+    'forwards %s to the service in a form that resolves upstream (gh #66)',
+    async (_label, id, normalized) => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [{ id: 'W3147052403', display_name: 'The short QT syndrome' }],
+      });
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', id });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'works', id }),
+        ctx,
+      );
+      expect(normalizeId(id)).toBe(normalized);
+      expect(result.results).toHaveLength(1);
+    },
+  );
+
+  /**
+   * `select` projects top-level fields, so a bibliometric leaf resolves as its parent object.
+   * Both client surfaces must carry it — structuredContent and the rendered content[]. (gh #64)
+   */
+  it('carries an aliased summary_stats object on both output surfaces (gh #64)', async () => {
+    const withStats: SearchResult = {
+      meta: { count: 1, per_page: 25, next_cursor: null },
+      results: [
+        {
+          id: 'A5022021627',
+          display_name: 'Yann LeCun',
+          summary_stats: { '2yr_mean_citedness': 13.98, h_index: 121, i10_index: 282 },
+        },
+      ],
+    };
+    mockSearch.mockResolvedValue(withStats);
+    const ctx = createMockContext();
+    const input = searchEntitiesTool.input.parse({
+      entity_type: 'authors',
+      query: 'Yann LeCun',
+      select: ['id', 'display_name', 'h_index'],
+    });
+
+    const result = await searchEntitiesTool.handler(input, ctx);
+
+    // The tool forwards the leaf name; the service is what widens it to the parent.
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ select: ['id', 'display_name', 'h_index'] }),
+      ctx,
+    );
+    expect(result.results[0]).toMatchObject({
+      summary_stats: { h_index: 121, i10_index: 282, '2yr_mean_citedness': 13.98 },
+    });
+
+    const blocks = searchEntitiesTool.format?.(result) ?? [];
+    const text = blocks.map((b) => ('text' in b ? b.text : '')).join('\n');
+    expect(text).toContain('121');
+    expect(text).toContain('282');
+    expect(text).toContain('13.98');
   });
 
   it('passes all optional params through', async () => {

@@ -165,7 +165,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .min(1)
       .describe(
-        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), PMID, or PMCID. Use openalex_resolve_name first if you only have a title.',
+        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), or PMCID. Use openalex_resolve_name first if you only have a title.',
       ),
     direction: z
       .enum(DIRECTIONS)

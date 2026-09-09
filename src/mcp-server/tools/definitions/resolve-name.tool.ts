@@ -109,7 +109,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .min(1)
       .describe(
-        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search.',
+        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search.',
       ),
     filters: z
       .record(z.string(), z.string())

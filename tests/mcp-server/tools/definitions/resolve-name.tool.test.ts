@@ -260,6 +260,38 @@ describe('resolveNameTool', () => {
       },
     );
 
+    /**
+     * The scheme is folded before the by-ID lookup runs, so an uppercase spelling reaches
+     * upstream in the one casing it answers. A bare PubMed URL is an identifier too — it
+     * used to read as an `https` scheme, find no entry, and fall through to a name search.
+     */
+    it.each([
+      ['uppercase PMID scheme', 'PMID:21491125', 'works', 'pmid:21491125'],
+      ['mixed-case DOI scheme', 'Doi:10.1038/nature12373', 'works', 'doi:10.1038/nature12373'],
+      [
+        'uppercase ORCID scheme',
+        'ORCID:0000-0001-9487-6983',
+        'authors',
+        'orcid:0000-0001-9487-6983',
+      ],
+      ['PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/21491125', 'works', 'pmid:21491125'],
+    ])(
+      'routes a %s to the deterministic lookup (gh #66)',
+      async (_label, query, entityType, id) => {
+        mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
+        const ctx = createMockContext();
+        const input = resolveNameTool.input.parse({ query });
+
+        await resolveNameTool.handler(input, ctx);
+
+        expect(mockAutocomplete).not.toHaveBeenCalled();
+        expect(mockResolveIdentifier).toHaveBeenCalledWith(
+          expect.objectContaining({ entityType, id }),
+          ctx,
+        );
+      },
+    );
+
     it('sends real names to autocomplete', async () => {
       mockAutocomplete.mockResolvedValue(sampleResults);
       const ctx = createMockContext();

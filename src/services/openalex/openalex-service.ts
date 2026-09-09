@@ -102,6 +102,27 @@ function buildFilterString(filters: Record<string, string>, ctx: Context): strin
 const BARE_ROR_PATTERN = /^0[0-9a-hj-km-np-tv-z]{6}\d{2}$/;
 
 /**
+ * A PubMed article URL. OpenAlex does not accept the bare URL as a work ID, but the numeric
+ * article path is a PMID, so the URL carries exactly the same meaning as the bare form. The
+ * host is anchored on both ends so a look-alike domain can never be read as PubMed.
+ */
+const PUBMED_URL_PATTERN = /^https?:\/\/(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)\/?$/i;
+
+/**
+ * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
+ * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
+ * lets an identifier resolve without the caller naming a type.
+ */
+const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
+  doi: 'works',
+  issn: 'sources',
+  orcid: 'authors',
+  pmcid: 'works',
+  pmid: 'works',
+  ror: 'institutions',
+};
+
+/**
  * Detect ID format and return the API path segment.
  * "10.1038/nature12373" → "doi:10.1038/nature12373"
  * "https://doi.org/10.1038/nature12373" → "doi:10.1038/nature12373"
@@ -110,6 +131,8 @@ const BARE_ROR_PATTERN = /^0[0-9a-hj-km-np-tv-z]{6}\d{2}$/;
  * "https://ror.org/00hx57361" → "ror:https://ror.org/00hx57361"
  * "013meh722" → "ror:013meh722"
  * "PMC1234567" → "pmcid:PMC1234567"
+ * "https://pubmed.ncbi.nlm.nih.gov/21491125" → "pmid:21491125"
+ * "PMID:21491125" → "pmid:21491125"
  * "W2741809807" → "W2741809807"
  */
 export function normalizeId(id: string): string {
@@ -165,23 +188,27 @@ export function normalizeId(id: string): string {
     return `pmid:${trimmed}`;
   }
 
-  // OpenAlex ID or already prefixed — pass through
+  // PubMed URL → the bare PMID form, matching the pure-numeric branch above. Runs after every
+  // shape-matching branch so it can never shadow the bare ROR/PMID disambiguation.
+  const pubmedPmid = PUBMED_URL_PATTERN.exec(trimmed)?.[1];
+  if (pubmedPmid) {
+    return `pmid:${pubmedPmid}`;
+  }
+
+  // Already prefixed — OpenAlex's bare external-ID schemes are case-sensitive, so a caller's
+  // `PMID:`/`DOI:` spelling 404s. Fold a recognized scheme to lower case and leave the value
+  // exactly as given: DOIs and ORCIDs carry meaningful casing that is the caller's to set.
+  const colon = trimmed.indexOf(':');
+  if (colon > 0) {
+    const scheme = trimmed.slice(0, colon).toLowerCase();
+    if (Object.hasOwn(ENTITY_TYPE_BY_ID_PREFIX, scheme)) {
+      return `${scheme}${trimmed.slice(colon)}`;
+    }
+  }
+
+  // OpenAlex ID or an unrecognized prefix — pass through
   return trimmed;
 }
-
-/**
- * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
- * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
- * lets an identifier resolve without the caller naming a type.
- */
-const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
-  doi: 'works',
-  issn: 'sources',
-  orcid: 'authors',
-  pmcid: 'works',
-  pmid: 'works',
-  ror: 'institutions',
-};
 
 /** Native OpenAlex ID letter → entity type. */
 const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
@@ -424,6 +451,32 @@ const SELECT_ALIASES_WORKS: Record<string, string> = {
 };
 
 /**
+ * Bibliometric leaves that live under `summary_stats` upstream. `select` projects top-level
+ * fields only — OpenAlex rejects both the bare leaf name and the dotted path — so a caller
+ * asking for `h_index` gets a 400 listing 21 field names, none of which resemble what they
+ * asked for. Widening the leaf to its parent makes the first call succeed and returns the
+ * requested metric inside the object it actually lives in.
+ */
+const SELECT_ALIASES_SUMMARY_STATS: Record<string, string> = {
+  '2yr_mean_citedness': 'summary_stats',
+  h_index: 'summary_stats',
+  i10_index: 'summary_stats',
+};
+
+/**
+ * Entity types that expose `summary_stats`, verified against `api.openalex.org`. `works`,
+ * `topics`, and `keywords` carry no such field and reject it in `select`, so they get no
+ * alias map — the upstream 400 is the correct answer there.
+ */
+const SUMMARY_STATS_ENTITY_TYPES: ReadonlySet<string> = new Set([
+  'authors',
+  'funders',
+  'institutions',
+  'publishers',
+  'sources',
+]);
+
+/**
  * Works-only `filter` key aliases. Same shape as `SELECT_ALIASES_WORKS` — LLM callers reach
  * for `cited_works` (the semantic phrasing) and `year` (universal in REST), neither of which
  * upstream accepts. Renames are fail-open: misses pass through to upstream and surface its
@@ -440,11 +493,21 @@ const FILTER_ALIASES_WORKS: Record<string, string> = {
  * `abstract` is reconstructed from `abstract_inverted_index` in the response — the API
  * itself only accepts the latter — so we accept either on input and forward the upstream
  * name. Keeps tool ergonomics symmetric with the response shape.
+ *
+ * Renames are fail-open: an unmapped name passes through and surfaces upstream's 400 with
+ * its valid-field list. Several leaves can share one parent, so the list is deduped after
+ * aliasing rather than before.
  */
 function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
   const withRequired = Array.from(new Set([...REQUIRED_SEARCH_FIELDS, ...fields]));
-  if (entityType !== 'works') return withRequired;
-  return withRequired.map((field) => SELECT_ALIASES_WORKS[field] ?? field);
+  const aliases =
+    entityType === 'works'
+      ? SELECT_ALIASES_WORKS
+      : SUMMARY_STATS_ENTITY_TYPES.has(entityType)
+        ? SELECT_ALIASES_SUMMARY_STATS
+        : undefined;
+  if (!aliases) return withRequired;
+  return Array.from(new Set(withRequired.map((field) => aliases[field] ?? field)));
 }
 
 /**

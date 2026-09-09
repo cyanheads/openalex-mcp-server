@@ -331,3 +331,71 @@ describe('Security — env var non-leakage through tool layer', () => {
     expect(text).not.toContain('api_key');
   });
 });
+
+/**
+ * Identifier normalization rewrites what the caller typed into an upstream path segment,
+ * so it is a place where caller input becomes part of a URL path. These cases pin the
+ * blast radius: exactly one recognized scheme prefix is case-folded, and nothing else
+ * about the caller's string — value casing, unknown prefixes, arbitrary text — is altered.
+ */
+describe('Security — identifier normalization never rewrites the caller value', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<() => Promise<Response>>().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        ),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  async function pathForId(id: string): Promise<string> {
+    const { initOpenAlexService, getOpenAlexService } = await import(
+      '@/services/openalex/openalex-service.js'
+    );
+    initOpenAlexService();
+    await getOpenAlexService().search({ entityType: 'works', id }, createMockContext());
+    const call = vi.mocked(globalThis.fetch).mock.lastCall;
+    if (!call) throw new Error('fetch was not called');
+    return new URL(String(call[0])).pathname;
+  }
+
+  it.each([
+    ['an unknown scheme keeps its case', 'X-Custom:AbC', '/works/X-Custom:AbC'],
+    ['a scheme-shaped name is not folded', 'Nature:AWeeklyJournal', '/works/Nature:AWeeklyJournal'],
+    [
+      'an uppercase ORCID value survives',
+      'ORCID:0000-0002-1825-009X',
+      '/works/orcid:0000-0002-1825-009X',
+    ],
+    [
+      'an uppercase ROR value survives',
+      'ROR:https://ror.org/00HX57361',
+      '/works/ror:https://ror.org/00HX57361',
+    ],
+    ['an uppercase DOI value survives', 'DOI:10.1136/BMJ.F5137', '/works/doi:10.1136/BMJ.F5137'],
+    ['an ISSN value survives', 'ISSN:0028-083X', '/works/issn:0028-083X'],
+  ])('%s (gh #66)', async (_label, id, expected) => {
+    expect(await pathForId(id)).toBe(expected);
+  });
+
+  it('confines the PubMed URL branch to a numeric article path (gh #66)', async () => {
+    expect(await pathForId('https://pubmed.ncbi.nlm.nih.gov/21491125')).toBe(
+      '/works/pmid:21491125',
+    );
+    // A look-alike host must not be read as PubMed and rewritten into a pmid: lookup.
+    expect(await pathForId('https://pubmed.ncbi.nlm.nih.gov.evil.test/21491125')).toBe(
+      '/works/https://pubmed.ncbi.nlm.nih.gov.evil.test/21491125',
+    );
+  });
+});

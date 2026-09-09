@@ -13,9 +13,19 @@ import type { SearchResult } from '@/services/openalex/types.js';
 
 const mockSearch = vi.fn<() => Promise<SearchResult>>();
 
-vi.mock('@/services/openalex/openalex-service.js', () => ({
-  getOpenAlexService: () => ({ search: mockSearch }),
-}));
+/**
+ * Only the service accessor is faked. `normalizeId` stays real, so the seed cases can check
+ * the path segment the seed lookup will actually request.
+ */
+vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/openalex/openalex-service.js')>();
+  return {
+    ...actual,
+    getOpenAlexService: () => ({ search: mockSearch }),
+  };
+});
+
+const { normalizeId } = await import('@/services/openalex/openalex-service.js');
 
 const { getCitationGraphTool } = await import(
   '@/mcp-server/tools/definitions/citation-graph.tool.js'
@@ -112,6 +122,36 @@ describe('getCitationGraphTool', () => {
       expect.objectContaining({ filters: { cited_by: 'W2741809807' } }),
       ctx,
     );
+  });
+
+  /**
+   * The seed lookup runs `seed_id` through the same service path a direct `id` lookup uses,
+   * so an uppercase scheme or a PubMed URL used to 404 here and surface as `entity_not_found`.
+   */
+  it.each([
+    ['an uppercase scheme', 'PMID:16344476', 'pmid:16344476'],
+    ['a PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/16344476', 'pmid:16344476'],
+  ])('resolves a seed_id carrying %s (gh #66)', async (_label, seedId, normalized) => {
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W2041112550'))
+      .mockResolvedValueOnce(sampleResult);
+    const ctx = createMockContext();
+    const input = getCitationGraphTool.input.parse({ seed_id: seedId, direction: 'cited_by' });
+
+    const result = await getCitationGraphTool.handler(input, ctx);
+
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ entityType: 'works', id: seedId, select: ['id'] }),
+      ctx,
+    );
+    expect(normalizeId(seedId)).toBe(normalized);
+    expect(mockSearch).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ filters: { cited_by: 'W2041112550' } }),
+      ctx,
+    );
+    expect(result.results).toHaveLength(3);
   });
 
   it('validates the seed even when seed_id is already a W-ID (gh #20)', async () => {
