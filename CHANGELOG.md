@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.11](changelog/0.7.x/0.7.11.md) — 2026-09-08
+
+Uppercase ID schemes and PubMed URLs now resolve instead of 404ing, summary_stats leaves (h_index, i10_index, 2yr_mean_citedness) alias into select, and describe_fields ranking no longer hides a nested field's parent.
+
 ## [0.7.10](changelog/0.7.x/0.7.10.md) — 2026-09-02
 
 An OpenAlex 500 now retries instead of failing on the first attempt, and a caller that disconnects mid-call surfaces as a cancellation rather than an internal error.
