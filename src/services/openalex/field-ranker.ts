@@ -90,21 +90,40 @@ function score(query: string, candidate: string): number {
   return Math.min(1.0, 0.55 * tokenOverlap + 0.25 * jw + subsetBonus);
 }
 
+/** Score every candidate, ordered by score descending. Sort is stable, so ties keep pool order. */
+function rankByScore(query: string, pool: string[]): { candidate: string; s: number }[] {
+  return pool
+    .map((candidate) => ({ candidate, s: score(query, candidate) }))
+    .sort((a, b) => b.s - a.s);
+}
+
 /**
  * Return the top-N candidate field names from `pool` ranked by similarity
  * to `query`. Results are ordered by score descending.
+ *
+ * Zero-scoring candidates are dropped — this backs the "did you mean" line on an
+ * invalid-field error, where a candidate sharing nothing with the rejected name is noise.
+ * To browse a whole pool, use `rankAllFields`: a lexical scorer cannot rank a nested leaf
+ * against its parent, so filtering there removes the answer instead of deprioritizing it.
  *
  * @param query - The rejected field name submitted by the caller.
  * @param pool - All valid field names for this entity_type + context.
  * @param topN - Maximum number of suggestions to return. Default 5.
  */
 export function rankFields(query: string, pool: string[], topN = 5): string[] {
-  if (pool.length === 0) return [];
-
-  return pool
-    .map((candidate) => ({ candidate, s: score(query, candidate) }))
+  return rankByScore(query, pool)
     .filter(({ s }) => s > 0)
-    .sort((a, b) => b.s - a.s)
     .slice(0, topN)
     .map(({ candidate }) => candidate);
+}
+
+/**
+ * Rank the entire `pool` against `query`, retaining every member. Zero-scoring candidates
+ * sort last rather than being dropped: a query reorders the pool, it does not reduce it.
+ *
+ * @param query - The partial or guessed field name submitted by the caller.
+ * @param pool - All valid field names for this entity_type + context.
+ */
+export function rankAllFields(query: string, pool: string[]): string[] {
+  return rankByScore(query, pool).map(({ candidate }) => candidate);
 }

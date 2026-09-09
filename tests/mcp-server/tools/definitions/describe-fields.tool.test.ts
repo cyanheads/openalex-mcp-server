@@ -181,8 +181,8 @@ describe('describeFieldsTool', () => {
     });
   });
 
-  describe('query filtering', () => {
-    it('ranks awards.funder_id near the top for query "funder" on works/filter', async () => {
+  describe('query ranking', () => {
+    it('ranks awards.funder_id near the top for query "funder" on works/group_by', async () => {
       const ctx = createMockContext();
       const input = describeFieldsTool.input.parse({
         entity_type: 'works',
@@ -192,13 +192,17 @@ describe('describeFieldsTool', () => {
 
       const result = await describeFieldsTool.handler(input, ctx);
 
-      expect(result.fields.length).toBeGreaterThan(0);
-      // total is the full pool size, fields is the ranked subset
-      expect(result.total).toBeGreaterThan(result.fields.length);
       expect(result.fields.slice(0, 5)).toContain('awards.funder_id');
+      // A query ranks the pool; it does not remove members of it.
+      expect(result.fields.length).toBe(result.total);
     });
 
-    it('returns fewer results when query is specific', async () => {
+    /**
+     * Was "returns fewer results when query is specific" — the cap it encoded is what hid
+     * `summary_stats` from the caller looking for `h_index`. A query now reorders the same
+     * pool, so the two calls return the same fields in a different order. (gh #63)
+     */
+    it('returns the same field set with or without a query — ranking, not filtering', async () => {
       const ctx = createMockContext();
       const allInput = describeFieldsTool.input.parse({
         entity_type: 'works',
@@ -213,8 +217,71 @@ describe('describeFieldsTool', () => {
       const allResult = await describeFieldsTool.handler(allInput, ctx);
       const queriedResult = await describeFieldsTool.handler(queriedInput, ctx);
 
-      expect(queriedResult.fields.length).toBeLessThan(allResult.fields.length);
       expect(queriedResult.total).toBe(allResult.total);
+      expect(queriedResult.fields.length).toBe(allResult.fields.length);
+      expect(new Set(queriedResult.fields)).toEqual(new Set(allResult.fields));
+      // …but ranked, so the query's best match moved to the front.
+      expect(queriedResult.fields[0]).not.toBe(allResult.fields[0]);
+    });
+
+    /**
+     * The reported repro: `h_index` is real author data living at `summary_stats.h_index`, and
+     * asking where it lives returned every authors/select field except the one that holds it.
+     */
+    it('returns summary_stats for query "h_index" on authors/select (gh #63)', async () => {
+      const ctx = createMockContext();
+      const input = describeFieldsTool.input.parse({
+        entity_type: 'authors',
+        context: 'select',
+        query: 'h_index',
+      });
+
+      const result = await describeFieldsTool.handler(input, ctx);
+
+      expect(result.fields).toContain('summary_stats');
+      expect(result.fields.length).toBe(result.total);
+    });
+
+    it('returns id for query "summary_stats" on authors/select (gh #63)', async () => {
+      const ctx = createMockContext();
+      const input = describeFieldsTool.input.parse({
+        entity_type: 'authors',
+        context: 'select',
+        query: 'summary_stats',
+      });
+
+      const result = await describeFieldsTool.handler(input, ctx);
+
+      expect(result.fields).toContain('id');
+      expect(result.fields[0]).toBe('summary_stats');
+      expect(result.fields.length).toBe(result.total);
+    });
+
+    it('withholds nothing from the 206-field works/filter pool (gh #63)', async () => {
+      const ctx = createMockContext();
+      const input = describeFieldsTool.input.parse({
+        entity_type: 'works',
+        context: 'filter',
+        query: 'funder',
+      });
+
+      const result = await describeFieldsTool.handler(input, ctx);
+
+      expect(result.total).toBeGreaterThan(200);
+      expect(result.fields.length).toBe(result.total);
+    });
+
+    it('leaves the no-query path unranked and complete', async () => {
+      const ctx = createMockContext();
+      const input = describeFieldsTool.input.parse({
+        entity_type: 'authors',
+        context: 'select',
+      });
+
+      const result = await describeFieldsTool.handler(input, ctx);
+
+      expect(result.fields.length).toBe(result.total);
+      expect(result.fields).toContain('summary_stats');
     });
   });
 
@@ -234,6 +301,21 @@ describe('describeFieldsTool', () => {
       expect(text).toContain('filter');
       expect(text).toContain('206');
       expect(text).toContain('publication_year');
+    });
+
+    it('renders every ranked field with no truncation note (gh #63)', () => {
+      const content =
+        describeFieldsTool.format?.({
+          entity_type: 'authors',
+          context: 'select',
+          fields: ['summary_stats', 'id', 'display_name'],
+          total: 3,
+        }) ?? [];
+
+      const text = content[0]?.type === 'text' ? content[0].text : '';
+      expect(text).toContain('summary_stats');
+      expect(text).toContain('display_name');
+      expect(text).not.toContain('showing top');
     });
 
     it('renders "No matches." when fields is empty', () => {
