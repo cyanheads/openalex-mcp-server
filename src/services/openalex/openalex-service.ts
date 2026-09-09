@@ -109,6 +109,26 @@ const BARE_ROR_PATTERN = /^0[0-9a-hj-km-np-tv-z]{6}\d{2}$/;
 const PUBMED_URL_PATTERN = /^https?:\/\/(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)\/?$/i;
 
 /**
+ * A PubMed Central article URL — the current `pmc.ncbi.nlm.nih.gov/articles/…` host and the
+ * legacy `ncbi.nlm.nih.gov/pmc/articles/…` path alike. The article segment is a PMCID, so the
+ * URL carries exactly the same meaning as the bare form; normalizing it is what makes the two
+ * fail identically instead of the URL being forwarded verbatim as a work ID. As with PubMed,
+ * the host is anchored on both ends so a look-alike domain can never be read as PubMed Central.
+ */
+const PMC_URL_PATTERN =
+  /^https?:\/\/(?:www\.)?(?:pmc\.ncbi\.nlm\.nih\.gov|ncbi\.nlm\.nih\.gov\/pmc)\/articles\/(PMC\d+)\/?$/i;
+
+/**
+ * Recovery for a PMCID that reached OpenAlex and came back with nothing. OpenAlex indexes no
+ * PMCIDs — `has_pmcid:true` matches zero works and a work's `ids` object never carries the key —
+ * so a PMCID cannot resolve however well formed it is, and the generic "verify the ID format"
+ * advice sends the caller back to retry an identifier that can never work. Shared by the 404
+ * mapping here and the `openalex_resolve_name` miss notice so both say the same thing.
+ */
+export const PMCID_NOT_INDEXED_HINT =
+  'OpenAlex indexes no PMCIDs, so a PMCID resolves nothing however it is written. Convert it to a PMID or DOI — the NCBI ID Converter (https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/) does this — and retry with that identifier.';
+
+/**
  * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
  * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
  * lets an identifier resolve without the caller naming a type.
@@ -131,6 +151,8 @@ const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
  * "https://ror.org/00hx57361" → "ror:https://ror.org/00hx57361"
  * "013meh722" → "ror:013meh722"
  * "PMC1234567" → "pmcid:PMC1234567"
+ * "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/" → "pmcid:PMC1234567"
+ * "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/" → "pmcid:PMC1234567"
  * "https://pubmed.ncbi.nlm.nih.gov/21491125" → "pmid:21491125"
  * "PMID:21491125" → "pmid:21491125"
  * "W2741809807" → "W2741809807"
@@ -193,6 +215,13 @@ export function normalizeId(id: string): string {
   const pubmedPmid = PUBMED_URL_PATTERN.exec(trimmed)?.[1];
   if (pubmedPmid) {
     return `pmid:${pubmedPmid}`;
+  }
+
+  // PubMed Central URL → the bare PMCID form, matching the `PMC\d+` branch above. Placed with
+  // the PubMed URL branch, after the shape-matching ones, for the same reason.
+  const pmcId = PMC_URL_PATTERN.exec(trimmed)?.[1];
+  if (pmcId) {
+    return `pmcid:${pmcId}`;
   }
 
   // Already prefixed — OpenAlex's bare external-ID schemes are case-sensitive, so a caller's
@@ -806,6 +835,15 @@ function resolveThrowReason(
 }
 
 /**
+ * Is this request path a by-ID lookup for a `pmcid:`-scheme identifier? `normalizeId()` folds a
+ * recognized scheme to lower case, so `pmcid:` is the exact prefix every PMCID lookup arrives
+ * with, bare form and PubMed Central URL alike.
+ */
+function isPmcidLookup(path: string): boolean {
+  return path.split('/')[2]?.startsWith('pmcid:') ?? false;
+}
+
+/**
  * Domain-language replacement for the framework's fetch-plumbing message on the failures
  * that never carry an HTTP status. `fetch GET <url> timed out.` describes this client, not
  * the upstream; the caller needs to read that OpenAlex did not answer.
@@ -1022,6 +1060,12 @@ class OpenAlexService {
       path,
       reason,
       ...ctx.recoveryFor(reason),
+      // A PMCID lookup that 404s is not a miss to verify and retry — OpenAlex indexes no
+      // PMCIDs, so every tool's generic "verify the ID" recovery hands back the one instruction
+      // that cannot help. Substituted here, where all three ID-accepting tools inherit it.
+      ...(code === JsonRpcErrorCode.NotFound && isPmcidLookup(path)
+        ? { recovery: { hint: PMCID_NOT_INDEXED_HINT } }
+        : {}),
       // `RateLimited` sits in the framework's transient set, so `withRetry` would spend the
       // full attempt budget against a budget wall that stays up until the daily reset. This
       // flag is the framework's per-error opt-out from that loop; the contract's own

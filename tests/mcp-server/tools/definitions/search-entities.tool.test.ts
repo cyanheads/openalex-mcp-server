@@ -3,10 +3,16 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
-import { invalidParams, JsonRpcErrorCode, rateLimited } from '@cyanheads/mcp-ts-core/errors';
+import {
+  invalidParams,
+  JsonRpcErrorCode,
+  notFound,
+  rateLimited,
+} from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
   getEnrichment,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -25,7 +31,9 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
   };
 });
 
-const { normalizeId } = await import('@/services/openalex/openalex-service.js');
+const { normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
+  '@/services/openalex/openalex-service.js'
+);
 
 const { searchEntitiesTool } = await import(
   '@/mcp-server/tools/definitions/search-entities.tool.js'
@@ -727,6 +735,95 @@ describe('searchEntitiesTool', () => {
       const description = searchEntitiesTool.input.shape.sort.description ?? '';
       expect(description).toMatch(/comma-separate/i);
       expect(description).toContain('-publication_year,cited_by_count');
+    });
+  });
+
+  /**
+   * OpenAlex indexes no PMCIDs, so a PMCID lookup can only 404. The tool still forwards it —
+   * a wasted call plus an actionable error beats a local block that would have to be removed
+   * by hand the day upstream starts populating the field — and the service's substituted
+   * recovery has to reach the caller on both client surfaces.
+   */
+  describe('PMCID lookups (gh #67)', () => {
+    const pmcIds: [label: string, id: string][] = [
+      ['a bare PMCID', 'PMC3084216'],
+      ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
+      ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/'],
+    ];
+
+    it.each(pmcIds)('forwards %s to the service as pmcid:PMC…', async (_label, id) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', id });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'works', id }),
+        ctx,
+      );
+      expect(normalizeId(id)).toBe('pmcid:PMC3084216');
+    });
+
+    it.each(pmcIds)(
+      'carries the conversion hint on both client surfaces for %s',
+      async (_label, id) => {
+        mockSearch.mockRejectedValue(
+          notFound('Entity not found at /works/pmcid:PMC3084216', {
+            reason: 'entity_not_found',
+            path: '/works/pmcid:PMC3084216',
+            recovery: { hint: PMCID_NOT_INDEXED_HINT },
+          }),
+        );
+
+        const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', id });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.NotFound,
+            data: {
+              reason: 'entity_not_found',
+              recovery: { hint: expect.stringContaining('OpenAlex indexes no PMCIDs') },
+            },
+          },
+        });
+        const rendered = (result.content ?? [])
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('\n');
+        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
+        expect(rendered).toContain('PMID');
+        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+      },
+    );
+
+    it('leaves a non-PMCID 404 on the generic contract recovery', async () => {
+      mockSearch.mockRejectedValue(
+        notFound('Entity not found at /works/W99999999999', {
+          reason: 'entity_not_found',
+          path: '/works/W99999999999',
+          recovery: {
+            hint: 'Verify the ID format or call openalex_resolve_name to find the correct ID.',
+          },
+        }),
+      );
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W99999999999',
+      });
+
+      const rendered = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(rendered).toContain('Verify the ID format');
+      expect(rendered).not.toContain('PMCID');
+    });
+
+    it('no longer advertises PMCID as an id that resolves', () => {
+      const description = searchEntitiesTool.input.shape.id.description ?? '';
+      expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
+      expect(description).toMatch(/PMID or DOI/i);
     });
   });
 

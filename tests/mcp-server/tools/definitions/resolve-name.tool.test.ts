@@ -7,6 +7,7 @@ import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
   getEnrichment,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
@@ -381,6 +382,83 @@ describe('resolveNameTool', () => {
 
       await resolveNameTool.handler(input, ctx);
       expect(getEnrichment(ctx).notice).toMatch(/shorter name/i);
+    });
+  });
+
+  /**
+   * A PMCID is still recognized and still forwarded, but OpenAlex indexes none, so it can only
+   * come back empty. The generic identifier-miss notice ("check it for a typo") is the wrong
+   * advice there — nothing about the identifier is wrong — so the PMCID case carries the
+   * conversion guidance instead, on both client surfaces.
+   */
+  describe('PMCID queries (gh #67)', () => {
+    const pmcQueries: [label: string, query: string][] = [
+      ['a bare PMCID', 'PMC3084216'],
+      ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
+      ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/'],
+    ];
+
+    it.each(pmcQueries)(
+      'routes %s to the deterministic lookup as pmcid:PMC…',
+      async (_label, query) => {
+        mockResolveIdentifier.mockResolvedValue({ results: [] });
+        const ctx = createMockContext();
+        const input = resolveNameTool.input.parse({ query });
+
+        await resolveNameTool.handler(input, ctx);
+
+        expect(mockAutocomplete).not.toHaveBeenCalled();
+        expect(mockResolveIdentifier).toHaveBeenCalledWith(
+          expect.objectContaining({
+            entityType: 'works',
+            id: 'pmcid:PMC3084216',
+            scheme: 'pmcid',
+          }),
+          ctx,
+        );
+      },
+    );
+
+    it.each(pmcQueries)(
+      'carries the conversion guidance on both client surfaces for %s',
+      async (_label, query) => {
+        mockResolveIdentifier.mockResolvedValue({ results: [] });
+
+        const result = await runToolContract(resolveNameTool, { query });
+
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          notice: expect.stringContaining('OpenAlex indexes no PMCIDs'),
+        });
+        const rendered = (result.content ?? [])
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('\n');
+        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
+        expect(rendered).toContain('PMID');
+        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+        expect(rendered).not.toMatch(/check it for a typo/i);
+      },
+    );
+
+    it('leaves the generic identifier-miss notice on every other scheme', async () => {
+      mockResolveIdentifier.mockResolvedValue({ results: [] });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: '10.1038/thisdoesnotexist999999' });
+
+      await resolveNameTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toMatch(/check it for a typo/i);
+      expect(notice).not.toMatch(/PMCID/i);
+    });
+
+    it('no longer advertises PMCID as an identifier that resolves', () => {
+      expect(resolveNameTool.description).toMatch(/OpenAlex indexes no PMCIDs/i);
+      expect(resolveNameTool.description).toMatch(/PMID or DOI/i);
+
+      const queryDescription = resolveNameTool.input.shape.query.description ?? '';
+      expect(queryDescription).toMatch(/OpenAlex indexes no PMCIDs/i);
+      expect(queryDescription).toMatch(/PMID or DOI/i);
     });
   });
 

@@ -35,7 +35,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 |:----------|:------------|
 | `openalex_search_entities` | Search, filter, sort, or retrieve by ID across all 8 entity types. |
 | `openalex_analyze_trends` | Group-by aggregation for trend and distribution analysis. |
-| `openalex_resolve_name` | Resolve a name or an identifier (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex ID) to an OpenAlex ID. |
+| `openalex_resolve_name` | Resolve a name or an identifier (DOI, ORCID, ROR, PMID, ISSN, OpenAlex ID) to an OpenAlex ID. |
 | `openalex_get_citation_graph` | Walk the citation graph one hop from a seed work: cites, cited_by, or related_to. |
 | `openalex_describe_fields` | List valid filter, group_by, and select field names for an entity type — call before building a query to avoid invalid-field errors. |
 
@@ -43,7 +43,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 
 Primary discovery and lookup tool. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders).
 
-- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN), bare or in URL form, with the scheme prefix accepted in any case. `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran. The search-only validations (semantic page cap, `sample` with `cursor`, `seed` without `sample`) are skipped too — a lookup is never rejected over parameters it ignores
+- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN), bare or in URL form, with the scheme prefix accepted in any case. A PMCID is recognized as well, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work's PMID or DOI instead. `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran. The search-only validations (semantic page cap, `sample` with `cursor`, `seed` without `sample`) are skipped too — a lookup is never rejected over parameters it ignores
 - Keyword search with boolean operators, quoted phrases, wildcards, and fuzzy matching
 - Exact and AI semantic search modes
 - Rich filter syntax: AND across fields, OR within fields (`us|gb`), NOT (`!us`), ranges (`2020-2024`), comparisons (`>100`)
@@ -71,7 +71,8 @@ Aggregate entities into groups and count them for trend, distribution, and compa
 The front door for turning anything you have into an OpenAlex ID. **Always use this before filtering by entity** — names are ambiguous, IDs are not.
 
 - A name or partial name runs an autocomplete search: up to 10 matches with disambiguation hints, ~200ms
-- An identifier resolves deterministically to the single record it addresses — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form, with the scheme prefix accepted in any case. No `entity_type` needed: the identifier determines its own
+- An identifier resolves deterministically to the single record it addresses — OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN, bare or in URL form, with the scheme prefix accepted in any case. No `entity_type` needed: the identifier determines its own
+- A PMCID is recognized, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — the empty result says so and points at converting it to a PMID or DOI
 - An identifier that matches nothing returns an empty result naming the scheme, not name-search advice
 - Optional entity type filter and field-level filters, applied to name queries
 
@@ -84,7 +85,7 @@ One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`c
 - `cites`: works that cite the seed (incoming citations)
 - `cited_by`: works the seed cites (its reference list)
 - `related_to`: OpenAlex algorithmic "related works" (~8-30 typical, may be empty for less-cited seeds)
-- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`, bare or in URL form; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`
+- Accepts OpenAlex IDs, DOIs, and PMIDs as `seed_id`, bare or in URL form; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`. A PMCID seed is recognized but OpenAlex indexes no PMCIDs, so it resolves nothing — the `NotFound` says so and points at converting it to a PMID or DOI
 - Stacks with `filters`/`sort`/`select` to narrow the graph (e.g., `publication_year=">2020"`, `is_oa="true"`)
 
 ---
@@ -118,7 +119,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core):
 
 OpenAlex-specific:
 
-- Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex URLs)
+- Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex and PubMed/PubMed Central URLs). A PMCID normalizes but resolves nothing — OpenAlex indexes none — so use the work's PMID or DOI
 - Abstract reconstruction from inverted indices — plaintext instead of OpenAlex's position-keyed encoding
 - HTTP status codes mapped to specific MCP error classes (400 → InvalidParams, 422 → ValidationError, 429 → RateLimited, etc.) with upstream messages surfaced
 - Every API-calling tool reports what the call spent against the OpenAlex daily budget and what is left of it, so a paginated sweep can be priced before it runs instead of ending in a 429. An account holding prepaid balance sees that too, since it keeps serving once the day's allowance is gone

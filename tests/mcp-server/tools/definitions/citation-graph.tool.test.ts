@@ -3,10 +3,11 @@
  * @module mcp-server/tools/definitions/citation-graph.tool.test
  */
 
-import { invalidParams, JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { invalidParams, JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
   getEnrichment,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SearchResult } from '@/services/openalex/types.js';
@@ -25,7 +26,9 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
   };
 });
 
-const { normalizeId } = await import('@/services/openalex/openalex-service.js');
+const { normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
+  '@/services/openalex/openalex-service.js'
+);
 
 const { getCitationGraphTool } = await import(
   '@/mcp-server/tools/definitions/citation-graph.tool.js'
@@ -516,6 +519,82 @@ describe('getCitationGraphTool', () => {
       const description = getCitationGraphTool.input.shape.sort.description ?? '';
       expect(description).toMatch(/comma-separate/i);
       expect(description).toContain('-publication_year,cited_by_count');
+    });
+  });
+
+  /**
+   * The seed lookup is a `/works/{id}` singleton call, so a PMCID seed reaches the same 404 the
+   * other two tools do. The service substitutes the conversion recovery for the contract's
+   * generic one, and it has to survive onto both client surfaces here too.
+   */
+  describe('PMCID seeds (gh #67)', () => {
+    const pmcSeeds: [label: string, seedId: string][] = [
+      ['a bare PMCID', 'PMC3084216'],
+      ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
+      ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/'],
+    ];
+
+    it.each(pmcSeeds)('forwards %s to the seed lookup as pmcid:PMC…', async (_label, seedId) => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2041112550'))
+        .mockResolvedValueOnce(sampleResult);
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({ seed_id: seedId, direction: 'cited_by' });
+
+      await getCitationGraphTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ entityType: 'works', id: seedId, select: ['id'] }),
+        ctx,
+      );
+      expect(normalizeId(seedId)).toBe('pmcid:PMC3084216');
+    });
+
+    it.each(pmcSeeds)(
+      'carries the conversion hint on both client surfaces for %s',
+      async (_label, seedId) => {
+        mockSearch.mockRejectedValue(
+          notFound('Entity not found at /works/pmcid:PMC3084216', {
+            reason: 'entity_not_found',
+            path: '/works/pmcid:PMC3084216',
+            recovery: { hint: PMCID_NOT_INDEXED_HINT },
+          }),
+        );
+
+        const result = await runToolContract(getCitationGraphTool, {
+          seed_id: seedId,
+          direction: 'cited_by',
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.NotFound,
+            data: {
+              reason: 'entity_not_found',
+              recovery: { hint: expect.stringContaining('OpenAlex indexes no PMCIDs') },
+            },
+          },
+        });
+        const rendered = (result.content ?? [])
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('\n');
+        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
+        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+      },
+    );
+
+    it('no longer lists PMCID as a working seed_id form', () => {
+      const contractRecovery =
+        getCitationGraphTool.errors?.find((entry) => entry.reason === 'entity_not_found')
+          ?.recovery ?? '';
+      expect(contractRecovery).toMatch(/OpenAlex indexes no PMCIDs/i);
+      expect(contractRecovery).not.toMatch(/DOI, PMID, or PMCID/i);
+
+      const description = getCitationGraphTool.input.shape.seed_id.description ?? '';
+      expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
+      expect(description).toMatch(/PMID or DOI/i);
     });
   });
 

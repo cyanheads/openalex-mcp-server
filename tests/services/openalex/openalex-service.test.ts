@@ -290,6 +290,28 @@ describe('OpenAlexService', () => {
       const url = await searchById('https://pubmed.ncbi.nlm.nih.gov/advanced');
       expect(url.pathname).toBe('/works/https://pubmed.ncbi.nlm.nih.gov/advanced');
     });
+
+    it.each([
+      ['https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216', '/works/pmcid:PMC3084216'],
+      ['https://www.pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['http://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216', '/works/pmcid:PMC3084216'],
+      ['https://ncbi.nlm.nih.gov/pmc/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['http://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+    ])(
+      'resolves the PubMed Central URL %s to the bare PMCID form (gh #67)',
+      async (id, expected) => {
+        const url = await searchById(id);
+        expect(url.pathname).toBe(expected);
+      },
+    );
+
+    it('leaves a non-article PubMed Central URL path to the pass-through branch (gh #67)', async () => {
+      const url = await searchById('https://pmc.ncbi.nlm.nih.gov/about/copyright/');
+      expect(url.pathname).toBe('/works/https://pmc.ncbi.nlm.nih.gov/about/copyright/');
+    });
   });
 
   // --- Identifier shape → entity type inference (gh #50) ---
@@ -316,6 +338,8 @@ describe('OpenAlexService', () => {
       ['uppercase-scheme ORCID', 'ORCID:0000-0002-1825-0097', 'authors', 'orcid'],
       ['uppercase-scheme ROR', 'ROR:013meh722', 'institutions', 'ror'],
       ['PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/21491125', 'works', 'pmid'],
+      ['PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', 'works', 'pmcid'],
+      ['legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/', 'works', 'pmcid'],
     ])('maps a %s to %s', async (_label, query, entityType, scheme) => {
       expect(await infer(query)).toEqual({
         entityType,
@@ -2383,6 +2407,91 @@ describe('OpenAlexService', () => {
         data: { reason: 'entity_not_found' },
       });
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * OpenAlex indexes no PMCIDs at all, so a `pmcid:` lookup 404s however well formed it is.
+     * The generic recovery ("verify the ID format") sends a caller back to retry an identifier
+     * that can never resolve, so the 404 mapping substitutes the conversion guidance for that
+     * one scheme — in the service, where all three ID-accepting tools inherit it.
+     */
+    describe('PMCID 404 recovery (gh #67)', () => {
+      /** Contract with a distinctive generic recovery, so a substitution is unmistakable. */
+      const notFoundContract = [
+        {
+          reason: 'entity_not_found',
+          code: JsonRpcErrorCode.NotFound,
+          when: 'lookup by id matched no OpenAlex entity',
+          recovery: 'GENERIC_NOT_FOUND_HINT verify the ID format or resolve the name first.',
+        },
+      ] as const;
+
+      function mock404(): void {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ error: 'Not found.' }), {
+            status: 404,
+            statusText: 'Not Found',
+          }),
+        );
+      }
+
+      it.each([
+        ['a bare PMCID', 'PMC3084216'],
+        ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
+        ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/'],
+        ['an uppercase-scheme PMCID', 'PMCID:PMC3084216'],
+      ])('substitutes the conversion recovery for %s', async (_label, id) => {
+        mock404();
+        const ctx = createMockContext({ errors: notFoundContract });
+        const service = await getService();
+
+        await expect(service.search({ entityType: 'works', id }, ctx)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          data: {
+            reason: 'entity_not_found',
+            path: '/works/pmcid:PMC3084216',
+            recovery: {
+              hint: expect.stringContaining('OpenAlex indexes no PMCIDs'),
+            },
+          },
+        });
+      });
+
+      it('names the NCBI ID Converter and the PMID/DOI conversion in the hint', async () => {
+        mock404();
+        const ctx = createMockContext({ errors: notFoundContract });
+        const service = await getService();
+
+        const rejection = await service.search({ entityType: 'works', id: 'PMC3084216' }, ctx).then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+
+        const hint = (rejection as { data: { recovery: { hint: string } } }).data.recovery.hint;
+        expect(hint).toContain('PMID');
+        expect(hint).toContain('DOI');
+        expect(hint).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+        expect(hint).not.toContain('GENERIC_NOT_FOUND_HINT');
+      });
+
+      it.each([
+        ['a DOI', '10.1371/journal.pone.0000217', '/works/doi:10.1371/journal.pone.0000217'],
+        ['a native work ID', 'W99999999999', '/works/W99999999999'],
+        ['a PMID', 'PMID:21491125', '/works/pmid:21491125'],
+      ])('keeps the generic recovery for %s', async (_label, id, path) => {
+        mock404();
+        const ctx = createMockContext({ errors: notFoundContract });
+        const service = await getService();
+
+        await expect(service.search({ entityType: 'works', id }, ctx)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          data: {
+            reason: 'entity_not_found',
+            path,
+            recovery: { hint: expect.stringContaining('GENERIC_NOT_FOUND_HINT') },
+          },
+        });
+      });
     });
 
     it('maps other 4xx responses to invalidRequest without retrying', async () => {

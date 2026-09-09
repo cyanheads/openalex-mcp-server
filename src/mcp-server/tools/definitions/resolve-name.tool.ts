@@ -7,12 +7,16 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { getOpenAlexService, inferIdentifier } from '@/services/openalex/openalex-service.js';
+import {
+  getOpenAlexService,
+  inferIdentifier,
+  PMCID_NOT_INDEXED_HINT,
+} from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const resolveNameTool = tool('openalex_resolve_name', {
   description:
-    'Resolve a name or an identifier to an OpenAlex ID. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. A name returns up to 10 autocomplete matches with disambiguation hints. An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form — resolves directly to the one record it addresses, and needs no entity_type.',
+    "Resolve a name or an identifier to an OpenAlex ID. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. A name returns up to 10 autocomplete matches with disambiguation hints. An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN, bare or in URL form — resolves directly to the one record it addresses, and needs no entity_type. A PMCID is recognized as well, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work's PMID or DOI instead.",
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/resolve-name.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -109,7 +113,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .min(1)
       .describe(
-        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search.',
+        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search. A PMCID ("PMC1234567" or a PubMed Central URL) is recognized but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead.',
       ),
     filters: z
       .record(z.string(), z.string())
@@ -240,8 +244,13 @@ export const resolveNameTool = tool('openalex_resolve_name', {
         );
       }
       if (result.results.length === 0) {
+        // A PMCID is the one identifier whose miss says nothing about the identifier: it is
+        // well formed and OpenAlex still holds no record for it, so "check it for a typo"
+        // sends the caller to re-check something that was never wrong.
         notices.push(
-          `No ${entity} in OpenAlex for ${scheme} "${input.query}". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.`,
+          identifier.scheme === 'pmcid'
+            ? `No ${entity} in OpenAlex for PMCID "${input.query}". ${PMCID_NOT_INDEXED_HINT}`
+            : `No ${entity} in OpenAlex for ${scheme} "${input.query}". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.`,
         );
       }
     } else if (result.results.length === 0) {

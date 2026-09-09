@@ -188,7 +188,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567"), ISSN ("1234-5678"). When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()

@@ -157,7 +157,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       code: JsonRpcErrorCode.NotFound,
       when: 'OpenAlex has no work matching the seed_id.',
       recovery:
-        'Verify seed_id with openalex_resolve_name, or pass a known OpenAlex work ID (W…), DOI, PMID, or PMCID.',
+        'Verify seed_id with openalex_resolve_name, or pass a known OpenAlex work ID (W…), DOI, or PMID. OpenAlex indexes no PMCIDs, so convert a PMCID to a PMID or DOI before passing it.',
     },
   ],
   input: z.object({
@@ -165,7 +165,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .min(1)
       .describe(
-        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), or PMCID. Use openalex_resolve_name first if you only have a title.',
+        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), or PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"). A PMCID is recognized too, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. Use openalex_resolve_name first if you only have a title.',
       ),
     direction: z
       .enum(DIRECTIONS)

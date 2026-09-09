@@ -398,4 +398,28 @@ describe('Security — identifier normalization never rewrites the caller value'
       '/works/https://pubmed.ncbi.nlm.nih.gov.evil.test/21491125',
     );
   });
+
+  it('confines the PubMed Central URL branch to the two real hosts (gh #67)', async () => {
+    expect(await pathForId('https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/')).toBe(
+      '/works/pmcid:PMC3084216',
+    );
+    expect(await pathForId('https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/')).toBe(
+      '/works/pmcid:PMC3084216',
+    );
+  });
+
+  /**
+   * Suffix and prefix look-alikes both have to miss: the host is anchored on the left by the
+   * scheme and on the right by the `/articles` (or `/pmc/articles`) path segment, so neither a
+   * domain that merely ends with the real host nor one that merely starts with it is rewritten.
+   */
+  it.each([
+    'https://pmc.ncbi.nlm.nih.gov.example/articles/PMC3084216/',
+    'https://notpmc.ncbi.nlm.nih.gov/articles/PMC1/',
+    'https://pmc.ncbi.nlm.nih.gov.evil.test/articles/PMC3084216/',
+    'https://ncbi.nlm.nih.gov.evil.test/pmc/articles/PMC3084216/',
+    'https://evil.test/pmc.ncbi.nlm.nih.gov/articles/PMC3084216/',
+  ])('does not rewrite the PMC look-alike host %s (gh #67)', async (id) => {
+    expect(await pathForId(id)).toBe(`/works/${id}`);
+  });
 });
