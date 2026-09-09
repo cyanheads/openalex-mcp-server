@@ -43,7 +43,7 @@ Five tools for querying the [OpenAlex](https://openalex.org) academic research c
 
 Primary discovery and lookup tool. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders).
 
-- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran. The search-only validations (semantic page cap, `sample` with `cursor`, `seed` without `sample`) are skipped too — a lookup is never rejected over parameters it ignores
+- Retrieve a single entity by ID (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN), bare or in URL form, with the scheme prefix accepted in any case. `id` takes precedence: search criteria passed alongside it are not applied, and the response says which ones were dropped rather than echoing them back as though they ran. The search-only validations (semantic page cap, `sample` with `cursor`, `seed` without `sample`) are skipped too — a lookup is never rejected over parameters it ignores
 - Keyword search with boolean operators, quoted phrases, wildcards, and fuzzy matching
 - Exact and AI semantic search modes
 - Rich filter syntax: AND across fields, OR within fields (`us|gb`), NOT (`!us`), ranges (`2020-2024`), comparisons (`>100`)
@@ -71,7 +71,7 @@ Aggregate entities into groups and count them for trend, distribution, and compa
 The front door for turning anything you have into an OpenAlex ID. **Always use this before filtering by entity** — names are ambiguous, IDs are not.
 
 - A name or partial name runs an autocomplete search: up to 10 matches with disambiguation hints, ~200ms
-- An identifier resolves deterministically to the single record it addresses — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form. No `entity_type` needed: the identifier determines its own
+- An identifier resolves deterministically to the single record it addresses — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, or ISSN, bare or in URL form, with the scheme prefix accepted in any case. No `entity_type` needed: the identifier determines its own
 - An identifier that matches nothing returns an empty result naming the scheme, not name-search advice
 - Optional entity type filter and field-level filters, applied to name queries
 
@@ -84,7 +84,7 @@ One-hop citation graph traversal from a seed work. Wraps the OpenAlex `cites`/`c
 - `cites`: works that cite the seed (incoming citations)
 - `cited_by`: works the seed cites (its reference list)
 - `related_to`: OpenAlex algorithmic "related works" (~8-30 typical, may be empty for less-cited seeds)
-- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`
+- Accepts OpenAlex IDs, DOIs, PMIDs, PMCIDs as `seed_id`, bare or in URL form; validates the seed via a singleton `/works/{id}` lookup before walking, so non-existent seeds surface as `NotFound`
 - Stacks with `filters`/`sort`/`select` to narrow the graph (e.g., `publication_year=">2020"`, `is_oa="true"`)
 
 ---
@@ -95,7 +95,7 @@ Discover valid field names before constructing a query — avoids invalid-field 
 
 - List valid fields for any entity type and context (`filter`, `group_by`, or `select`)
 - `group_by` returns the subset of the `filter` set OpenAlex can aggregate — raw date fields, `*.search` operators, and `from_*`/`to_*` range modifiers are excluded
-- Pass `query` (a partial or guessed name) to rank results by name similarity — surfaces the right field when you only know roughly what you want
+- Pass `query` (a partial or guessed name) to rank results by name similarity — surfaces the right field when you only know roughly what you want. Ranking reorders the list without shortening it, so a nested value's parent object is still reachable further down
 - Complements the ranked "did you mean" suggestions now appended to invalid-field errors on the search, trends, and citation-graph tools
 
 ## Prompts
@@ -193,6 +193,7 @@ bun install
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
+| `MCP_SESSION_MODE` | HTTP session handling: `auto`, `stateful`, or `stateless`. This server ships `stateless` — set by `Dockerfile` and by `.env.example`. | `auto` (resolves to `stateful`) |
 | `MCP_ALLOWED_ORIGINS` | Comma-separated allow-list of browser `Origin` headers for HTTP transport. Unset = loopback-only; set to `*` to disable. | _loopback only_ |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `debug` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
