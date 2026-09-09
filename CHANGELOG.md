@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.12](changelog/0.7.x/0.7.12.md) — 2026-09-08
+
+PMCID is now recognized as a PubMed Central URL too, and every PMCID miss says OpenAlex indexes none and points at converting to a PMID or DOI instead of the generic verify-the-ID advice.
+
 ## [0.7.11](changelog/0.7.x/0.7.11.md) — 2026-09-08
 
 Uppercase ID schemes and PubMed URLs now resolve instead of 404ing, summary_stats leaves (h_index, i10_index, 2yr_mean_citedness) alias into select, and describe_fields ranking no longer hides a nested field's parent.

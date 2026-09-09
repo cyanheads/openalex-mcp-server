@@ -1,6 +1,6 @@
 {
   "name": "openalex-mcp-server",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "author": {
     "name": "cyanheads"
@@ -11,7 +11,10 @@
   "mcpServers": {
     "openalex-mcp-server": {
       "command": "npx",
-      "args": ["-y", "@cyanheads/openalex-mcp-server"],
+      "args": [
+        "-y",
+        "@cyanheads/openalex-mcp-server"
+      ],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "OPENALEX_API_KEY": ""
