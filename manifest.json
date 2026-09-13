@@ -1,10 +1,12 @@
 {
   "manifest_version": "0.3",
   "name": "openalex-mcp-server",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
   },
   "repository": {
     "type": "git",
@@ -21,7 +23,11 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "OPENALEX_API_KEY": "${user_config.OPENALEX_API_KEY}",
+        "OPENALEX_MAILTO": "${user_config.OPENALEX_MAILTO}",
+        "OPENALEX_BASE_URL": "${user_config.OPENALEX_BASE_URL}",
+        "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
   },
@@ -36,6 +42,7 @@
     "OPENALEX_API_KEY": {
       "type": "string",
       "title": "OpenAlex API Key",
+      "sensitive": true,
       "description": "OpenAlex account API key, sent as api_key= (free from https://openalex.org/settings/api). Optional — omit for anonymous access.",
       "default": "",
       "required": false
@@ -57,7 +64,7 @@
     "MCP_LOG_LEVEL": {
       "type": "string",
       "title": "Log Level",
-      "description": "Minimum log level for output (debug, info, warn, error).",
+      "description": "Minimum log level (debug, info, notice, warning, error, crit, alert, emerg).",
       "default": "info",
       "required": false
     }

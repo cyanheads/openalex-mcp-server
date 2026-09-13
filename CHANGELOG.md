@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.13](changelog/0.7.x/0.7.13.md) — 2026-09-13
+
+Framework adoption and plugin configuration
+
 ## [0.7.12](changelog/0.7.x/0.7.12.md) — 2026-09-08
 
 PMCID is now recognized as a PubMed Central URL too, and every PMCID miss says OpenAlex indexes none and points at converting to a PMID or DOI instead of the generic verify-the-ID advice.

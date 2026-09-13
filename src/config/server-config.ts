@@ -4,6 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   apiKey: z
@@ -26,10 +27,10 @@ export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 let _config: ServerConfig | undefined;
 
 export function getServerConfig(): ServerConfig {
-  _config ??= ServerConfigSchema.parse({
-    apiKey: process.env.OPENALEX_API_KEY,
-    mailto: process.env.OPENALEX_MAILTO,
-    baseUrl: process.env.OPENALEX_BASE_URL,
+  _config ??= parseEnvConfig(ServerConfigSchema, {
+    apiKey: 'OPENALEX_API_KEY',
+    mailto: 'OPENALEX_MAILTO',
+    baseUrl: 'OPENALEX_BASE_URL',
   });
   return _config;
 }

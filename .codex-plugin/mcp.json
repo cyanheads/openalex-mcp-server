@@ -3,8 +3,8 @@
     "command": "npx",
     "args": ["-y", "@cyanheads/openalex-mcp-server"],
     "env": {
-      "MCP_TRANSPORT_TYPE": "stdio",
-      "OPENALEX_API_KEY": ""
-    }
+      "MCP_TRANSPORT_TYPE": "stdio"
+    },
+    "env_vars": ["OPENALEX_API_KEY", "OPENALEX_MAILTO", "OPENALEX_BASE_URL", "MCP_LOG_LEVEL"]
   }
 }

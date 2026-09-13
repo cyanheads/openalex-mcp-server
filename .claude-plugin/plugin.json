@@ -1,23 +1,54 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "openalex-mcp-server",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "description": "Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
   },
   "homepage": "https://github.com/cyanheads/openalex-mcp-server#readme",
   "repository": "https://github.com/cyanheads/openalex-mcp-server",
   "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "openalex", "academic-research", "scholarly-data"],
+  "userConfig": {
+    "OPENALEX_API_KEY": {
+      "type": "string",
+      "title": "OpenAlex API key",
+      "description": "Optional. OpenAlex account key (free from openalex.org/settings/api), sent as api_key= for keyed rate limits. Leave blank for anonymous access.",
+      "sensitive": true,
+      "default": ""
+    },
+    "OPENALEX_MAILTO": {
+      "type": "string",
+      "title": "OpenAlex Mailto",
+      "description": "Optional email sent as mailto= to identify yourself to OpenAlex (the polite pool). Separate from the API key.",
+      "default": ""
+    },
+    "OPENALEX_BASE_URL": {
+      "type": "string",
+      "title": "OpenAlex Base URL",
+      "description": "OpenAlex API base URL.",
+      "default": "https://api.openalex.org"
+    },
+    "MCP_LOG_LEVEL": {
+      "type": "string",
+      "title": "Log Level",
+      "description": "Minimum log level (debug, info, notice, warning, error, crit, alert, emerg).",
+      "default": "info"
+    }
+  },
   "mcpServers": {
     "openalex-mcp-server": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@cyanheads/openalex-mcp-server"
-      ],
+      "args": ["-y", "@cyanheads/openalex-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "OPENALEX_API_KEY": ""
+        "OPENALEX_API_KEY": "${user_config.OPENALEX_API_KEY}",
+        "OPENALEX_MAILTO": "${user_config.OPENALEX_MAILTO}",
+        "OPENALEX_BASE_URL": "${user_config.OPENALEX_BASE_URL}",
+        "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
   }
