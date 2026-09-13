@@ -29,7 +29,7 @@
 
 ## Overview
 
-An MCP server over the [OpenAlex](https://openalex.org) scholarly catalog — 270M+ works, 90M+ authors, 100K+ sources, plus institutions, topics, keywords, publishers, and funders. Search, filter, and aggregate across all eight entity types, resolve ambiguous names to canonical IDs, and walk the citation graph one hop at a time. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90M+ authors, 100K+ sources, plus institutions, topics, keywords, publishers, and funders. Search, filter, and aggregate across all eight entity types, resolve ambiguous names to canonical IDs, and walk the citation graph one hop at a time. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 ### Tools
 
