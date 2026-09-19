@@ -43,6 +43,25 @@ type Direction = (typeof DIRECTIONS)[number];
 
 const RESERVED_FILTER_KEYS: ReadonlySet<string> = new Set<string>(DIRECTIONS);
 
+/** Reject a `filters` key that `direction` owns — merging it would silently overwrite one. */
+function assertNoReservedFilterKey(
+  input: { direction: Direction; filters?: Record<string, string> | undefined },
+  ctx: HandlerContext<'reserved_filter_key'>,
+): void {
+  if (!input.filters) return;
+  const reserved = Object.keys(input.filters).find((key) => RESERVED_FILTER_KEYS.has(key));
+  if (reserved === undefined) return;
+  throw ctx.fail(
+    'reserved_filter_key',
+    `${reserved} cannot be passed in filters — direction reserves cites/cited_by/related_to.`,
+    {
+      ...ctx.recoveryFor('reserved_filter_key'),
+      reservedKey: reserved,
+      direction: input.direction,
+    },
+  );
+}
+
 function buildCitationEcho(input: {
   seed_id: string;
   direction: Direction;
@@ -160,6 +179,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         'Verify seed_id with openalex_resolve_name, or pass a known OpenAlex work ID (W…), DOI, or PMID. OpenAlex indexes no PMCIDs, so convert a PMCID to a PMID or DOI before passing it.',
     },
   ],
+  inputAliases: { filter: 'filters' },
   input: z.object({
     seed_id: z
       .string()
@@ -282,20 +302,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   },
 
   async handler(input, ctx) {
-    if (input.filters) {
-      const reserved = Object.keys(input.filters).find((key) => RESERVED_FILTER_KEYS.has(key));
-      if (reserved !== undefined) {
-        throw ctx.fail(
-          'reserved_filter_key',
-          `${reserved} cannot be passed in filters — direction reserves cites/cited_by/related_to.`,
-          {
-            ...ctx.recoveryFor('reserved_filter_key'),
-            reservedKey: reserved,
-            direction: input.direction,
-          },
-        );
-      }
-    }
+    assertNoReservedFilterKey(input, ctx);
 
     const service = getOpenAlexService();
     const workId = await resolveSeedToWorkId(service, input.seed_id, ctx);

@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool
  */
 
+import type { HandlerContext } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
@@ -60,6 +61,58 @@ function buildSearchEcho(input: SearchEchoInput): string {
   const parts = [`entity_type=${input.entity_type}`];
   if (input.id) return [...parts, `id=${input.id}`].join(' | ');
   return [...parts, ...searchOnlyParams(input).map((part) => part.rendered)].join(' | ');
+}
+
+/**
+ * Reject list-query parameter combinations OpenAlex cannot serve. All three checks constrain a
+ * *list* query. `id` takes the singleton path in `OpenAlexService.search()`, which reads only
+ * `entity_type`, `id`, and `select` — so search_mode, per_page, cursor, sample, and seed are
+ * unread there, and rejecting an ID lookup over how they relate to each other fails it on
+ * constraints it never met. The handler's dropped-parameter notice reports them instead. The
+ * `id` predicate is truthiness, not `!== undefined`, to match the service branch: an
+ * empty-string `id` parses and lists.
+ */
+function assertListQueryConstraints(
+  input: {
+    id?: string | undefined;
+    search_mode: string;
+    per_page: number;
+    cursor?: string | undefined;
+    sample?: number | undefined;
+    seed?: string | undefined;
+  },
+  ctx: HandlerContext<'semantic_per_page_cap' | 'sample_with_cursor' | 'seed_without_sample'>,
+): void {
+  if (input.id) return;
+
+  if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
+    throw ctx.fail(
+      'semantic_per_page_cap',
+      `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
+      {
+        ...ctx.recoveryFor('semantic_per_page_cap'),
+        searchMode: input.search_mode,
+        perPage: input.per_page,
+        cap: SEMANTIC_PER_PAGE_CAP,
+      },
+    );
+  }
+
+  if (input.sample !== undefined && input.cursor !== undefined) {
+    throw ctx.fail(
+      'sample_with_cursor',
+      'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
+      { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
+    );
+  }
+
+  if (input.seed !== undefined && input.sample === undefined) {
+    throw ctx.fail(
+      'seed_without_sample',
+      '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
+      { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
+    );
+  }
 }
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
@@ -182,6 +235,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
     },
   ],
+  inputAliases: { search: 'query', filter: 'filters' },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
     id: z
@@ -329,44 +383,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   },
 
   async handler(input, ctx) {
-    /**
-     * All three checks below constrain a *list* query. `id` takes the singleton path in
-     * `OpenAlexService.search()`, which reads only `entity_type`, `id`, and `select` — so
-     * search_mode, per_page, cursor, sample, and seed are unread there, and rejecting an ID
-     * lookup over how they relate to each other fails it on constraints it never met. The
-     * dropped-parameter notice below reports them instead. The `id` predicate is truthiness,
-     * not `!== undefined`, to match the service branch: an empty-string `id` parses and lists.
-     */
-    if (!input.id) {
-      if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
-        throw ctx.fail(
-          'semantic_per_page_cap',
-          `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-          {
-            ...ctx.recoveryFor('semantic_per_page_cap'),
-            searchMode: input.search_mode,
-            perPage: input.per_page,
-            cap: SEMANTIC_PER_PAGE_CAP,
-          },
-        );
-      }
-
-      if (input.sample !== undefined && input.cursor !== undefined) {
-        throw ctx.fail(
-          'sample_with_cursor',
-          'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
-          { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
-        );
-      }
-
-      if (input.seed !== undefined && input.sample === undefined) {
-        throw ctx.fail(
-          'seed_without_sample',
-          '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
-          { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
-        );
-      }
-    }
+    assertListQueryConstraints(input, ctx);
 
     const service = getOpenAlexService();
     const result = await service.search(

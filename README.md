@@ -254,7 +254,7 @@ cp .env.example .env
 |:---------|:------------|:--------|
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). This server ships `stateless` (see Dockerfile and `.env.example`). | `auto` |
+| `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). The server declares `stateless` in code; an explicit value overrides it. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_ALLOWED_ORIGINS` | Comma-separated allow-list of browser `Origin` headers for HTTP transport. Unset = loopback-only; set to `*` to disable. | _loopback only_ |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `debug` |

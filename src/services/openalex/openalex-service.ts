@@ -971,11 +971,11 @@ class OpenAlexService {
     ctx.log.debug('OpenAlex request', { path, params: Object.keys(params) });
 
     return withRetry(
-      async () => {
+      async ({ signal }) => {
         try {
           const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx, {
             headers: { Accept: 'application/json' },
-            signal: ctx.signal,
+            signal,
           });
           // Only 2xx responses reach here — `fetchWithTimeout` throws on anything else, so a
           // throttled or budget-exhausted call surfaces through the error contract instead.

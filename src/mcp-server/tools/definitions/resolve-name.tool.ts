@@ -102,6 +102,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
     },
   ],
+  inputAliases: { name: 'query', filter: 'filters' },
   input: z.object({
     entity_type: z
       .enum(ENTITY_TYPES)

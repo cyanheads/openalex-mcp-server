@@ -17,6 +17,8 @@ import { initOpenAlexService } from '@/services/openalex/openalex-service.js';
 await createApp({
   name: 'openalex-mcp-server',
   title: 'openalex-mcp-server',
+  // No tool gates on ctx.requestInput, so every call completes in a single round trip.
+  sessionMode: 'stateless',
   tools: [
     resolveNameTool,
     searchEntitiesTool,

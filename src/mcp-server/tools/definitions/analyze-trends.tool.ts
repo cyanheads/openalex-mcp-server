@@ -105,6 +105,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
     },
   ],
+  inputAliases: { filter: 'filters' },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Entity type to aggregate.'),
     group_by: z
