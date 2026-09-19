@@ -4,7 +4,7 @@ description: >
   MCP definition linter rules reference. Use when `bun run lint:mcp` or `bun run devcheck` reports a lint error or warning (`format-parity`, `schema-is-object`, `name-format`, `server-json-*`, etc.) and you need to understand the rule, its severity, and how to fix it. Every rule ID the linter emits has an entry in this doc.
 metadata:
   author: cyanheads
-  version: "1.14"
+  version: "1.16"
   audience: external
   type: reference
 ---
@@ -44,16 +44,16 @@ Grouped by family. Jump to any rule ID via its anchor.
 |:-------|:------|:--------|
 | Definition | `definition-invalid` | [Definition rules](#definition-rules) |
 | Format parity | `format-parity`, `format-parity-threw`, `format-parity-walk-failed`, `format-parity-depth-limit` | [Format parity](#format-parity) |
-| Schema | `schema-is-object`, `describe-on-fields`, `schema-serializable`, `schema-unsatisfiable`, `header-param-designation` | [Schema rules](#schema-rules) |
+| Schema | `schema-is-object`, `describe-on-fields`, `schema-serializable`, `schema-unsatisfiable`, `header-param-designation`, `schema-root-meta-discarded` | [Schema rules](#schema-rules) |
 | Portability | `schema-format-portability`, `schema-anyof-needs-type`, `schema-no-discriminator-keyword`, `schema-no-defs`, `schema-root-oneof-portability`, `schema-dialect-tag` | [Portability rules](#portability-rules) |
 | Names | `name-required`, `name-format`, `name-unique` | [Name rules](#name-rules) |
-| Tools | `description-required`, `handler-required`, `auth-type`, `auth-scope-format`, `annotation-type`, `annotation-coherence`, `meta-ui-type`, `meta-ui-resource-uri-required`, `meta-ui-resource-uri-scheme`, `app-tool-resource-pairing`, `canvas-consumer-missing` | [Tool rules](#tool-rules) |
+| Tools | `description-required`, `handler-required`, `auth-type`, `auth-scope-format`, `annotation-type`, `annotation-coherence`, `input-alias-conflict`, `meta-ui-type`, `meta-ui-resource-uri-required`, `meta-ui-resource-uri-scheme`, `app-tool-resource-pairing`, `canvas-consumer-missing` | [Tool rules](#tool-rules) |
 | Resources | `uri-template-required`, `uri-template-valid`, `resource-name-not-uri`, `template-params-align` | [Resource rules](#resource-rules) |
 | Landing | `landing-*` (23 rules — shape, tagline, logo, links, repo, envExample, connectSnippets, theme) | [Landing config rules](#landing-config-rules) |
 | Prompts | `generate-required` | [Prompt rules](#prompt-rules) |
 | Handler body | `prefer-mcp-error-in-handler`, `prefer-error-factory`, `preserve-cause-on-rethrow`, `no-stringify-upstream-error` | [Handler body rules](#handler-body-rules) |
-| Error contract (structural) | `error-contract-type`, `error-contract-empty`, `error-contract-entry-type`, `error-contract-code-type`, `error-contract-code-unknown`, `error-contract-code-unknown-error`, `error-contract-reason-required`, `error-contract-reason-format`, `error-contract-reason-unique`, `error-contract-when-required`, `error-contract-retryable-type`, `error-contract-recovery-required`, `error-contract-recovery-empty`, `error-contract-recovery-min-words` | [Error contract rules](#error-contract-rules) |
-| Error contract (conformance) | `error-contract-conformance`, `error-contract-prefer-fail` | [Error contract rules](#error-contract-rules) |
+| Error contract (structural) | `error-contract-type`, `error-contract-empty`, `error-contract-entry-type`, `error-contract-code-type`, `error-contract-code-unknown`, `error-contract-code-unknown-error`, `error-contract-reason-required`, `error-contract-reason-format`, `error-contract-reason-unique`, `error-contract-when-required`, `error-contract-retryable-type`, `error-contract-severity-unknown`, `error-contract-recovery-required`, `error-contract-recovery-empty`, `error-contract-recovery-min-words` | [Error contract rules](#error-contract-rules) |
+| Error contract (conformance) | `error-contract-conformance`, `error-contract-prefer-fail`, `error-contract-unthrown` | [Error contract rules](#error-contract-rules) |
 | Enrichment | `enrichment-type`, `enrichment-empty`, `enrichment-field-type`, `enrichment-output-collision`, `enrichment-prefer-block`, `enrichment-trailer-render`, `enrichment-trailer-orphan`, `enrichment-trailer-unknown-field`, `capped-list-no-truncation` | [Enrichment rules](#enrichment-rules) |
 | server.json | ~40 rules prefixed `server-json-*` | [server.json rules](#server-json-rules) |
 
@@ -270,6 +270,29 @@ The message names the offending field in the linter's path vocabulary: `input.ro
 
 Silent when the schema cannot be converted to JSON Schema at all — that is `schema-serializable`'s diagnostic.
 
+### schema-root-meta-discarded
+
+**Severity:** warning
+
+Fires when a `.describe()` or `.meta()` on a tool's **input root** was discarded by strictening, so the advertised `inputSchema` does not carry it.
+
+Zod keys both calls to the schema *instance*, in `z.globalRegistry`. `.strict()` is `catchall(z.never())` — a clone with no link back to the original — so the strictened schema `tool()` stores inherits no entry. Ordering is therefore load-bearing, and nothing in the type signature says so:
+
+```ts
+z.object({ … }).describe('An object root.')          // lost — tool() strictens after
+z.object({ … }).strict().describe('An object root.') // kept — already strict, returned untouched
+```
+
+The loss is otherwise invisible in every direction: `describe-on-fields` never asks a root to describe itself, and `schema-anyof-needs-type` reports on the metadata that *survived*, so a dropped `.meta({ anyOf })` reads as no `anyOf` at all — which matters, because `anyOf` with per-branch `type` is the portable way to publish "one of these argument sets is required".
+
+**Fix:** move `.strict()` ahead of `.describe()` / `.meta()` on the root. The message names what was discarded and where: `input` for an object or union root, `input|<i>` for a union variant (a union is rebuilt from its strictened options, so the union's own entry and each rebuilt variant's both go).
+
+Silent when nothing was strictened — an explicit `.strict()`, `.passthrough()`, or `.catchall(...)` on the root or on every variant — which is exactly the case that advertises the metadata today. Also silent for a definition assembled without the `tool()` builder, since nothing strictened it.
+
+Detection happens inside `tool()`, the only place both the authored and the strictened instance exist; by lint time the definition holds the clone, which carries no registry entry and no way back. The record rides a symbol-keyed, non-enumerable property, so `Object.keys(definition)`, `JSON.stringify(definition)`, `tools/list`, `/.well-known/mcp.json`, and `_meta` are all unchanged.
+
+Whether the discarded description or metadata should instead reach the wire is a separate question — that changes the advertised bytes, so it is held.
+
 ---
 
 ## Portability rules
@@ -431,6 +454,28 @@ Every element in `auth` must be a non-empty string. Empty strings in the array a
 **Severity:** warning
 
 Catches `readOnlyHint: true` with **any** explicit `destructiveHint` value (even `false`) — the destructive hint is meaningless on a read-only tool, so its presence signals authoring confusion. Drop `destructiveHint` entirely when the tool is read-only.
+
+### input-alias-conflict
+
+**Severity:** error
+
+Fires when a tool's `inputAliases` cannot resolve to exactly one declared input key. An alias is a one-to-one mapping fixed ahead of time — the reason it is accepted where nearest-key matching is not — so an alias resolving to none or to more than one is a definition error, not a runtime one. The runtime declines an ambiguous rewrite silently and the caller sees the ordinary strict rejection, which reads as the alias simply not working.
+
+Five conditions, all decidable from the definition:
+
+| Condition | Example |
+|:--|:--|
+| An alias must not equal a declared key | `input: z.object({ q, query })` with `inputAliases: { q: 'query' }` — a declared key is never rewritten, so the alias can never fire |
+| An alias's target must be a declared key | `inputAliases: { q: 'searchQuery' }` when the schema declares `query` |
+| Two declared keys must not case-fold to one name | `z.object({ maxResults, max_results })` — no alias can resolve between them |
+| An alias must not case-fold to a declared key other than its target | `inputAliases: { max_results: 'query' }` alongside a declared `maxResults` |
+| Two aliases must not case-fold to one name with different targets | `inputAliases: { 'search-term': 'query', search_term: 'maxResults' }` |
+
+Case-folding strips `-` and `_` and lowercases — the same fold the runtime rewrite applies, so the rule and the runtime cannot disagree. On a discriminated-union root, every variant's keys count as declared: a rewrite resolves against the selected variant, so an alias naming a key no variant declares can never fire.
+
+**Fix:** point the alias at an existing key, rename the key it shadows, or drop the alias. Also fires when `inputAliases` is not an object of non-empty string targets.
+
+Silent when no `inputAliases` is declared — the case-style half needs no declaration and declines ambiguity on its own.
 
 ### meta-ui-type
 
@@ -770,6 +815,23 @@ Fires when an entry's `when` field is missing or empty. `when` is the human-read
 
 Fires when an entry's optional `retryable` field is present but isn't a boolean. Only `true` or `false` is meaningful — drop the field if you can't commit to either.
 
+### error-contract-severity-unknown
+
+**Severity:** error
+
+Fires when an entry's optional `severity` field is present but isn't one of `debug`, `info`, `notice`, or `warning`. Unlike `retryable`, this field is not inert metadata — it selects the logger method the failure's record is emitted through, so an unrecognized value has no runtime meaning.
+
+`error` is not accepted: it is the default, expressed by omitting the field. Nor are the pino spellings (`warn`) or other cases (`WARNING`) — the values are the framework logger's own level names.
+
+**Fix:** use one of the four levels, or drop the field.
+
+```ts
+// instead of:
+{ reason: 'consent_declined', code: JsonRpcErrorCode.InvalidRequest, when: '…', severity: 'warn', recovery: '…' }
+// use:
+{ reason: 'consent_declined', code: JsonRpcErrorCode.InvalidRequest, when: '…', severity: 'warning', recovery: '…' }
+```
+
 ### error-contract-recovery-required
 
 **Severity:** error
@@ -820,6 +882,31 @@ throw ctx.fail('no_match', 'No items match');
 ```
 
 The diagnostic message includes the declared reason(s) for the code so you can copy-paste.
+
+### error-contract-unthrown
+
+**Severity:** warning
+
+The inverse of `error-contract-conformance`. Fires when a declared `reason` has no literal `ctx.fail('<reason>'` and no literal `ctx.recoveryFor('<reason>'` anywhere in the handler — a contract entry no code path can produce.
+
+A dead entry compiles and lints clean: the typed `ctx.fail` union accepts the reason, so nothing downstream objects. The cost lands on the client, which plans around the advertised failure surface — an agent prepares for a mode the tool cannot produce, while the mode it *does* produce goes undocumented.
+
+**Fix:** wire the missing throw, or drop the entry. Which one is right is the author's call, so the rule surfaces and does not auto-remove.
+
+```ts
+errors: [
+  { reason: 'no_match',       code: JsonRpcErrorCode.NotFound, when: '…', recovery: '…' },
+  { reason: 'site_not_found', code: JsonRpcErrorCode.NotFound, when: '…', recovery: '…' },
+],
+async handler(input, ctx) {
+  if (rows.length === 0) throw ctx.fail('no_match', 'No rows in range');
+}
+// warning  error-contract-unthrown — 'site_not_found' is declared but never thrown.
+```
+
+**Trigger.** Only when the handler holds at least one literal `ctx.fail(`. A handler with none produces its reasons somewhere the scan cannot reach, so firing there would warn on every service-layer definition. A `ctx.fail(` whose first argument is not a string literal — a variable, a template literal, a map lookup — makes the thrown set unknowable, and the whole definition is skipped rather than guessed at.
+
+**Heuristic limitations:** the scan reads `handler.toString()` and matches call sites in the comment- and string-stripped text, so a `ctx.fail('…')` written inside a comment or nested in another literal does not count as thrown. A reason produced outside the handler closure is invisible to any `toString()` scan, which is why the rule can never prove absence and stays a warning. Silent under the trigger above: a service that throws a factory error carrying `data: { reason }`, a `createFail(errors)` resolver built outside the handler, and an aliased `const fail = ctx.fail`.
 
 ---
 
