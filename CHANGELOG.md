@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.14](changelog/0.7.x/0.7.14.md) — 2026-09-19
+
+Input aliases for filter/search/name parameters, mcp-ts-core 0.13.x error-text and validation upgrades, and a code-declared stateless session default.
+
 ## [0.7.13](changelog/0.7.x/0.7.13.md) — 2026-09-13
 
 Framework adoption and plugin configuration
