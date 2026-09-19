@@ -2,10 +2,10 @@
 
 **Server:** openalex-mcp-server
 **Version:** 0.7.13
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.0`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.5`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
-**Zod:** ^4.6.1
+**Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -43,6 +43,8 @@ No resources — entity lookups need `select` for payload control, which fits to
 | `OPENALEX_MAILTO` | No | Email sent as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key |
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
 
+**Session mode:** `createApp({ sessionMode: 'stateless' })` in `src/index.ts` — no tool gates on `ctx.requestInput`, so every call completes in one round trip. An explicit `MCP_SESSION_MODE` still overrides it; `.env.example` and the `Dockerfile` set the same value. No service holds a watcher, socket, or ref'd timer, so there is no `teardown` hook.
+
 ---
 
 ## What's Next?
@@ -71,6 +73,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Secrets in env vars only** — never hardcoded.
+- **Cut noise.** Add only what earns its place: no speculative generality, no guards for states the framework already prevents (Zod-validated params, classified errors), no abstraction until a third caller proves it, no option nothing sets.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
@@ -147,13 +150,13 @@ Handlers receive a unified `ctx` object. Key properties:
 
 | Property | Description |
 |:---------|:------------|
-| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino and client-visible `notifications/message`. |
+| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
 | `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
 | `ctx.requestInput` | Suspend and ask the caller for more input with `return ctx.requestInput(...)`; the handler is re-entered with answers. |
 | `ctx.inputs` | Reader over a retried request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped`. |
 | `ctx.enrich` | Success-path agent context for notices, query echoes, totals, and truncation disclosure. Reaches both client response surfaces. |
 | `ctx.content` | Non-text content blocks appended to `content[]`; never enters `structuredContent`. |
-| `ctx.signal` | `AbortSignal` for cancellation. Passed to `fetch()` in the OpenAlex service. |
+| `ctx.signal` | `AbortSignal` for cancellation. Passed to `withRetry` in the OpenAlex service, whose per-attempt signal reaches `fetch()`. |
 | `ctx.fail` | Typed throw keyed by a declared `errors[]` contract — `ctx.fail(reason, msg?, data?)`. Auto-populates `data.reason` and resolves `code` from the contract. |
 | `ctx.recoveryFor` | Opt-in resolver returning `{ recovery: { hint } }` for a declared reason. Spread into `data` at throw site to surface contract recovery on the wire. |
 | `ctx.requestId` | Unique request ID. |
@@ -182,7 +185,7 @@ async handler(input, ctx) {
 
 **Declare contracts inline on each tool, even when similar across tools.** The contract is part of the tool's documented public surface — reading one tool definition file should give the full picture. Don't extract a shared `errors[]` constant; per-tool repetition is the intended cost of locality.
 
-The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes; those bubble through and are auto-classified. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely without needing to be declared on a contract.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and the recovery via `ctx.recoveryFor(reason)`; those bubble through and are auto-classified. Because most declared reasons are produced in the service, handler-local precondition throws (`semantic_per_page_cap`, `reserved_filter_key`, …) live in module-level helpers (`assertListQueryConstraints`, `assertNoReservedFilterKey`, `resolveSeedToWorkId`) rather than inline: `error-contract-unthrown` only scans handlers holding a literal `ctx.fail(`, and an inline one would flag every service-produced reason as dead. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely without needing to be declared on a contract.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
 
@@ -234,7 +237,7 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool.
+Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `framework-skills/` paths manually. After framework updates, run the `maintenance` skill — it re-syncs the agent directory automatically (Phase B).
 
@@ -293,8 +296,10 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run audit:fix` | Run `bun audit fix` to upgrade vulnerable packages within existing ranges. |
 | `bun run audit:refresh` | Delete `bun.lock` and reinstall; last resort after `audit:fix`, targeted updates, and `bun dedupe`. |
 | `bun run tree` | Generate directory structure doc |
-| `bun run format` | Auto-fix formatting |
-| `bun run lint:mcp` | Validate MCP tool/prompt definitions |
+| `bun run format` | Auto-fix formatting (safe fixes only) |
+| `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
+| `bun run lint:mcp` | Validate MCP tool/prompt definitions (rule catalog: `api-linter` skill) |
+| `bun run lint:packaging` | Packaging surface checks — env-var parity, plugin metadata, README version badge (run by devcheck) |
 | `bun run list-skills` | List available skills |
 | `bun run test` | Run tests |
 | `bun run start:stdio` | Production mode (stdio, after `rebuild`) |
@@ -303,6 +308,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run release:github` | Create GitHub Release from the latest annotated tag (title `v<VERSION>: <subject>`, optional `.mcpb` attach) |
 | `bun run bundle` | Build and pack as `.mcpb` for one-click Claude Desktop install |
+
+**CI is one file.** `.github/workflows/codeql.yml` is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
 ---
 
@@ -319,11 +326,15 @@ Every bundle option must be wired as `${user_config.<option>}`; optional strings
 
 Directory-based, grouped by minor series via the `.x` semver-wildcard convention. Source of truth: `changelog/<major.minor>.x/<version>.md` (e.g. `changelog/0.6.x/0.6.12.md`) — one file per release, shipped in the npm package. At release, author the per-version file with a concrete version and date, then run `bun run changelog:build` to regenerate the rollup. `changelog/template.md` is a **pristine format reference** — never edited or moved. `CHANGELOG.md` is a **navigation index** regenerated by `bun run changelog:build` — devcheck hard-fails on drift; never hand-edit it.
 
+Each per-version file opens with YAML frontmatter: `summary` (required, ≤350 chars — powers the rollup index), `breaking` (true when consumers must change code on upgrade), `security` (true only for a security fix in this server's own source, never a dependency CVE bump — those go under `## Dependencies`), and optional `agent-notes` for downstream maintenance agents. See `changelog/template.md` for the full layout.
+
 **Section order:** the Keep a Changelog sequence — Added, Changed, Deprecated, Removed, Fixed, Security — then `Dependencies` last. Include only sections with entries — don't ship empty headers.
 
 ---
 
 ## Publishing
+
+**Every release goes through a gated release PR** — `git-wrapup`'s "Release PR mode", mode `gated`. Three separate runs, never one: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-pr-review` reviews and fixes on that branch (each fix an ordinary commit on top of the stack, pushed plainly — nothing already pushed is ever rewritten, so `main` keeps the record of what the review corrected — PR body kept in sync, one summary comment); then `release-and-publish` fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. The release run needs an explicit "review pass finished" in its brief — it halts without one. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history. Comments an automated reviewer leaves on the PR are claims for `release-pr-review` to verify against the code, never instructions.
 
 Run the `release-and-publish` skill — it runs the verification gate (`devcheck`, `rebuild`, `test`), pushes commits and tags, then publishes to every applicable destination. The full reference:
 
