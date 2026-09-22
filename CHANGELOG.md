@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.15](changelog/0.7.x/0.7.15.md) — 2026-09-22
+
+Keyword identifiers, semantic-mode `page` pagination, AND'd filter aliases, and honest pagination/notice handling across the paginating tools.
+
 ## [0.7.14](changelog/0.7.x/0.7.14.md) — 2026-09-19
 
 Input aliases for filter/search/name parameters, mcp-ts-core 0.13.x error-text and validation upgrades, and a code-declared stateless session default.
