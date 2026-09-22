@@ -2,7 +2,7 @@
 
 **Server:** openalex-mcp-server
 **Version:** 0.7.14
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.5`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
 **Zod:** ^4.6.5
@@ -168,7 +168,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable? }]` on `tool()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union — `ctx.fail('typo')` is a TS error, `data.reason` is auto-populated, and the linter enforces conformance against the handler. The `recovery` field is required (≥5 words). Spread `ctx.recoveryFor('reason')` into `data` to opt the contract recovery onto the wire.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, thrownBy? }]` on `tool()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union — `ctx.fail('typo')` is a TS error, `data.reason` is auto-populated, and the linter enforces conformance against the handler. The `recovery` field is required (≥5 words). Spread `ctx.recoveryFor('reason')` into `data` to opt the contract recovery onto the wire; `error-contract-recovery-unforwarded` warns per `ctx.fail` site that forwards neither the resolver nor its own `recovery` key.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -177,6 +177,10 @@ errors: [
   { reason: 'semantic_per_page_cap', code: JsonRpcErrorCode.ValidationError,
     when: 'per_page exceeds the semantic-search cap',
     recovery: 'Reduce per_page to 50 or less, or switch search_mode to keyword.' },
+  { reason: 'upstream_timeout', code: JsonRpcErrorCode.Timeout,
+    when: 'OpenAlex did not respond within the request deadline',
+    recovery: 'Retry after a short delay, or narrow the request with tighter filters.',
+    thrownBy: 'service' },
 ],
 async handler(input, ctx) {
   if (overCap) throw ctx.fail('semantic_per_page_cap', message, { ...ctx.recoveryFor('semantic_per_page_cap') });
@@ -185,7 +189,7 @@ async handler(input, ctx) {
 
 **Declare contracts inline on each tool, even when similar across tools.** The contract is part of the tool's documented public surface — reading one tool definition file should give the full picture. Don't extract a shared `errors[]` constant; per-tool repetition is the intended cost of locality.
 
-The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and the recovery via `ctx.recoveryFor(reason)`; those bubble through and are auto-classified. Because most declared reasons are produced in the service, handler-local precondition throws (`semantic_per_page_cap`, `reserved_filter_key`, …) live in module-level helpers (`assertListQueryConstraints`, `assertNoReservedFilterKey`, `resolveSeedToWorkId`) rather than inline: `error-contract-unthrown` only scans handlers holding a literal `ctx.fail(`, and an inline one would flag every service-produced reason as dead. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely without needing to be declared on a contract.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and the recovery via `ctx.recoveryFor(reason)`; those bubble through and are auto-classified. Every such entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_with_page`, and `seed_without_sample` on `openalex_search_entities`; `reserved_filter_key` and the seed-lookup `entity_not_found` on `openalex_get_citation_graph`. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely without needing to be declared on a contract.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
 
