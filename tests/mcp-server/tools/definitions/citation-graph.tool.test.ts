@@ -344,6 +344,62 @@ describe('getCitationGraphTool', () => {
       });
     }
 
+    /**
+     * The guard read the raw key, so `cited_works` passed it, aliased to `cites` in the service,
+     * collided with the direction's own value, and lost — the caller's filter vanished instead
+     * of being rejected the way a literal `cites` key already was. (gh #70)
+     */
+    it.each(['cites', 'cited_by', 'related_to'] as const)(
+      'rejects cited_works, which aliases onto a reserved key, with direction %s (gh #70)',
+      async (direction) => {
+        const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+        const input = getCitationGraphTool.input.parse({
+          seed_id: 'W2741809807',
+          direction,
+          filters: { cited_works: 'W12345' },
+        });
+
+        await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'reserved_filter_key', reservedKey: 'cited_works', direction },
+        });
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('names the upstream key the alias resolves to in the rejection (gh #70)', async () => {
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        filters: { cited_works: 'W12345' },
+      });
+
+      await expect(getCitationGraphTool.handler(input, ctx)).rejects.toMatchObject({
+        message: expect.stringContaining('cites'),
+      });
+    });
+
+    it('leaves an alias that resolves to a non-reserved key alone (gh #70)', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+      const ctx = createMockContext({ errors: getCitationGraphTool.errors });
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        filters: { year: '2020' },
+      });
+
+      await getCitationGraphTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ filters: { year: '2020', cites: 'W2741809807' } }),
+        ctx,
+      );
+    });
+
     it('still allows non-reserved filter keys alongside direction', async () => {
       mockSearch
         .mockResolvedValueOnce(lookupResponse('W2741809807'))
@@ -595,6 +651,119 @@ describe('getCitationGraphTool', () => {
       const description = getCitationGraphTool.input.shape.seed_id.description ?? '';
       expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
       expect(description).toMatch(/PMID or DOI/i);
+    });
+  });
+
+  /**
+   * A zero-edge page on a cursor continuation is a finished traversal, not a seed with no
+   * neighbours — the verify-the-seed advice there points at a walk that already returned
+   * every edge it had. (gh #74)
+   */
+  describe('exhausted pages (gh #74)', () => {
+    const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+
+    /** Terminal cursor page: nonzero edge count, empty results, null cursor. */
+    const terminalCursorPage: SearchResult = {
+      meta: { count: 3, per_page: 2, next_cursor: null },
+      results: [],
+    };
+
+    it('replaces the broadening advice on a cursor continuation, on both surfaces', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(terminalCursorPage);
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('Pagination exhausted');
+      expect(notice).not.toContain('No edges for');
+      const rendered = renderedText(result.content);
+      expect(rendered).toContain('Pagination exhausted');
+      expect(rendered).not.toContain('No edges for');
+    });
+
+    it('leaves echo, totalCount, and meta.count untouched on the exhausted branch', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(terminalCursorPage);
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      const output = await getCitationGraphTool.handler(input, ctx);
+
+      expect(output.meta.count).toBe(3);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalCount).toBe(3);
+      expect(enrichment.echo).toContain('seed_id=W2741809807');
+    });
+
+    it('keeps the broadening advice on a first call with no cursor', async () => {
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockResolvedValueOnce({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = getCitationGraphTool.input.parse({
+        seed_id: 'W2741809807',
+        direction: 'related_to',
+      });
+
+      await getCitationGraphTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('No edges for');
+      expect(notice).not.toContain('Pagination exhausted');
+    });
+
+    it('describes meta.per_page as the requested page size, not the record count', () => {
+      const description = getCitationGraphTool.output.shape.meta.shape.per_page.description ?? '';
+      expect(description).toMatch(/request/i);
+      expect(description).not.toBe('Records on this page.');
+    });
+  });
+
+  /**
+   * A supplied-but-blank `cursor` used to reach upstream as `cursor=`, which OpenAlex answers
+   * with the first page — restarting the walk — while the tool read the parameter's presence as
+   * a continuation and reported a seed with no edges as an exhausted traversal. (gh #80)
+   */
+  describe('blank cursor (gh #80)', () => {
+    it('rejects a blank cursor on the error envelope before the seed lookup', async () => {
+      // The resolved values are what make `not.toHaveBeenCalled()` load-bearing: without them a
+      // forwarded call would still fail, just for a different reason.
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        per_page: 2,
+        cursor: '',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('documents that a blank cursor is rejected rather than read as the first page', () => {
+      expect(getCitationGraphTool.input.shape.cursor.description ?? '').toMatch(/empty string/i);
     });
   });
 

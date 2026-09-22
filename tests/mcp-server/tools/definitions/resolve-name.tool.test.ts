@@ -293,6 +293,51 @@ describe('resolveNameTool', () => {
       },
     );
 
+    /**
+     * Keywords are the one entity type OpenAlex addresses by slug, so the URL form is the
+     * only spelling that names its own type. The bare slug stays a name query — nothing
+     * distinguishes it from any other word — and autocomplete resolves it. (gh #68)
+     */
+    it('routes a keyword URL to the deterministic lookup (gh #68)', async () => {
+      mockResolveIdentifier.mockResolvedValue({
+        results: [
+          {
+            id: 'https://openalex.org/keywords/groundwater',
+            external_id: null,
+            display_name: 'Groundwater',
+            entity_type: 'keyword',
+            cited_by_count: 2504216,
+            works_count: 141298,
+            hint: null,
+          },
+        ],
+      });
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({
+        query: 'https://openalex.org/keywords/groundwater',
+      });
+
+      const result = await resolveNameTool.handler(input, ctx);
+
+      expect(mockAutocomplete).not.toHaveBeenCalled();
+      expect(mockResolveIdentifier).toHaveBeenCalledWith(
+        { entityType: 'keywords', id: 'groundwater', scheme: 'openalex' },
+        ctx,
+      );
+      expect(result.results[0]?.id).toBe('https://openalex.org/keywords/groundwater');
+    });
+
+    it('sends a bare keyword slug to autocomplete (gh #68)', async () => {
+      mockAutocomplete.mockResolvedValue(sampleResults);
+      const ctx = createMockContext();
+      const input = resolveNameTool.input.parse({ query: 'groundwater' });
+
+      await resolveNameTool.handler(input, ctx);
+
+      expect(mockResolveIdentifier).not.toHaveBeenCalled();
+      expect(mockAutocomplete).toHaveBeenCalled();
+    });
+
     it('sends real names to autocomplete', async () => {
       mockAutocomplete.mockResolvedValue(sampleResults);
       const ctx = createMockContext();

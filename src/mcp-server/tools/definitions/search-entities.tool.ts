@@ -3,7 +3,6 @@
  * @module mcp-server/tools/definitions/search-entities.tool
  */
 
-import type { HandlerContext } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
@@ -31,9 +30,9 @@ type SearchEchoInput = {
  * alone, so every parameter named here is dropped on that path — by OpenAlex itself, which
  * answers an entity-by-ID URL identically whether or not search params ride along.
  *
- * Pagination (`per_page`, `cursor`) is deliberately absent: a singleton lookup is one record by
- * definition, and `per_page` always carries its schema default, so a caller's intent there
- * cannot be told apart from the absence of one. Naming it would be noise, not a warning.
+ * Pagination (`per_page`, `cursor`, `page`) is deliberately absent: a singleton lookup is one
+ * record by definition, and `per_page` always carries its schema default, so a caller's intent
+ * there cannot be told apart from the absence of one. Naming it would be noise, not a warning.
  */
 function searchOnlyParams(input: SearchEchoInput): { name: string; rendered: string }[] {
   const parts: { name: string; rendered: string }[] = [];
@@ -64,55 +63,19 @@ function buildSearchEcho(input: SearchEchoInput): string {
 }
 
 /**
- * Reject list-query parameter combinations OpenAlex cannot serve. All three checks constrain a
- * *list* query. `id` takes the singleton path in `OpenAlexService.search()`, which reads only
- * `entity_type`, `id`, and `select` — so search_mode, per_page, cursor, sample, and seed are
- * unread there, and rejecting an ID lookup over how they relate to each other fails it on
- * constraints it never met. The handler's dropped-parameter notice reports them instead. The
- * `id` predicate is truthiness, not `!== undefined`, to match the service branch: an
- * empty-string `id` parses and lists.
+ * Is this call continuing a paginated traversal rather than opening one? A `cursor` is the
+ * keyword/exact signal — the schema rejects a blank one, so its presence is always a real
+ * continuation rather than a mistake OpenAlex answers with page 1; a `page` past the first is
+ * the semantic signal, and `page` only survives the handler's preconditions under semantic
+ * mode. Only on a continuing call does a page of
+ * zero results mean the traversal is finished — on a first call it means nothing matched, and
+ * the two want opposite advice.
  */
-function assertListQueryConstraints(
-  input: {
-    id?: string | undefined;
-    search_mode: string;
-    per_page: number;
-    cursor?: string | undefined;
-    sample?: number | undefined;
-    seed?: string | undefined;
-  },
-  ctx: HandlerContext<'semantic_per_page_cap' | 'sample_with_cursor' | 'seed_without_sample'>,
-): void {
-  if (input.id) return;
-
-  if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
-    throw ctx.fail(
-      'semantic_per_page_cap',
-      `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-      {
-        ...ctx.recoveryFor('semantic_per_page_cap'),
-        searchMode: input.search_mode,
-        perPage: input.per_page,
-        cap: SEMANTIC_PER_PAGE_CAP,
-      },
-    );
-  }
-
-  if (input.sample !== undefined && input.cursor !== undefined) {
-    throw ctx.fail(
-      'sample_with_cursor',
-      'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
-      { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
-    );
-  }
-
-  if (input.seed !== undefined && input.sample === undefined) {
-    throw ctx.fail(
-      'seed_without_sample',
-      '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
-      { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
-    );
-  }
+function isContinuationPage(input: {
+  cursor?: string | undefined;
+  page?: number | undefined;
+}): boolean {
+  return input.cursor !== undefined || (input.page ?? 1) > 1;
 }
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
@@ -129,10 +92,37 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       recovery: `Reduce per_page to ${SEMANTIC_PER_PAGE_CAP} or less, or switch search_mode to keyword.`,
     },
     {
+      reason: 'semantic_without_query',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search set search_mode to "semantic" without supplying the `query` it embeds.',
+      recovery:
+        'Pass the text to match in `query`, or switch search_mode to keyword for a filter-only listing.',
+    },
+    {
+      reason: 'semantic_with_cursor',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search set search_mode to "semantic" and supplied `cursor`, which OpenAlex rejects on a semantic query.',
+      recovery:
+        'Drop `cursor` and walk semantic results with `page` (1-based), or switch search_mode to keyword or exact, which paginate by cursor.',
+    },
+    {
+      reason: 'page_without_semantic',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search supplied `page` under a search_mode other than "semantic".',
+      recovery:
+        'Drop `page` and paginate with `cursor`, or set search_mode to "semantic" — the only mode `page` applies to.',
+    },
+    {
       reason: 'sample_with_cursor',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A search (no `id`) provided both `sample` and `cursor`.',
       recovery: 'Sampling returns a single page only; remove `cursor` or remove `sample`.',
+    },
+    {
+      reason: 'sample_with_page',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search (no `id`) provided both `sample` and `page`.',
+      recovery: 'Sampling returns a single page only; remove `page` or remove `sample`.',
     },
     {
       reason: 'seed_without_sample',
@@ -145,6 +135,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.NotFound,
       when: 'Lookup by id matched no OpenAlex entity.',
       recovery: 'Verify the ID format or call openalex_resolve_name to find the correct ID.',
+      thrownBy: 'service',
     },
     {
       reason: 'rate_limited',
@@ -153,6 +144,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_budget_exhausted',
@@ -161,6 +153,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       retryable: false,
       recovery:
         'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_timeout',
@@ -169,6 +162,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       retryable: true,
       recovery:
         'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
@@ -177,6 +171,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unauthorized',
@@ -184,6 +179,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'OpenAlex rejected the API key (HTTP 401).',
       recovery:
         'Check that OPENALEX_API_KEY is set to a valid OpenAlex account API key (free from https://openalex.org/settings/api).',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_forbidden',
@@ -191,6 +187,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'OpenAlex denied access to the requested resource (HTTP 403).',
       recovery:
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+      thrownBy: 'service',
     },
     {
       reason: 'comma_in_filter_value',
@@ -198,6 +195,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params',
@@ -205,6 +203,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'OpenAlex rejected an invalid filter, select, or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, context) to browse all valid fields for the given entity type and context.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_id_value',
@@ -212,6 +211,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
       recovery:
         'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id, primary_topic.id, and cites accept IDs only.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_sort_requires_search',
@@ -219,6 +219,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'sort=-relevance_score was used without an active search (HTTP 400).',
       recovery:
         'Sorting by relevance_score requires an active search — add a `query` or a `*.search` filter (e.g. title.search), or choose a concrete sort field such as -cited_by_count or -publication_date.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'query_too_long',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex rejected `query` as longer than the search length it accepts (HTTP 400).',
+      recovery:
+        'Shorten `query` to the character limit the upstream message names, or split the text into several shorter searches and merge their results.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params_other',
@@ -226,6 +235,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
         'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_validation_failed',
@@ -233,6 +243,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
       recovery:
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
+      thrownBy: 'service',
     },
   ],
   inputAliases: { search: 'query', filter: 'filters' },
@@ -240,27 +251,29 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
     id: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        'Text search query. Supports boolean operators (AND, OR, NOT), quoted phrases ("exact match"), wildcards (machin*), fuzzy matching (machin~1), and proximity ("climate change"~5). Omit for filter-only queries.',
+        'Text search query. Supports boolean operators (AND, OR, NOT), quoted phrases ("exact match"), wildcards (machin*), fuzzy matching (machin~1), and proximity ("climate change"~5). Omit for filter-only queries — an empty string is rejected, since a blank search is a mistake rather than a request for the whole catalog.',
       ),
     search_mode: z
       .enum(['keyword', 'exact', 'semantic'])
       .default('keyword')
       .describe(
-        'Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity (max 50 results, 1 req/sec).',
+        `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity, ranking at most ${SEMANTIC_PER_PAGE_CAP} candidates at ~1 req/sec and paginated with \`page\` rather than \`cursor\`.`,
       ),
     filters: z
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
+        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
       ),
     sort: z
       .string()
@@ -285,8 +298,19 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       ),
     cursor: z
       .string()
+      .min(1)
       .optional()
-      .describe('Pagination cursor from a previous response. Pass to get the next page.'),
+      .describe(
+        'Pagination cursor from a previous response. Pass to get the next page. Omit it on the first call — an empty string is rejected, since a supplied-but-blank cursor is a caller mistake rather than a request for page 1. Keyword and exact modes only — semantic search walks its candidates with `page`, and a `cursor` sent with it is rejected.',
+      ),
+    page: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        `Page number (1-based) for semantic search, the one mode that paginates with \`page\` instead of \`cursor\`. Semantic search ranks at most ${SEMANTIC_PER_PAGE_CAP} candidates, so the last reachable page is ceil(${SEMANTIC_PER_PAGE_CAP} / per_page) — e.g. page 17 with per_page=3. Passing it under any other search_mode is rejected.`,
+      ),
     sample: z
       .number()
       .int()
@@ -294,7 +318,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .max(SAMPLE_MAX)
       .optional()
       .describe(
-        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — pagination via \`cursor\` is not supported with sampling. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
+        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — neither \`cursor\` nor \`page\` pagination applies to sampling, and a search that passes either alongside it is rejected. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
       ),
     seed: z
       .string()
@@ -306,8 +330,16 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   output: z.object({
     meta: z
       .object({
-        count: z.number().describe('Total results matching the query/filters.'),
-        per_page: z.number().describe('Results on this page.'),
+        count: z
+          .number()
+          .describe(
+            `Total results matching the query/filters. Under search_mode "semantic" it is instead the capped candidate count — at most ${SEMANTIC_PER_PAGE_CAP} — not an exhaustive match total.`,
+          ),
+        per_page: z
+          .number()
+          .describe(
+            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this.',
+          ),
         next_cursor: z
           .string()
           .nullable()
@@ -350,7 +382,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when results are empty (echoes the criteria and suggests how to broaden) or when an `id` lookup was passed search criteria it does not apply (names them). Absent otherwise.',
+        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), and on every semantic search to disclose that `meta.count` is a capped candidate total. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -383,7 +415,94 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   },
 
   async handler(input, ctx) {
-    assertListQueryConstraints(input, ctx);
+    /**
+     * Reject list-query parameter combinations OpenAlex cannot serve. Every check here
+     * constrains a *list* query. `id` takes the singleton path in `OpenAlexService.search()`,
+     * which reads only `entity_type`, `id`, and `select` — so search_mode, per_page, cursor,
+     * page, sample, and seed are unread there, and rejecting an ID lookup over how they relate
+     * to each other fails it on constraints it never met. The dropped-parameter notice below
+     * reports them instead. The `id` predicate mirrors the service's own truthiness branch.
+     */
+    if (!input.id) {
+      // Semantic search matches an embedding of the query text, so with no query there is
+      // nothing to embed — the request silently degraded to a plain unfiltered listing whose
+      // echo still advertised `search_mode=semantic`.
+      if (input.search_mode === 'semantic' && !input.query) {
+        throw ctx.fail(
+          'semantic_without_query',
+          'Semantic search needs `query` text to embed — none was supplied.',
+          { ...ctx.recoveryFor('semantic_without_query'), searchMode: input.search_mode },
+        );
+      }
+
+      if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
+        throw ctx.fail(
+          'semantic_per_page_cap',
+          `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
+          {
+            ...ctx.recoveryFor('semantic_per_page_cap'),
+            searchMode: input.search_mode,
+            perPage: input.per_page,
+            cap: SEMANTIC_PER_PAGE_CAP,
+          },
+        );
+      }
+
+      // OpenAlex answers `search.semantic` plus a cursor with a 400 ("Cursor pagination is not
+      // supported with semantic search"), so forwarding it spends a round trip to learn that.
+      if (input.search_mode === 'semantic' && input.cursor !== undefined) {
+        throw ctx.fail(
+          'semantic_with_cursor',
+          'Semantic search does not accept `cursor` — walk its candidates with `page` (1-based) instead.',
+          {
+            ...ctx.recoveryFor('semantic_with_cursor'),
+            searchMode: input.search_mode,
+            cursor: input.cursor,
+          },
+        );
+      }
+
+      // The inverse: `page` is the semantic-only knob, and OpenAlex ignores it on a cursor
+      // traversal — silently returning page 1 again rather than the page that was asked for.
+      if (input.page !== undefined && input.search_mode !== 'semantic') {
+        throw ctx.fail(
+          'page_without_semantic',
+          `\`page\` applies to semantic search only — search_mode is "${input.search_mode}", which paginates with \`cursor\`.`,
+          {
+            ...ctx.recoveryFor('page_without_semantic'),
+            searchMode: input.search_mode,
+            page: input.page,
+          },
+        );
+      }
+
+      if (input.sample !== undefined && input.cursor !== undefined) {
+        throw ctx.fail(
+          'sample_with_cursor',
+          'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
+          { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
+        );
+      }
+
+      // Sampling pins `per_page` to `sample` and returns that one page, so there is no second
+      // page for `page` to address — the same exclusion `cursor` has above. Reachable under
+      // semantic mode alone; every other mode rejects `page` at the check before this one.
+      if (input.sample !== undefined && input.page !== undefined) {
+        throw ctx.fail(
+          'sample_with_page',
+          'Sampling returns one page only — `sample` cannot be combined with `page` pagination.',
+          { ...ctx.recoveryFor('sample_with_page'), sample: input.sample, page: input.page },
+        );
+      }
+
+      if (input.seed !== undefined && input.sample === undefined) {
+        throw ctx.fail(
+          'seed_without_sample',
+          '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
+          { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
+        );
+      }
+    }
 
     const service = getOpenAlexService();
     const result = await service.search(
@@ -397,6 +516,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         select: input.select,
         perPage: input.per_page,
         cursor: input.cursor,
+        page: input.page,
         sample: input.sample,
         seed: input.seed,
       },
@@ -414,20 +534,35 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     const echo = buildSearchEcho(input);
     ctx.enrich({ echo, totalCount: result.meta.count });
 
+    const notices: string[] = [];
+
     // An `id` lookup always returns its one record or throws, so it never reaches the
     // empty-results notice — the two branches are exclusive, and the dropped-parameter
     // warning is the more useful of the two on that path.
     const ignored = input.id ? searchOnlyParams(input).map((part) => part.name) : [];
     if (ignored.length > 0) {
       const [verb, pronoun] = ignored.length === 1 ? ['was', 'it'] : ['were', 'them'];
-      ctx.enrich.notice(
+      notices.push(
         `\`id\` takes precedence — ${ignored.join(', ')} ${verb} not applied, and the record below is the entity at that ID regardless of ${pronoun}. Drop \`id\` to run ${pronoun} as a search.`,
       );
     } else if (result.results.length === 0) {
-      ctx.enrich.notice(
-        `No matches for ${echo}. Try broadening the query, removing filters, or switching search_mode.`,
+      notices.push(
+        isContinuationPage(input)
+          ? `Pagination exhausted for ${echo} — the previous page was the last, so this one came back empty. Stop paging rather than broadening the search.`
+          : `No matches for ${echo}. Try broadening the query, removing filters, or switching search_mode.`,
       );
     }
+
+    // `meta.count` reports the ranked candidate set under semantic search, not the population
+    // matching the query — a caller reading it as a match total plans a traversal that ends
+    // at the cap.
+    if (!input.id && input.search_mode === 'semantic') {
+      notices.push(
+        `Semantic search ranks a capped candidate set, so \`meta.count\` (${result.meta.count}) is that ceiling — at most ${SEMANTIC_PER_PAGE_CAP} — not the total number of matching records. Reach the rest of the candidates with \`page\`.`,
+      );
+    }
+
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       meta: {

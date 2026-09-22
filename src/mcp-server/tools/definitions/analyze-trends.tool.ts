@@ -23,6 +23,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_budget_exhausted',
@@ -31,6 +32,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       retryable: false,
       recovery:
         'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_timeout',
@@ -39,6 +41,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       retryable: true,
       recovery:
         'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
@@ -47,6 +50,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unauthorized',
@@ -54,6 +58,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'OpenAlex rejected the API key (HTTP 401).',
       recovery:
         'Check that OPENALEX_API_KEY is set to a valid OpenAlex account API key (free from https://openalex.org/settings/api).',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_forbidden',
@@ -61,6 +66,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'OpenAlex denied access to the requested resource (HTTP 403).',
       recovery:
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+      thrownBy: 'service',
     },
     {
       reason: 'comma_in_filter_value',
@@ -68,6 +74,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params',
@@ -75,6 +82,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'OpenAlex rejected an invalid group_by or filter field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected key and suggests close matches. Use openalex_describe_fields(entity_type, "group_by") to browse valid group_by fields, or openalex_describe_fields(entity_type, "filter") for filter fields.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_id_value',
@@ -82,6 +90,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
       recovery:
         'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id and primary_topic.id accept IDs only.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_ungroupable_group_by',
@@ -89,6 +98,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'group_by targets a raw date, float, or *.search field OpenAlex cannot aggregate (HTTP 400).',
       recovery:
         'Group by a categorical or year field (e.g. publication_year, type, oa_status, or an integer count field) — raw date fields and *.search operators cannot be grouped. Call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params_other',
@@ -96,6 +106,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
         'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and the group_by field.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_validation_failed',
@@ -103,6 +114,16 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
       recovery:
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_missing_group_by',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OpenAlex answered with its plain list shape, carrying no aggregation for the requested group_by.',
+      retryable: true,
+      recovery:
+        'Retry the request; if it repeats, confirm group_by names a field OpenAlex can aggregate with openalex_describe_fields(entity_type, "group_by").',
+      thrownBy: 'service',
     },
   ],
   inputAliases: { filter: 'filters' },
@@ -110,6 +131,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     entity_type: z.enum(ENTITY_TYPES).describe('Entity type to aggregate.'),
     group_by: z
       .string()
+      .min(1)
       .describe(
         'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — check entity docs if unsure.',
       ),
@@ -142,9 +164,10 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       ),
     cursor: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        'Pagination cursor from a previous response. Only relevant when order is "key" — count-descending results have no next page. Pass the next_cursor from the previous response to advance.',
+        'Pagination cursor from a previous response. Only relevant when order is "key" — count-descending results have no next page. Pass the next_cursor from the previous response to advance. Omit it on the first call — an empty string is rejected, since a supplied-but-blank cursor is a caller mistake rather than a request for the first page.',
       ),
   }),
   output: z.object({
@@ -187,7 +210,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when no groups are returned (recovery suggestions) or when the page is full and more groups likely exist (truncation signal with narrowing advice). Absent otherwise.',
+        'Guidance notice. Set when a first call returns no groups (recovery suggestions), when a `cursor` continuation returns none because the traversal is already finished, or when the page is full and more groups likely exist (truncation signal with narrowing advice). Absent otherwise.',
       ),
     budget: z
       .object({
@@ -244,9 +267,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     const echo = buildAnalyzeEcho(input);
     ctx.enrich({ echo, totalCount: result.meta.count });
 
+    // An empty page on a `cursor` continuation means the key-ascending traversal already
+    // enumerated every group, so there is nothing left to remove or regroup. On a first call
+    // the same shape can still be an honest zero — including the all-values-unknown case,
+    // where `count` is nonzero but every matched entity is null for the grouped field.
     if (result.groups.length === 0) {
       ctx.enrich.notice(
-        `No groups returned for ${echo}. Try removing filters or grouping by a different field.`,
+        input.cursor === undefined
+          ? `No groups returned for ${echo}. Try removing filters or grouping by a different field.`
+          : `Pagination exhausted for ${echo} — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping.`,
       );
     } else if (input.order === 'key') {
       // Key-ascending traversal: omitted groups sit beyond the cursor, not in a count tail, so

@@ -28,6 +28,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_budget_exhausted',
@@ -36,6 +37,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       retryable: false,
       recovery:
         'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_timeout',
@@ -44,6 +46,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       retryable: true,
       recovery:
         'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
@@ -52,6 +55,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unauthorized',
@@ -59,12 +63,14 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'OpenAlex rejected the API key (HTTP 401).',
       recovery:
         'Check that OPENALEX_API_KEY is set to a valid OpenAlex account API key (free from https://openalex.org/settings/api).',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_forbidden',
       code: JsonRpcErrorCode.Forbidden,
       when: 'OpenAlex denied access to autocomplete (HTTP 403).',
       recovery: 'Confirm the API key has access to autocomplete, then retry the request.',
+      thrownBy: 'service',
     },
     {
       reason: 'comma_in_filter_value',
@@ -72,6 +78,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'A `filters` value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a free-text phrase containing commas into the `query` parameter.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params',
@@ -79,6 +86,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'OpenAlex rejected an invalid filter field name on the autocomplete query (HTTP 400).',
       recovery:
         'The upstream message names the rejected field and suggests close matches. Use openalex_describe_fields(entity_type, "filter") to browse valid filter fields, or drop `filters` entirely.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_id_value',
@@ -86,6 +94,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'A `filters` entry expecting an entity ID received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
       recovery:
         'Resolve that name to an OpenAlex ID first — run this tool without the ID-valued filter, take the `id` from a match, then re-run with the ID.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params_other',
@@ -93,6 +102,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'OpenAlex rejected the autocomplete request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
         'Read the upstream message in the error above and adjust the request — trim the query, check filter value formats, and ensure entity_type is a supported value.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_validation_failed',
@@ -100,6 +110,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'OpenAlex rejected the autocomplete request as semantically invalid (HTTP 422).',
       recovery:
         'Read the upstream message for the specific field, then adjust the request to satisfy validation.',
+      thrownBy: 'service',
     },
   ],
   inputAliases: { name: 'query', filter: 'filters' },
@@ -114,7 +125,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .min(1)
       .describe(
-        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search. A PMCID ("PMC1234567" or a PubMed Central URL) is recognized but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead.',
+        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678") — which resolves straight to that one record instead of running a name search. A keyword URL ("https://openalex.org/keywords/groundwater") resolves the same way; a bare keyword slug reads as a name and runs a name search, which finds it too. A PMCID ("PMC1234567" or a PubMed Central URL) is recognized but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead.',
       ),
     filters: z
       .record(z.string(), z.string())

@@ -7,6 +7,7 @@ import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
   getEnrichment,
+  runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
@@ -208,6 +209,23 @@ describe('analyzeTrendsTool', () => {
     await analyzeTrendsTool.handler(input, ctx);
 
     expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ order: undefined }), ctx);
+  });
+
+  /**
+   * A blank `group_by` was dropped by a truthiness check, so OpenAlex answered with its plain
+   * list shape and the tool reported a successful aggregation of zero groups over the whole
+   * catalog. Rejecting it at the schema keeps the mistake from reaching upstream. (gh #69)
+   */
+  it('rejects a blank group_by before any upstream call (gh #69)', () => {
+    expect(() =>
+      analyzeTrendsTool.input.parse({ entity_type: 'works', group_by: '', per_page: 1 }),
+    ).toThrow();
+  });
+
+  it('declares upstream_missing_group_by so its recovery reaches the caller (gh #69)', () => {
+    const entry = analyzeTrendsTool.errors?.find((e) => e.reason === 'upstream_missing_group_by');
+    expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(entry?.thrownBy).toBe('service');
   });
 
   it('defaults include_unknown to false', () => {
@@ -451,6 +469,120 @@ describe('analyzeTrendsTool', () => {
           recovery: { hint: expect.stringMatching(/upstream message/i) },
         },
       });
+    });
+  });
+
+  /**
+   * A zero-group page on a cursor continuation is a finished key-ascending traversal, not a
+   * filter set that grouped nothing — the remove-filters advice there names filters that are
+   * already doing their job. (gh #74)
+   */
+  describe('exhausted pages (gh #74)', () => {
+    const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+
+    /** Terminal key-ascending page: population count unchanged from page 1, no groups. */
+    const terminalCursorPage: AnalyzeResult = {
+      meta: { count: 4782, groups_count: 0, next_cursor: null },
+      groups: [],
+    };
+
+    it('replaces the broadening advice on a cursor continuation, on both surfaces', async () => {
+      mockAnalyze.mockResolvedValue(terminalCursorPage);
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'publication_year',
+        filters: { publication_year: '2024-2025', 'primary_topic.id': 'T10398' },
+        order: 'key',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('Pagination exhausted');
+      expect(notice).not.toContain('No groups returned for');
+      const rendered = renderedText(result.content);
+      expect(rendered).toContain('Pagination exhausted');
+      expect(rendered).not.toContain('No groups returned for');
+    });
+
+    it('leaves echo, totalCount, and groups_count untouched on the exhausted branch', async () => {
+      mockAnalyze.mockResolvedValue(terminalCursorPage);
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'publication_year',
+        order: 'key',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      const output = await analyzeTrendsTool.handler(input, ctx);
+
+      expect(output.meta.count).toBe(4782);
+      expect(output.meta.groups_count).toBe(0);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalCount).toBe(4782);
+      expect(enrichment.echo).toContain('group_by=publication_year');
+    });
+
+    it('keeps the broadening advice for an all-values-unknown first page', async () => {
+      // count > 0 with zero groups on page 1: every matched entity is null for the grouped
+      // field and include_unknown is false. Not exhaustion — the advice still fits.
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 4782, groups_count: 0, next_cursor: null },
+        groups: [],
+      });
+      const ctx = createMockContext();
+      const input = analyzeTrendsTool.input.parse({
+        entity_type: 'works',
+        group_by: 'grants.funder',
+      });
+
+      await analyzeTrendsTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('No groups returned for');
+      expect(notice).not.toContain('Pagination exhausted');
+    });
+
+    it('leaves the groups_count description unchanged', () => {
+      expect(analyzeTrendsTool.output.shape.meta.shape.groups_count.description).toBe(
+        'Number of groups on this page (max 200).',
+      );
+    });
+  });
+
+  /**
+   * A supplied-but-blank `cursor` was dropped by a truthiness check, so the request restarted
+   * the key-ascending traversal at the first page while the tool read the parameter's presence
+   * as a continuation and reported a genuine zero-group first call as exhausted. (gh #80)
+   */
+  describe('blank cursor (gh #80)', () => {
+    it('rejects a blank cursor on the error envelope before the round trip', async () => {
+      // The resolved value is what makes `not.toHaveBeenCalled()` load-bearing: without it a
+      // forwarded call would still fail, just for a different reason.
+      mockAnalyze.mockResolvedValue(sampleResult);
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'publication_year',
+        order: 'key',
+        per_page: 2,
+        cursor: '',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(mockAnalyze).not.toHaveBeenCalled();
+    });
+
+    it('documents that a blank cursor is rejected rather than read as the first page', () => {
+      expect(analyzeTrendsTool.input.shape.cursor.description ?? '').toMatch(/empty string/i);
     });
   });
 

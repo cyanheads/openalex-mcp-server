@@ -52,11 +52,12 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 
 ### `openalex_search_entities` <sub>tool</sub>
 
-- Retrieve a single entity by ID — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or PMCID (bare or URL form). `id` takes precedence: search parameters passed alongside it are dropped, and the response names which ones. A PMCID resolves nothing (OpenAlex indexes none) — use the work's PMID or DOI instead
-- Keyword search (boolean operators, quoted phrases, wildcards, fuzzy match) plus `exact` and `semantic` search modes — semantic caps at 50 results per page and ~1 req/sec
+- Retrieve a single entity by ID — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or PMCID (bare or URL form), or a keyword by its slug or keyword URL. `id` takes precedence: search parameters passed alongside it are dropped, and the response names which ones. A PMCID resolves nothing (OpenAlex indexes none) — use the work's PMID or DOI instead
+- Keyword search (boolean operators, quoted phrases, wildcards, fuzzy match) plus `exact` and `semantic` search modes — semantic ranks at most 50 candidates at ~1 req/sec, and its `meta.count` reports that ceiling rather than a match total
 - Rich filter syntax: AND across fields, OR within a field (`|`), NOT (`!`), ranges, comparisons; a comma inside a filter value is rejected (use `|`, or a `.search` filter for free text)
 - `select` returns a curated per-entity-type default unless overridden, or `["*"]` for the full record; invalid field names error with the valid set
-- Cursor pagination, up to 100 results per page (default 25); `sample` (up to 100, single page only, no `cursor`) plus a deterministic `seed` for reproducible random sampling
+- Cursor pagination for keyword and exact search, up to 100 results per page (default 25); semantic search walks its candidates with `page` (1-based) instead, and mixing either knob with the wrong `search_mode` is rejected before the upstream call
+- `sample` (up to 100, single page only — neither `cursor` nor `page` applies) plus a deterministic `seed` for reproducible random sampling
 - `display_name` is nullable for untitled records; every call reports OpenAlex daily-budget cost and remaining balance
 
 ---
@@ -74,7 +75,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 ### `openalex_resolve_name` <sub>tool</sub>
 
 - A name or partial name runs an autocomplete search: up to 10 matches with disambiguation hints (last institution, host organization, place, etc.)
-- An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN, bare or in URL form — resolves directly to the one record it addresses; no `entity_type` needed, since the identifier determines its own. A PMCID is recognized but resolves nothing — OpenAlex indexes none
+- An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or keyword URL, bare or in URL form — resolves directly to the one record it addresses; no `entity_type` needed, since the identifier determines its own. A PMCID is recognized but resolves nothing — OpenAlex indexes none
 - `filters` narrows autocomplete only; on an identifier lookup they're ignored and named in a notice
 - Reports OpenAlex daily-budget cost and remaining balance
 
@@ -84,7 +85,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 
 - `direction` sets the edge: `cites` (works citing the seed), `cited_by` (the seed's own reference list), `related_to` (OpenAlex's algorithmic related works, ~8-30 typical, may be empty)
 - `seed_id` accepts an OpenAlex ID, DOI, or PMID (PMCID recognized but resolves nothing); validated against a live lookup first, so a non-existent seed fails as `NotFound` rather than returning an empty graph
-- Stacks with `filters`/`sort`/`select` to narrow the graph; `filters` cannot set `cites`/`cited_by`/`related_to` directly — those are reserved for `direction`
+- Stacks with `filters`/`sort`/`select` to narrow the graph; `filters` cannot set `cites`/`cited_by`/`related_to`, nor an alias of one such as `cited_works` — those keys are reserved for `direction`
 - Cursor pagination, up to 100 results per page (default 25)
 - Reports OpenAlex daily-budget cost, covering both the seed-validation lookup and the graph page, plus remaining balance
 

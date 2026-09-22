@@ -57,18 +57,25 @@ const BOOLEAN_GROUP_BY_FIELDS = new Set([
   'has_fulltext',
 ]);
 
+/** One upstream filter clause: the canonical key and the value it constrains. */
+type FilterClause = [key: string, value: string];
+
 /**
- * Build an OpenAlex filter string from a key-value record.
- * Input: { "cited_by_count": ">100", "is_oa": "true" }
+ * Build an OpenAlex filter string from ordered key-value clauses.
+ * Input: [["cited_by_count", ">100"], ["is_oa", "true"]]
  * Output: "cited_by_count:>100,is_oa:true"
+ *
+ * Clauses, not a record: OpenAlex ANDs a repeated key (`publication_year:2020,publication_year:2024`
+ * matches works in both years, which is nothing), and two caller filters can resolve to one
+ * canonical key. A record would hold only the last of them.
  *
  * Comma handling (commas collide with OpenAlex's filter clause separator):
  * - `*.search` keys: wrap the value in double quotes for faithful phrase passthrough
  *   (skip if already quoted).
  * - All other keys: throw a pre-flight validation error — OpenAlex OR-lists use `|`, not commas.
  */
-function buildFilterString(filters: Record<string, string>, ctx: Context): string {
-  return Object.entries(filters)
+function buildFilterString(filters: FilterClause[], ctx: Context): string {
+  return filters
     .map(([key, value]) => {
       if (value.includes(',')) {
         if (key.endsWith('.search')) {
@@ -129,6 +136,16 @@ export const PMCID_NOT_INDEXED_HINT =
   'OpenAlex indexes no PMCIDs, so a PMCID resolves nothing however it is written. Convert it to a PMID or DOI — the NCBI ID Converter (https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/) does this — and retry with that identifier.';
 
 /**
+ * A keyword's own OpenAlex URL. Keywords are the only `ENTITY_TYPES` member OpenAlex addresses
+ * by slug rather than a native letter-and-number ID, and their URL spells out the `keywords/`
+ * path segment the endpoint already supplies — so stripping the host alone builds
+ * `/keywords/keywords/<slug>`, which 404s, and the ID a search returns cannot be fed back into
+ * its own lookup. The host is anchored on both ends so a look-alike domain is never read as
+ * OpenAlex, and the slug group requires at least one character so a slugless path stays unrouted.
+ */
+const OPENALEX_KEYWORD_URL_PATTERN = /^https:\/\/openalex\.org\/keywords\/([^/?#]+)\/?$/i;
+
+/**
  * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
  * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
  * lets an identifier resolve without the caller naming a type.
@@ -155,10 +172,18 @@ const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
  * "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/" → "pmcid:PMC1234567"
  * "https://pubmed.ncbi.nlm.nih.gov/21491125" → "pmid:21491125"
  * "PMID:21491125" → "pmid:21491125"
+ * "https://openalex.org/keywords/groundwater" → "groundwater"
  * "W2741809807" → "W2741809807"
  */
 export function normalizeId(id: string): string {
   const trimmed = id.trim();
+
+  // Keyword URL → its bare slug. Runs ahead of the generic OpenAlex strip, which would leave
+  // the `keywords/` segment in place and double it against the endpoint path.
+  const keywordSlug = OPENALEX_KEYWORD_URL_PATTERN.exec(trimmed)?.[1];
+  if (keywordSlug) {
+    return keywordSlug;
+  }
 
   // Full OpenAlex URL
   if (trimmed.startsWith('https://openalex.org/')) {
@@ -244,7 +269,6 @@ const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
   A: 'authors',
   F: 'funders',
   I: 'institutions',
-  K: 'keywords',
   P: 'publishers',
   S: 'sources',
   T: 'topics',
@@ -252,12 +276,14 @@ const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
 };
 
 /**
- * Native OpenAlex IDs this server can route. `C` (the deprecated Concepts entity) and `G` are
- * deliberately absent even though `OPENALEX_ID_VALUE_PATTERN` accepts them as *filter values*:
- * neither is in `ENTITY_TYPES`, so there is no endpoint to fetch one from. They fall through to
- * autocomplete rather than being routed to a path that would 404.
+ * Native OpenAlex IDs this server can route. Three letters `OPENALEX_ID_VALUE_PATTERN` accepts
+ * as *filter values* are deliberately absent here. `C` (the deprecated Concepts entity) and `G`
+ * are not in `ENTITY_TYPES`, so there is no endpoint to fetch one from. `K` is in `ENTITY_TYPES`,
+ * but OpenAlex identifies keywords by slug and emits no numeric K-prefixed IDs, so routing that
+ * shape addressed nothing — `OPENALEX_KEYWORD_URL_PATTERN` is the keyword identifier. All three
+ * fall through to autocomplete rather than being routed to a path that would 404.
  */
-const ROUTABLE_OPENALEX_ID = /^([AFIKPSTW])\d+$/;
+const ROUTABLE_OPENALEX_ID = /^([AFIPSTW])\d+$/;
 
 /** An identifier the deterministic by-ID path can resolve, with the scheme it was read as. */
 export interface ResolvedIdentifier {
@@ -275,8 +301,18 @@ export interface ResolvedIdentifier {
  * and stamps external ones with their scheme prefix — so detection reduces to reading back what
  * it produced. Names never survive that: a name with a colon in it yields a prefix that is in no
  * scheme table, and anything else fails the native-ID pattern.
+ *
+ * Keywords are the exception, and are read from the raw query instead: their IDs are slugs, so
+ * `normalizeId()` reduces the URL to a bare word that no longer names an entity type. The URL
+ * form is the only keyword spelling that identifies itself — a bare slug is indistinguishable
+ * from any other name, and autocomplete is the right answer for it.
  */
 export function inferIdentifier(query: string): ResolvedIdentifier | undefined {
+  const keywordSlug = OPENALEX_KEYWORD_URL_PATTERN.exec(query.trim())?.[1];
+  if (keywordSlug) {
+    return { entityType: 'keywords', id: keywordSlug, scheme: 'openalex' };
+  }
+
   const normalized = normalizeId(query);
 
   const colon = normalized.indexOf(':');
@@ -576,21 +612,40 @@ function isOpenAlexFilterValue(value: string): boolean {
 }
 
 /**
+ * Rewrite one caller-supplied filter key to the upstream OpenAlex name, before the
+ * value-dependent `id` rewrite. Exported so the citation-graph tool can check a caller's key
+ * against the ones `direction` reserves: checking the raw key alone let `cited_works` past the
+ * guard, and it then aliased onto `cites` and collided with the direction's own value.
+ *
+ * Misses fall through unchanged so upstream's 400 with the valid-field list still fires for
+ * typos no map can preempt.
+ */
+export function translateFilterKey(entityType: SearchParams['entityType'], key: string): string {
+  return entityType === 'works' ? (FILTER_ALIASES_WORKS[key] ?? key) : key;
+}
+
+/**
  * Rewrite caller-supplied filter keys to the upstream OpenAlex names. Works-only key map plus
  * a universal `id` → `openalex` rewrite when the value looks like an OpenAlex ID. Values pass
- * through unchanged. Misses fall through so upstream's 400 with the valid-field list still
- * fires for typos no map can preempt.
+ * through unchanged.
+ *
+ * Emits clauses rather than a record because an alias and its canonical name are two separate
+ * constraints that resolve to one key — `{year: "2020", publication_year: "2024"}` is a request
+ * for works in both years. A record kept only whichever came last, so JSON property order
+ * silently decided the result set. Both are sent, matching OpenAlex's own repeated-key AND.
+ * Clauses that resolve to an identical key *and* value are deduplicated: restating one
+ * constraint changes nothing upstream.
  */
 function translateFilters(
   entityType: SearchParams['entityType'],
   filters: Record<string, string>,
-): Record<string, string> {
-  const aliases = entityType === 'works' ? FILTER_ALIASES_WORKS : undefined;
-  const out: Record<string, string> = {};
+): FilterClause[] {
+  const out: FilterClause[] = [];
   for (const [rawKey, value] of Object.entries(filters)) {
-    const aliased = aliases?.[rawKey] ?? rawKey;
+    const aliased = translateFilterKey(entityType, rawKey);
     const finalKey = aliased === 'id' && isOpenAlexFilterValue(value) ? 'openalex' : aliased;
-    out[finalKey] = value;
+    if (out.some(([key, existing]) => key === finalKey && existing === value)) continue;
+    out.push([finalKey, value]);
   }
   return out;
 }
@@ -777,16 +832,26 @@ const UNGROUPABLE_GROUP_BY_RE = /cannot group by/i;
 const INVALID_ID_VALUE_RE = /is not a valid OpenAlex ID/i;
 
 /**
+ * OpenAlex 400 emitted when the search text exceeds the length it accepts: the body's `error`
+ * reads "Search query too long" and its `message` quotes both the submitted length and the
+ * ceiling — "Your search is too long (1890 characters; the limit is 1500)." The bound is
+ * upstream's to move (its docs still say 2,000 characters with truncation), so it is reported
+ * from the message rather than pinned as a local `.max()` that would drift.
+ */
+const QUERY_TOO_LONG_RE = /\bsearch\b(?: query)?(?: is)? too long\b/i;
+
+/**
  * A single upstream HTTP 400 spans several distinct failure shapes, each needing a different
  * caller recovery. Pick the declared tool reason from the message shape so the per-tool
  * `recovery` hint (resolved via `ctx.recoveryFor`) matches the actual failure instead of
- * always claiming a rejected field name. Ordering: the ID-value check runs first because it
- * is the only shape naming a concrete upstream concept; the field-name check is anchored at
- * string start; the rest are keyword probes; anything unmatched falls through to a neutral
- * `_other` reason so no shape inherits the field-name recovery by default.
+ * always claiming a rejected field name. Ordering: the over-long-query and ID-value checks run
+ * first because they are the shapes naming a concrete upstream concept; the field-name check is
+ * anchored at string start; the rest are keyword probes; anything unmatched falls through to a
+ * neutral `_other` reason so no shape inherits the field-name recovery by default.
  */
 function classifyInvalidParamsReason(rawMessage: string | undefined): string {
   if (rawMessage !== undefined) {
+    if (QUERY_TOO_LONG_RE.test(rawMessage)) return 'query_too_long';
     if (INVALID_ID_VALUE_RE.test(rawMessage)) return 'upstream_invalid_id_value';
     if (REJECTED_FIELD_RE.test(rawMessage)) return 'upstream_invalid_params';
     if (SORT_REQUIRES_SEARCH_RE.test(rawMessage)) return 'upstream_sort_requires_search';
@@ -1170,10 +1235,13 @@ class OpenAlexService {
       queryParams.per_page = String(params.perPage ?? 25);
     }
 
-    // Semantic search doesn't support cursor pagination — use page/per_page only.
-    // Sampling returns one page only — cursor is mutually exclusive (enforced at the tool
-    // layer; the service never sends both).
-    if (params.searchMode !== 'semantic' && params.sample === undefined) {
+    // Semantic search doesn't support cursor pagination — OpenAlex answers `search.semantic`
+    // plus a cursor with a 400 — so it walks its candidate set with `page`/`per_page` instead.
+    // Sampling returns one page only, so cursor is mutually exclusive there too. Both
+    // combinations are rejected at the tool layer; the service never sends them together.
+    if (params.searchMode === 'semantic') {
+      if (params.page !== undefined) queryParams.page = String(params.page);
+    } else if (params.sample === undefined) {
       queryParams.cursor = params.cursor ?? '*';
     }
 
@@ -1246,18 +1314,34 @@ class OpenAlexService {
       queryParams.cursor = '*';
     }
 
-    const data = (await this.request(`/${params.entityType}`, queryParams, ctx)) as {
+    const path = `/${params.entityType}`;
+    const data = (await this.request(path, queryParams, ctx)) as {
       meta: { count: number; groups_count?: number | null; next_cursor?: string | null };
-      group_by: AnalyzeResult['groups'];
+      group_by?: AnalyzeResult['groups'] | undefined;
     };
+
+    // No `group_by` key at all is OpenAlex's plain *list* shape — the aggregation never ran.
+    // Defaulting it to `[]` reported a successful aggregation of nothing, which a caller reads
+    // as "the filters matched no groups". A present-but-empty array is that honest answer and
+    // passes through.
+    if (data.group_by === undefined) {
+      throw serviceUnavailable(
+        `OpenAlex returned no group_by aggregation for ${path} (group_by=${params.groupBy})`,
+        {
+          path,
+          reason: 'upstream_missing_group_by',
+          ...ctx.recoveryFor('upstream_missing_group_by'),
+        },
+      );
+    }
 
     return {
       meta: {
         count: data.meta.count,
-        groups_count: data.meta.groups_count ?? data.group_by?.length ?? null,
+        groups_count: data.meta.groups_count ?? data.group_by.length,
         next_cursor: data.meta.next_cursor ?? null,
       },
-      groups: deepDecodeHtmlEntities(data.group_by ?? []),
+      groups: deepDecodeHtmlEntities(data.group_by),
     };
   }
 
@@ -1306,7 +1390,7 @@ class OpenAlexService {
     };
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(params.filters, ctx);
+      queryParams.filter = buildFilterString(Object.entries(params.filters), ctx);
     }
 
     const data = (await this.request(path, queryParams, ctx)) as {

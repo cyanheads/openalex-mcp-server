@@ -170,13 +170,52 @@ describe('searchEntitiesTool', () => {
     expect(text).toContain('13.98');
   });
 
-  it('passes all optional params through', async () => {
+  /**
+   * The default works projection now carries `best_oa_location`, so the readable copy of a
+   * paper is one call away. It is an upstream passthrough field, so both client surfaces
+   * have to carry it — `structuredContent` and the rendered `content[]` alike. (gh #79)
+   */
+  it('carries best_oa_location on both output surfaces (gh #79)', async () => {
+    const withBestOa: SearchResult = {
+      meta: { count: 1, per_page: 25, next_cursor: null },
+      results: [
+        {
+          id: 'W001',
+          display_name: 'Paper Alpha',
+          open_access: { is_oa: true, oa_status: 'green' },
+          primary_location: { pdf_url: null },
+          best_oa_location: {
+            pdf_url: 'https://repo.example.org/alpha.pdf',
+            license: 'cc-by',
+            version: 'acceptedVersion',
+          },
+        },
+      ],
+    };
+    mockSearch.mockResolvedValue(withBestOa);
+    const ctx = createMockContext();
+    const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'alpha' });
+
+    const parsed = searchEntitiesTool.output.parse(await searchEntitiesTool.handler(input, ctx));
+
+    expect(parsed.results[0]).toMatchObject({
+      best_oa_location: { pdf_url: 'https://repo.example.org/alpha.pdf' },
+    });
+
+    const blocks = searchEntitiesTool.format?.(withBestOa) ?? [];
+    const text = blocks.map((b) => ('text' in b ? b.text : '')).join('\n');
+    expect(text).toContain('**Best OA Location:**');
+    expect(text).toContain('https://repo.example.org/alpha.pdf');
+    expect(text).toContain('cc-by');
+  });
+
+  it('passes all optional params through on a cursor-paginated search', async () => {
     mockSearch.mockResolvedValue(sampleResult);
     const ctx = createMockContext();
     const input = searchEntitiesTool.input.parse({
       entity_type: 'authors',
       query: 'smith',
-      search_mode: 'semantic',
+      search_mode: 'exact',
       filters: { has_orcid: 'true' },
       sort: '-cited_by_count',
       select: ['id', 'display_name'],
@@ -190,12 +229,48 @@ describe('searchEntitiesTool', () => {
       {
         entityType: 'authors',
         query: 'smith',
-        searchMode: 'semantic',
+        searchMode: 'exact',
         filters: { has_orcid: 'true' },
         sort: '-cited_by_count',
         select: ['id', 'display_name'],
         perPage: 10,
         cursor: 'abc123',
+        page: undefined,
+        id: undefined,
+        sample: undefined,
+        seed: undefined,
+      },
+      ctx,
+    );
+  });
+
+  it('passes all optional params through on a page-paginated semantic search', async () => {
+    mockSearch.mockResolvedValue(sampleResult);
+    const ctx = createMockContext();
+    const input = searchEntitiesTool.input.parse({
+      entity_type: 'authors',
+      query: 'smith',
+      search_mode: 'semantic',
+      filters: { has_orcid: 'true' },
+      sort: '-cited_by_count',
+      select: ['id', 'display_name'],
+      per_page: 10,
+      page: 3,
+    });
+
+    await searchEntitiesTool.handler(input, ctx);
+
+    expect(mockSearch).toHaveBeenCalledWith(
+      {
+        entityType: 'authors',
+        query: 'smith',
+        searchMode: 'semantic',
+        filters: { has_orcid: 'true' },
+        sort: '-cited_by_count',
+        select: ['id', 'display_name'],
+        perPage: 10,
+        cursor: undefined,
+        page: 3,
         id: undefined,
         sample: undefined,
         seed: undefined,
@@ -334,7 +409,8 @@ describe('searchEntitiesTool', () => {
       expect(enrichment.echo).toContain('filters={"is_oa":"true"}');
       expect(enrichment.echo).toContain('sort=-cited_by_count');
       expect(enrichment.echo).toContain('search_mode=semantic');
-      expect(enrichment.notice).toBeUndefined();
+      // Semantic responses always disclose that `meta.count` is the candidate ceiling.
+      expect(enrichment.notice).toMatch(/capped candidate set/i);
     });
 
     it('carries the budget reading the service writes through to structuredContent', () => {
@@ -350,6 +426,26 @@ describe('searchEntitiesTool', () => {
       expect(searchEntitiesTool.enrichmentTrailer?.budget?.render?.(budget)).toContain(
         '$0.0689 left today',
       );
+    });
+
+    /**
+     * The echo used to advertise two constraints while only one reached upstream. Both are
+     * forwarded to the service now, so the echo and the query agree. (gh #70)
+     */
+    it.each([
+      ['alias first', { year: '2020', publication_year: '2024' }],
+      ['canonical first', { publication_year: '2024', year: '2020' }],
+    ])('echoes both colliding filter constraints and forwards both — %s', async (_l, filters) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works', filters });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ filters }), ctx);
+      const { echo } = getEnrichment(ctx);
+      expect(echo).toContain('"year":"2020"');
+      expect(echo).toContain('"publication_year":"2024"');
     });
 
     it('omits search_mode from echo when keyword (default)', async () => {
@@ -549,19 +645,79 @@ describe('searchEntitiesTool', () => {
       expect(getEnrichment(ctx).notice).toContain('seed');
     });
 
-    it('still validates when id is an empty string, which lists rather than looks up', async () => {
-      // `search()` branches on truthiness, so "" takes the list path — the checks must too.
+    it('rejects an empty-string id at the schema layer rather than quietly listing (gh #69)', () => {
+      // `search()` branches on truthiness, so "" used to take the list path — a supplied-but-
+      // blank identifier became an unfiltered sweep of the whole catalog.
+      expect(() =>
+        searchEntitiesTool.input.parse({ entity_type: 'works', id: '', seed: 'abc' }),
+      ).toThrow();
+    });
+  });
+
+  /**
+   * An explicitly blank input is a caller mistake, not a request for everything. Each of these
+   * used to be dropped by a truthiness check and answered with the whole unfiltered catalog.
+   * (gh #69)
+   */
+  describe('blank inputs (gh #69)', () => {
+    it.each([
+      ['id', { entity_type: 'works', id: '', per_page: 1, select: ['id'] }],
+      ['query', { entity_type: 'works', query: '', per_page: 1, select: ['id'] }],
+    ])('rejects a blank %s before any upstream call', (_label, raw) => {
+      expect(() => searchEntitiesTool.input.parse(raw)).toThrow();
+    });
+
+    it('rejects semantic search with no query, which never ran a semantic search', async () => {
       const ctx = createMockContext({ errors: searchEntitiesTool.errors });
       const input = searchEntitiesTool.input.parse({
         entity_type: 'works',
-        id: '',
-        seed: 'abc',
+        search_mode: 'semantic',
+        per_page: 1,
+        select: ['id'],
       });
 
       await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        data: expect.objectContaining({ reason: 'seed_without_sample' }),
+        data: expect.objectContaining({
+          reason: 'semantic_without_query',
+          recovery: { hint: expect.stringMatching(/query/i) },
+        }),
       });
       expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('declares semantic_without_query as a ValidationError on the contract', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'semantic_without_query');
+      expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
+    });
+
+    it.each([
+      ['exact', 'exact'],
+      ['keyword', 'keyword'],
+    ])('leaves %s mode free to run without a query', async (_label, searchMode) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        search_mode: searchMode,
+        filters: { is_oa: 'true' },
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).resolves.toBeDefined();
+    });
+
+    it('keeps filter-only and bare listing queries working', async () => {
+      // Omitting `query` and `id` is a supported discovery path, not the bug.
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      const input = searchEntitiesTool.input.parse({ entity_type: 'works' });
+
+      const result = await searchEntitiesTool.handler(input, ctx);
+
+      expect(result.results).toHaveLength(2);
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ query: undefined, id: undefined }),
+        ctx,
+      );
     });
   });
 
@@ -824,6 +980,389 @@ describe('searchEntitiesTool', () => {
       const description = searchEntitiesTool.input.shape.id.description ?? '';
       expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
       expect(description).toMatch(/PMID or DOI/i);
+    });
+  });
+
+  it('documents the keyword slug and URL forms on the id parameter (gh #68)', () => {
+    const description = searchEntitiesTool.input.shape.id.description ?? '';
+    expect(description).toMatch(/keywords?/i);
+    expect(description).toContain('https://openalex.org/keywords/groundwater');
+  });
+
+  /**
+   * Semantic search ranks a capped candidate set and pages it with `page`; OpenAlex rejects a
+   * cursor on a semantic query, and no other mode accepts `page`. Both mismatches are settled
+   * locally so neither costs a round trip. (gh #71)
+   */
+  describe('semantic pagination (gh #71)', () => {
+    const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+
+    it('forwards page to the service and leaves cursor unset', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'estimating groundwater recharge',
+        search_mode: 'semantic',
+        per_page: 3,
+        page: 17,
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ searchMode: 'semantic', page: 17, cursor: undefined }),
+        ctx,
+      );
+    });
+
+    it('rejects cursor in semantic mode on both surfaces before the round trip', async () => {
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'estimating groundwater recharge',
+        search_mode: 'semantic',
+        cursor: 'definitely-invalid',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'semantic_with_cursor',
+            recovery: { hint: expect.stringContaining('page') },
+          },
+        },
+      });
+      expect(renderedText(result.content)).toContain('page');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an omitted search_mode', {}],
+      ['keyword mode', { search_mode: 'keyword' }],
+      ['exact mode', { search_mode: 'exact' }],
+    ] as const)(
+      'rejects page with %s on both surfaces before the round trip',
+      async (_label, extra) => {
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          query: 'groundwater',
+          page: 2,
+          ...extra,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'page_without_semantic',
+              recovery: { hint: expect.stringContaining('cursor') },
+            },
+          },
+        });
+        expect(renderedText(result.content)).toContain('cursor');
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects sample + page on both surfaces before the round trip', async () => {
+      // The resolved value is what makes `not.toHaveBeenCalled()` load-bearing: without it a
+      // forwarded call would still fail, just for a different reason.
+      mockSearch.mockResolvedValue(sampleResult);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'groundwater',
+        search_mode: 'semantic',
+        sample: 5,
+        page: 2,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'sample_with_page',
+            recovery: { hint: expect.stringContaining('remove `page`') },
+          },
+        },
+      });
+      const rendered = renderedText(result.content);
+      expect(rendered).toContain('remove `page`');
+      expect(rendered).toContain('sample_with_page');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('accepts page 1 and rejects page 0 at the schema layer', () => {
+      const first = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'groundwater',
+        search_mode: 'semantic',
+        page: 1,
+      });
+      expect(first.page).toBe(1);
+
+      expect(() =>
+        searchEntitiesTool.input.parse({
+          entity_type: 'works',
+          query: 'groundwater',
+          search_mode: 'semantic',
+          page: 0,
+        }),
+      ).toThrow();
+    });
+
+    it('discloses the capped candidate count on both surfaces for a semantic response', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 50, per_page: 3, next_cursor: null },
+        results: [{ id: 'W001', display_name: 'Paper Alpha' }],
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'estimating groundwater recharge',
+        search_mode: 'semantic',
+        per_page: 3,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toMatch(/candidate/i);
+      expect(notice).toContain('50');
+      const rendered = renderedText(result.content);
+      expect(rendered).toMatch(/candidate/i);
+      expect(rendered).toContain('50');
+    });
+
+    it.each([
+      ['keyword', 'keyword'],
+      ['exact', 'exact'],
+    ])('leaves a %s response without a capped-count notice', async (_label, searchMode) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'groundwater',
+        search_mode: searchMode,
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('declares query_too_long as a service-thrown InvalidParams reason', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'query_too_long');
+      expect(entry?.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(entry?.thrownBy).toBe('service');
+    });
+
+    it('carries the query_too_long reason, upstream limit, and recovery from the service', async () => {
+      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+      mockSearch.mockRejectedValue(
+        invalidParams('Your search is too long (1890 characters; the limit is 1500).', {
+          reason: 'query_too_long',
+          ...ctx.recoveryFor('query_too_long'),
+        }),
+      );
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'a'.repeat(1890),
+        search_mode: 'semantic',
+      });
+
+      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        message: expect.stringContaining('the limit is 1500'),
+        data: {
+          reason: 'query_too_long',
+          recovery: { hint: expect.stringMatching(/shorten/i) },
+        },
+      });
+    });
+
+    it('puts no local length limit on query', () => {
+      // The ceiling is upstream's to move; a local `.max()` would pin a number that has
+      // already drifted from what OpenAlex enforces.
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'a'.repeat(5000),
+        search_mode: 'semantic',
+      });
+      expect(input.query).toHaveLength(5000);
+    });
+
+    it('documents page alongside cursor and search_mode', () => {
+      expect(searchEntitiesTool.input.shape.page.description ?? '').toMatch(/semantic/i);
+      expect(searchEntitiesTool.input.shape.cursor.description ?? '').toMatch(/page/i);
+      expect(searchEntitiesTool.input.shape.search_mode.description ?? '').toMatch(/page/i);
+    });
+
+    it('names the capped candidate total in the meta.count description', () => {
+      expect(searchEntitiesTool.output.shape.meta.shape.count.description ?? '').toMatch(
+        /semantic/i,
+      );
+    });
+  });
+
+  /**
+   * A zero-result page on a *continuing* call means the traversal ran past its last page, not
+   * that the criteria matched nothing — broadening advice there tells the caller to widen a
+   * search that already returned everything it had. (gh #74)
+   */
+  describe('exhausted pages (gh #74)', () => {
+    const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+
+    /** Terminal cursor page: nonzero count, empty results, null cursor. */
+    const terminalCursorPage: SearchResult = {
+      meta: { count: 2, per_page: 2, next_cursor: null },
+      results: [],
+    };
+
+    it('replaces the broadening advice on a cursor continuation, on both surfaces', async () => {
+      mockSearch.mockResolvedValue(terminalCursorPage);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'publishers',
+        query: 'Elsevier',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('Pagination exhausted');
+      expect(notice).not.toContain('No matches for');
+      expect(notice).not.toContain('Try broadening');
+      const rendered = renderedText(result.content);
+      expect(rendered).toContain('Pagination exhausted');
+      expect(rendered).not.toContain('No matches for');
+      expect(rendered).not.toContain('Try broadening');
+    });
+
+    it('leaves echo, totalCount, and meta.count untouched on the exhausted branch', async () => {
+      mockSearch.mockResolvedValue(terminalCursorPage);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'publishers',
+        query: 'Elsevier',
+        per_page: 2,
+        cursor: 'second-page',
+      });
+
+      const output = await searchEntitiesTool.handler(input, ctx);
+
+      expect(output.meta.count).toBe(2);
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalCount).toBe(2);
+      expect(enrichment.echo).toContain('entity_type=publishers');
+    });
+
+    it('treats a semantic page past the last candidate as exhausted', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 50, per_page: 3, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'estimating groundwater recharge',
+        search_mode: 'semantic',
+        per_page: 3,
+        page: 18,
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('Pagination exhausted');
+      expect(notice).not.toContain('No matches for');
+    });
+
+    it('keeps the broadening advice on semantic page 1', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 0, per_page: 3, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'xyzzy_no_match',
+        search_mode: 'semantic',
+        per_page: 3,
+        page: 1,
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('No matches for');
+      expect(notice).not.toContain('Pagination exhausted');
+    });
+
+    it('keeps the broadening advice on a first call with no cursor', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'xyzzy_no_match',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('No matches for');
+      expect(notice).not.toContain('Pagination exhausted');
+    });
+
+    it('describes meta.per_page as the requested page size, not the result count', () => {
+      const description = searchEntitiesTool.output.shape.meta.shape.per_page.description ?? '';
+      expect(description).toMatch(/request/i);
+      expect(description).not.toBe('Results on this page.');
+    });
+  });
+
+  /**
+   * A supplied-but-blank `cursor` used to reach upstream as `cursor=`, which OpenAlex answers
+   * with page 1 — restarting the traversal — while the tool read the parameter's presence as a
+   * continuation and reported a genuine zero-match first call as an exhausted page. (gh #80)
+   */
+  describe('blank cursor (gh #80)', () => {
+    it('rejects a blank cursor on the error envelope before the round trip', async () => {
+      // The resolved value is what makes `not.toHaveBeenCalled()` load-bearing: without it a
+      // forwarded call would still fail, just for a different reason.
+      mockSearch.mockResolvedValue(sampleResult);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'groundwater recharge',
+        per_page: 2,
+        select: ['id'],
+        cursor: '',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a blank cursor on an id lookup too, which never paginates', () => {
+      expect(() =>
+        searchEntitiesTool.input.parse({ entity_type: 'works', id: 'W2741809807', cursor: '' }),
+      ).toThrow();
+    });
+
+    it('documents that a blank cursor is rejected rather than read as page 1', () => {
+      expect(searchEntitiesTool.input.shape.cursor.description ?? '').toMatch(/empty string/i);
     });
   });
 

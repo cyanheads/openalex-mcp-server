@@ -3,64 +3,19 @@
  * @module mcp-server/tools/definitions/citation-graph.tool
  */
 
-import type { HandlerContext } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
-import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
+import { getOpenAlexService, translateFilterKey } from '@/services/openalex/openalex-service.js';
 import type { EntityRecord } from '@/services/openalex/types.js';
 
 const OPENALEX_URL_PREFIX = 'https://openalex.org/';
-
-/**
- * Resolve any accepted seed identifier to a bare W-ID and confirm it exists. The graph
- * filters (`cites`/`cited_by`/`related_to`) themselves don't validate the seed — passing
- * a non-existent W-ID returns zero edges, indistinguishable from a valid seed with no
- * citations yet. A singleton `/works/{id}` lookup gates the query so bad seeds surface
- * as NotFound (bubbles via the service as `entity_not_found`) and good seeds with empty
- * graphs return honest empty results.
- */
-async function resolveSeedToWorkId(
-  service: ReturnType<typeof getOpenAlexService>,
-  seedId: string,
-  ctx: HandlerContext<'entity_not_found'>,
-): Promise<string> {
-  const lookup = await service.search({ entityType: 'works', id: seedId, select: ['id'] }, ctx);
-  const record = lookup.results[0];
-  if (!record?.id) {
-    throw ctx.fail(
-      'entity_not_found',
-      `Could not resolve seed_id "${seedId}" to an OpenAlex work ID.`,
-      { ...ctx.recoveryFor('entity_not_found'), seedId },
-    );
-  }
-  return record.id.replace(OPENALEX_URL_PREFIX, '');
-}
 
 const DIRECTIONS = ['cites', 'cited_by', 'related_to'] as const;
 type Direction = (typeof DIRECTIONS)[number];
 
 const RESERVED_FILTER_KEYS: ReadonlySet<string> = new Set<string>(DIRECTIONS);
-
-/** Reject a `filters` key that `direction` owns — merging it would silently overwrite one. */
-function assertNoReservedFilterKey(
-  input: { direction: Direction; filters?: Record<string, string> | undefined },
-  ctx: HandlerContext<'reserved_filter_key'>,
-): void {
-  if (!input.filters) return;
-  const reserved = Object.keys(input.filters).find((key) => RESERVED_FILTER_KEYS.has(key));
-  if (reserved === undefined) return;
-  throw ctx.fail(
-    'reserved_filter_key',
-    `${reserved} cannot be passed in filters — direction reserves cites/cited_by/related_to.`,
-    {
-      ...ctx.recoveryFor('reserved_filter_key'),
-      reservedKey: reserved,
-      direction: input.direction,
-    },
-  );
-}
 
 function buildCitationEcho(input: {
   seed_id: string;
@@ -90,6 +45,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: true,
       recovery:
         'Wait several seconds and retry; consider lowering request frequency for this caller.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_budget_exhausted',
@@ -98,6 +54,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: false,
       recovery:
         'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_timeout',
@@ -106,6 +63,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: true,
       recovery:
         'Retry after a short delay; if timeouts persist, narrow the request with tighter filters to reduce upstream load.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unavailable',
@@ -114,6 +72,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_unauthorized',
@@ -121,6 +80,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'OpenAlex rejected the API key (HTTP 401).',
       recovery:
         'Check that OPENALEX_API_KEY is set to a valid OpenAlex account API key (free from https://openalex.org/settings/api).',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_forbidden',
@@ -128,6 +88,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'OpenAlex denied access to the requested resource (HTTP 403).',
       recovery:
         'Confirm the API key has access to this entity type or endpoint, then retry the request.',
+      thrownBy: 'service',
     },
     {
       reason: 'comma_in_filter_value',
@@ -135,6 +96,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params',
@@ -142,6 +104,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'OpenAlex rejected an invalid filter or sort field name (HTTP 400).',
       recovery:
         'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or use openalex_describe_fields(entity_type, "filter") to browse valid filter fields.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_id_value',
@@ -149,6 +112,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'An entity-ID filter received a value that is not an OpenAlex ID — usually a name (HTTP 400).',
       recovery:
         'Call openalex_resolve_name to turn the name into an OpenAlex ID, then filter by that ID. Entity filters such as authorships.author.id and primary_topic.id accept IDs only.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_sort_requires_search',
@@ -156,6 +120,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'sort=-relevance_score was used but the citation-graph query has no active search (HTTP 400).',
       recovery:
         'Sorting by relevance_score requires an active search, which a citation-graph walk lacks — choose a concrete sort field such as -cited_by_count or -publication_date, or add a `*.search` filter.',
+      thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params_other',
@@ -163,11 +128,12 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'OpenAlex rejected the request (HTTP 400) for a reason other than an invalid field name.',
       recovery:
         'Read the upstream message in the error above and adjust the request — check filter operators, value formats, and cursor/per_page bounds.',
+      thrownBy: 'service',
     },
     {
       reason: 'reserved_filter_key',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'filters contains cites/cited_by/related_to — the direction parameter reserves those keys.',
+      when: 'filters contains cites/cited_by/related_to, or an alias of one such as cited_works — the direction parameter reserves those keys.',
       recovery:
         'Remove the reserved key from filters, or restate the relationship through direction.',
     },
@@ -196,7 +162,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Do not include cites/cited_by/related_to — those are set by the `direction` parameter.',
+        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Do not include cites/cited_by/related_to, nor an alias of one such as cited_works — those keys are set by the `direction` parameter.',
       ),
     sort: z
       .string()
@@ -219,8 +185,11 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .describe('Results per page (1-100). Default 25.'),
     cursor: z
       .string()
+      .min(1)
       .optional()
-      .describe('Pagination cursor from a previous response. Pass to get the next page.'),
+      .describe(
+        'Pagination cursor from a previous response. Pass to get the next page. Omit it on the first call — an empty string is rejected, since a supplied-but-blank cursor is a caller mistake rather than a request for the first page.',
+      ),
   }),
   output: z.object({
     meta: z
@@ -228,7 +197,11 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         count: z
           .number()
           .describe('Total edges from seed_id in this direction (across all pages).'),
-        per_page: z.number().describe('Records on this page.'),
+        per_page: z
+          .number()
+          .describe(
+            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this.',
+          ),
         next_cursor: z
           .string()
           .nullable()
@@ -269,7 +242,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .optional()
       .describe(
-        'Recovery guidance when no edges are returned — suggests verifying the seed_id, broadening filters, or trying a different direction. Absent when results are present.',
+        'Guidance when no edges are returned. A first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead. Absent when results are present.',
       ),
     budget: z
       .object({
@@ -302,10 +275,52 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   },
 
   async handler(input, ctx) {
-    assertNoReservedFilterKey(input, ctx);
+    /**
+     * Reject a `filters` key that `direction` owns — merging it would silently overwrite one.
+     * The check runs on the *translated* key, not the raw one: `cited_works` is an alias of
+     * `cites`, so reading the caller's spelling alone let it past the guard and the collision
+     * happened a layer down, where the direction won and the caller's filter disappeared.
+     */
+    const reserved = Object.keys(input.filters ?? {}).find((key) =>
+      RESERVED_FILTER_KEYS.has(translateFilterKey('works', key)),
+    );
+    if (reserved !== undefined) {
+      const upstreamKey = translateFilterKey('works', reserved);
+      const resolution = upstreamKey === reserved ? '' : ` — it resolves to \`${upstreamKey}\``;
+      throw ctx.fail(
+        'reserved_filter_key',
+        `${reserved} cannot be passed in filters${resolution}, and direction reserves cites/cited_by/related_to.`,
+        {
+          ...ctx.recoveryFor('reserved_filter_key'),
+          reservedKey: reserved,
+          direction: input.direction,
+        },
+      );
+    }
 
     const service = getOpenAlexService();
-    const workId = await resolveSeedToWorkId(service, input.seed_id, ctx);
+
+    /**
+     * Resolve any accepted seed identifier to a bare W-ID and confirm it exists. The graph
+     * filters (`cites`/`cited_by`/`related_to`) themselves don't validate the seed — passing a
+     * non-existent W-ID returns zero edges, indistinguishable from a valid seed with no citations
+     * yet. A singleton `/works/{id}` lookup gates the query so bad seeds surface as NotFound
+     * (a 404 bubbles from the service as `entity_not_found` too) and good seeds with empty graphs
+     * return honest empty results.
+     */
+    const seedLookup = await service.search(
+      { entityType: 'works', id: input.seed_id, select: ['id'] },
+      ctx,
+    );
+    const seedRecord = seedLookup.results[0];
+    if (!seedRecord?.id) {
+      throw ctx.fail(
+        'entity_not_found',
+        `Could not resolve seed_id "${input.seed_id}" to an OpenAlex work ID.`,
+        { ...ctx.recoveryFor('entity_not_found'), seedId: input.seed_id },
+      );
+    }
+    const workId = seedRecord.id.replace(OPENALEX_URL_PREFIX, '');
 
     const mergedFilters: Record<string, string> = {
       ...(input.filters ?? {}),
@@ -333,9 +348,13 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
 
     const echo = buildCitationEcho(input);
     ctx.enrich({ echo, totalCount: result.meta.count });
+    // An empty page on a `cursor` continuation means the walk already returned every edge it
+    // had, so the verify-the-seed advice would send the caller after a seed that is fine.
     if (result.results.length === 0) {
       ctx.enrich.notice(
-        `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`,
+        input.cursor === undefined
+          ? `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`
+          : `Pagination exhausted for ${echo} — the previous page held the last edge, so this one came back empty. Stop paging rather than broadening filters or changing direction.`,
       );
     }
 

@@ -19,6 +19,12 @@ export type EntityType = (typeof ENTITY_TYPES)[number];
 /**
  * Default `select` fields applied to search queries (not single-entity lookups) when the caller
  * doesn't specify `select`. Prevents 20-70KB-per-record responses from blowing up context windows.
+ *
+ * `best_oa_location` earns its place on works despite the payload it adds (~36% on a 25-record
+ * page): it is the field naming the readable copy — `pdf_url`, `license`, `version`, and the
+ * hosting source — and on a green-OA work that copy sits in a repository, not at the closed
+ * publisher page `primary_location` points to. Without it, finding a paper and reading it takes
+ * two calls.
  */
 export const DEFAULT_SELECT: Record<EntityType, string[]> = {
   works: [
@@ -31,6 +37,7 @@ export const DEFAULT_SELECT: Record<EntityType, string[]> = {
     'open_access',
     'primary_topic',
     'primary_location',
+    'best_oa_location',
   ],
   authors: [
     'id',
@@ -82,6 +89,11 @@ export interface SearchParams {
   entityType: EntityType;
   filters?: Record<string, string> | undefined;
   id?: string | undefined;
+  /**
+   * 1-based page number, semantic search only. OpenAlex rejects `cursor` on a semantic query
+   * and pages it with `page`/`per_page` instead, so the two are never sent together.
+   */
+  page?: number | undefined;
   perPage?: number | undefined;
   query?: string | undefined;
   sample?: number | undefined;

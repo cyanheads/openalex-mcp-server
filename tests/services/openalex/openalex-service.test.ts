@@ -314,6 +314,108 @@ describe('OpenAlexService', () => {
     });
   });
 
+  // --- Keyword identifiers: slugs, not native IDs (gh #68) ---
+
+  describe('keyword identifiers (gh #68)', () => {
+    async function lookupKeyword(id: string): Promise<URL> {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'https://openalex.org/keywords/x', display_name: 'X' }), {
+          status: 200,
+        }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'keywords', id }, createMockContext());
+      return lastFetchUrl();
+    }
+
+    /**
+     * The ID a keyword search returns is a URL carrying the `keywords/` path segment the
+     * endpoint already supplies. Stripping the host alone builds `/keywords/keywords/<slug>`,
+     * which 404s — so the returned ID could not be fed back into its own lookup.
+     */
+    it.each([
+      ['the keyword URL a search returns', 'https://openalex.org/keywords/groundwater'],
+      ['the same URL with a trailing slash', 'https://openalex.org/keywords/groundwater/'],
+      ['the bare slug', 'groundwater'],
+    ])('resolves %s to /keywords/groundwater', async (_label, id) => {
+      expect((await lookupKeyword(id)).pathname).toBe('/keywords/groundwater');
+    });
+
+    it('resolves a multi-word keyword slug', async () => {
+      expect((await lookupKeyword('https://openalex.org/keywords/machine-learning')).pathname).toBe(
+        '/keywords/machine-learning',
+      );
+    });
+
+    it('does not read a slugless keyword path as a lookup', async () => {
+      // No slug means no keyword to address — the path must not collapse to the list endpoint.
+      expect((await lookupKeyword('https://openalex.org/keywords/')).pathname).not.toBe(
+        '/keywords/',
+      );
+    });
+
+    it('does not read a look-alike host as an OpenAlex keyword URL', async () => {
+      expect((await lookupKeyword('https://notopenalex.org/keywords/groundwater')).pathname).toBe(
+        '/keywords/https://notopenalex.org/keywords/groundwater',
+      );
+    });
+
+    it('infers the keywords entity type from a keyword URL', async () => {
+      const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+      expect(inferIdentifier('https://openalex.org/keywords/groundwater')).toEqual({
+        entityType: 'keywords',
+        id: 'groundwater',
+        scheme: 'openalex',
+      });
+    });
+
+    it.each([
+      ['a slugless keyword path', 'https://openalex.org/keywords/'],
+      ['a look-alike host', 'https://notopenalex.org/keywords/groundwater'],
+      ['a bare slug, which is indistinguishable from a name', 'groundwater'],
+    ])('leaves %s to name resolution', async (_label, query) => {
+      const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+      expect(inferIdentifier(query)).toBeUndefined();
+    });
+
+    /**
+     * The by-ID lookup and `openalex_resolve_name` have to land on the same record for the
+     * ID a search hands back — that round trip is the whole point of the identifier.
+     */
+    it('resolves the keyword URL through resolveIdentifier to the same record', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: 'https://openalex.org/keywords/groundwater',
+            display_name: 'Groundwater',
+            works_count: 141298,
+            cited_by_count: 2504216,
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+      const identifier = inferIdentifier('https://openalex.org/keywords/groundwater');
+      expect(identifier).toBeDefined();
+
+      const result = await service.resolveIdentifier(identifier!, createMockContext());
+
+      expect(lastFetchUrl().pathname).toBe('/keywords/groundwater');
+      expect(result.results).toEqual([
+        {
+          id: 'https://openalex.org/keywords/groundwater',
+          display_name: 'Groundwater',
+          entity_type: 'keyword',
+          external_id: null,
+          hint: null,
+          works_count: 141298,
+          cited_by_count: 2504216,
+        },
+      ]);
+    });
+  });
+
   // --- Identifier shape → entity type inference (gh #50) ---
 
   describe('inferIdentifier', () => {
@@ -354,7 +456,6 @@ describe('OpenAlexService', () => {
       ['S137773608', 'sources'],
       ['I241749', 'institutions'],
       ['T10159', 'topics'],
-      ['K12345', 'keywords'],
       ['P4310320595', 'publishers'],
       ['F4320332161', 'funders'],
     ])('derives %s → %s from the native ID letter', async (query, entityType) => {
@@ -397,8 +498,9 @@ describe('OpenAlexService', () => {
     it.each([
       ['C71924100', 'the deprecated Concepts entity'],
       ['G12345', 'an entity type this server does not model'],
+      ['K12345', 'a shape OpenAlex never emits — keyword IDs are slugs (gh #68)'],
     ])('does not route %s — %s', async (query) => {
-      // No endpoint exists for these, so routing them would turn a name search into a 404.
+      // No endpoint answers these, so routing them would turn a name search into a 404.
       expect(await infer(query)).toBeUndefined();
     });
   });
@@ -1128,6 +1230,99 @@ describe('OpenAlexService', () => {
       expect(filter).toContain('is_oa:true');
     });
 
+    /**
+     * An alias and its canonical name are two constraints, not one. Merging them into an object
+     * dropped whichever arrived first, so JSON property order decided the result set while the
+     * response echoed both. OpenAlex ANDs a repeated filter key, which is the semantics the
+     * caller asked for and the one this tool documents ("AND across fields"). (gh #70)
+     */
+    describe('alias collisions preserve AND-conjunction (gh #70)', () => {
+      function filterClauses(): string[] {
+        return filterParam().split(',').filter(Boolean);
+      }
+
+      it.each([
+        ['alias first', { year: '2020', publication_year: '2024' }],
+        ['canonical first', { publication_year: '2024', year: '2020' }],
+      ])('sends both years as an AND’d clause pair — %s', async (_label, filters) => {
+        const service = await getService();
+        await service.search({ entityType: 'works', filters }, createMockContext());
+
+        expect(filterClauses().sort()).toEqual(['publication_year:2020', 'publication_year:2024']);
+      });
+
+      it.each([
+        ['alias first', { cited_works: 'W1', cites: 'W2' }],
+        ['canonical first', { cites: 'W2', cited_works: 'W1' }],
+      ])('sends both citation constraints — %s', async (_label, filters) => {
+        const service = await getService();
+        await service.search({ entityType: 'works', filters }, createMockContext());
+
+        expect(filterClauses().sort()).toEqual(['cites:W1', 'cites:W2']);
+      });
+
+      it.each([
+        ['alias first', { id: 'W1', openalex: 'W2' }],
+        ['canonical first', { openalex: 'W2', id: 'W1' }],
+      ])('sends both OpenAlex-ID constraints — %s', async (_label, filters) => {
+        const service = await getService();
+        await service.search({ entityType: 'works', filters }, createMockContext());
+
+        expect(filterClauses().sort()).toEqual(['openalex:W1', 'openalex:W2']);
+      });
+
+      it('deduplicates aliases resolving to an identical value', async () => {
+        // Repeating one constraint changes nothing upstream, so one clause is the honest send.
+        const service = await getService();
+        await service.search(
+          { entityType: 'works', filters: { year: '2020', publication_year: '2020' } },
+          createMockContext(),
+        );
+
+        expect(filterClauses()).toEqual(['publication_year:2020']);
+      });
+
+      it('preserves the collision on the analyze path too', async () => {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+        );
+        const service = await getService();
+        await service.analyze(
+          {
+            entityType: 'works',
+            groupBy: 'oa_status',
+            filters: { year: '2020', publication_year: '2024' },
+          },
+          createMockContext(),
+        );
+
+        expect(filterClauses().sort()).toEqual(['publication_year:2020', 'publication_year:2024']);
+      });
+
+      it('leaves distinct canonical keys in caller order', async () => {
+        const service = await getService();
+        await service.search(
+          { entityType: 'works', filters: { is_oa: 'true', year: '2020' } },
+          createMockContext(),
+        );
+
+        expect(filterClauses()).toEqual(['is_oa:true', 'publication_year:2020']);
+      });
+
+      it('still rejects a comma in one of two clauses sharing a key', async () => {
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', filters: { year: '2020', publication_year: '2021,2022' } },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          data: { reason: 'comma_in_filter_value', filterKey: 'publication_year' },
+        });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      });
+    });
+
     it('also applies aliases on the analyze path', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
@@ -1297,6 +1492,87 @@ describe('OpenAlexService', () => {
     });
   });
 
+  // --- best_oa_location in the default works projection (gh #79) ---
+
+  describe('default works projection carries best_oa_location (gh #79)', () => {
+    /** Fields projected by the default works request, as OpenAlex receives them. */
+    function defaultWorksSelect(): string[] {
+      return lastFetchUrl().searchParams.get('select')?.split(',') ?? [];
+    }
+
+    it('projects best_oa_location on a default works search', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', query: 'groundwater' }, createMockContext());
+      expect(defaultWorksSelect()).toContain('best_oa_location');
+    });
+
+    it('projects best_oa_location on a default works id lookup', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search({ entityType: 'works', id: 'W1' }, createMockContext());
+      expect(defaultWorksSelect()).toContain('best_oa_location');
+    });
+
+    it('leaves every other entity type default projection untouched', async () => {
+      const service = await getService();
+      for (const entityType of ['authors', 'sources', 'institutions', 'topics'] as const) {
+        await service.search({ entityType }, createMockContext());
+        expect(defaultWorksSelect(), `${entityType} gained a works-only field`).not.toContain(
+          'best_oa_location',
+        );
+      }
+    });
+
+    it('does not add best_oa_location when the caller supplies an explicit select', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', select: ['id', 'display_name', 'doi'] },
+        createMockContext(),
+      );
+      expect(defaultWorksSelect()).toEqual(['id', 'display_name', 'doi']);
+    });
+
+    /**
+     * A repository-hosted green-OA copy is where `best_oa_location` differs from
+     * `primary_location` — the readable PDF lives at the repository, not the publisher.
+     * `pdf_url: null` is upstream data and is passed through, never synthesized.
+     */
+    it('passes a green-OA best_oa_location through the response unchanged', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 25 },
+            results: [
+              {
+                id: 'W1',
+                display_name: 'A green-OA paper',
+                primary_location: { pdf_url: null, source: { display_name: 'Elsevier BV' } },
+                best_oa_location: {
+                  pdf_url: 'https://repo.example.org/paper.pdf',
+                  license: 'cc-by',
+                  version: 'acceptedVersion',
+                  source: { display_name: 'Institutional Repository' },
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+
+      expect(result.results[0]?.best_oa_location).toEqual({
+        pdf_url: 'https://repo.example.org/paper.pdf',
+        license: 'cc-by',
+        version: 'acceptedVersion',
+        source: { display_name: 'Institutional Repository' },
+      });
+    });
+  });
+
   // --- Search params ---
 
   describe('search', () => {
@@ -1325,6 +1601,86 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(lastFetchUrl().searchParams.get('search.semantic')).toBe('effects of warming');
+    });
+
+    /**
+     * Semantic search pages with `page`; OpenAlex rejects a cursor on `search.semantic`
+     * outright, so the two never ride together on the wire. (gh #71)
+     */
+    describe('semantic pagination (gh #71)', () => {
+      it('forwards page and sends no cursor in semantic mode', async () => {
+        const service = await getService();
+        await service.search(
+          {
+            entityType: 'works',
+            query: 'estimating groundwater recharge',
+            searchMode: 'semantic',
+            perPage: 3,
+            page: 2,
+          },
+          createMockContext(),
+        );
+
+        const url = lastFetchUrl();
+        expect(url.searchParams.get('page')).toBe('2');
+        expect(url.searchParams.get('per_page')).toBe('3');
+        expect(url.searchParams.get('cursor')).toBeNull();
+      });
+
+      it('reaches the last candidate page with no cursor appearing', async () => {
+        const service = await getService();
+        await service.search(
+          {
+            entityType: 'works',
+            query: 'estimating groundwater recharge',
+            searchMode: 'semantic',
+            perPage: 3,
+            page: 17,
+          },
+          createMockContext(),
+        );
+
+        const url = lastFetchUrl();
+        expect(url.searchParams.get('page')).toBe('17');
+        expect(url.searchParams.get('cursor')).toBeNull();
+      });
+
+      it('sends neither page nor cursor when semantic mode omits page', async () => {
+        const service = await getService();
+        await service.search(
+          { entityType: 'works', query: 'estimating groundwater recharge', searchMode: 'semantic' },
+          createMockContext(),
+        );
+
+        const url = lastFetchUrl();
+        expect(url.searchParams.get('page')).toBeNull();
+        expect(url.searchParams.get('cursor')).toBeNull();
+      });
+
+      it.each(['keyword', 'exact'] as const)(
+        'opens a cursor traversal for %s mode and sends no page',
+        async (searchMode) => {
+          const service = await getService();
+          await service.search(
+            { entityType: 'works', query: 'groundwater', searchMode },
+            createMockContext(),
+          );
+
+          const url = lastFetchUrl();
+          expect(url.searchParams.get('cursor')).toBe('*');
+          expect(url.searchParams.get('page')).toBeNull();
+        },
+      );
+
+      it('forwards a caller cursor unchanged on a non-semantic continuation', async () => {
+        const service = await getService();
+        await service.search(
+          { entityType: 'works', query: 'groundwater', searchMode: 'keyword', cursor: 'page-two' },
+          createMockContext(),
+        );
+
+        expect(lastFetchUrl().searchParams.get('cursor')).toBe('page-two');
+      });
     });
 
     it('passes select as comma-joined string', async () => {
@@ -1536,9 +1892,55 @@ describe('OpenAlexService', () => {
       expect(lastFetchUrl().searchParams.get('group_by')).toBe('oa_status:include_unknown');
     });
 
-    it('handles missing group_by in response', async () => {
+    /**
+     * A response carrying no `group_by` key at all is OpenAlex's plain list shape — the
+     * aggregation never ran. Folding it into `groups: []` reported a successful aggregation
+     * with nothing in it, which reads as "the filters matched nothing to group". (gh #69)
+     */
+    it('throws rather than reporting an empty aggregation when group_by is absent (gh #69)', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
-        new Response(JSON.stringify({ meta: { count: 0 } }), { status: 200 }),
+        new Response(JSON.stringify({ meta: { count: 327790539 }, results: [] }), { status: 200 }),
+      );
+      const service = await getService();
+
+      await expect(
+        service.analyze({ entityType: 'works', groupBy: 'type' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_missing_group_by' },
+      });
+    });
+
+    it('carries the caller contract recovery on a missing-aggregation response (gh #69)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 1 }, results: [] }), { status: 200 }),
+      );
+      const ctx = createMockContext({
+        errors: [
+          {
+            reason: 'upstream_missing_group_by',
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            when: 'the response carried no aggregation',
+            recovery: 'DISTINCTIVE_GROUP_BY_HINT retry, then check the group_by field.',
+          },
+        ],
+      });
+      const service = await getService();
+
+      await expect(
+        service.analyze({ entityType: 'works', groupBy: 'type' }, ctx),
+      ).rejects.toMatchObject({
+        data: {
+          reason: 'upstream_missing_group_by',
+          recovery: { hint: expect.stringContaining('DISTINCTIVE_GROUP_BY_HINT') },
+        },
+      });
+    });
+
+    it('still reports an empty aggregation when upstream returns an empty group_by array', async () => {
+      // A present-but-empty array is honest data: the filters matched nothing to group.
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
       );
       const service = await getService();
       const result = await service.analyze(
@@ -1546,6 +1948,7 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(result.groups).toEqual([]);
+      expect(result.meta.groups_count).toBe(0);
     });
 
     it('forwards per_page when provided', async () => {
@@ -2031,6 +2434,72 @@ describe('OpenAlexService', () => {
         ).rejects.toMatchObject({
           code: JsonRpcErrorCode.InvalidParams,
           data: { reason: 'upstream_invalid_params_other' },
+        });
+      });
+
+      /**
+       * The search-length ceiling is upstream's to move — OpenAlex's docs say 2,000 characters
+       * with truncation while the proxy enforces a hard 400 at 1,500 — so the caller reads the
+       * bound off the message rather than off a number pinned here. (gh #71)
+       */
+      it('maps a search-too-long 400 to query_too_long, quoting the upstream limit', async () => {
+        // Verbatim upstream body for a 1,890-character `search.semantic` query.
+        mock400(
+          'Your search is too long (1890 characters; the limit is 1500). Very long pasted-text or Boolean searches are disproportionately expensive.',
+        );
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', query: 'a'.repeat(1890), searchMode: 'semantic' },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          message: expect.stringContaining('the limit is 1500'),
+          data: { reason: 'query_too_long' },
+        });
+      });
+
+      it('classifies the bare "Search query too long" error field too', async () => {
+        // Some 400 bodies carry only `error`, which is what `message ?? error` falls back to.
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ error: 'Search query too long' }), {
+            status: 400,
+            statusText: 'Bad Request',
+          }),
+        );
+        const service = await getService();
+        await expect(
+          service.search(
+            { entityType: 'works', query: 'a'.repeat(9000), searchMode: 'keyword' },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'query_too_long' },
+        });
+      });
+
+      it('resolves the query_too_long recovery hint from the caller contract', async () => {
+        mock400('Your search is too long (1890 characters; the limit is 1500).');
+        const ctx = createMockContext({
+          errors: [
+            {
+              reason: 'query_too_long',
+              code: JsonRpcErrorCode.InvalidParams,
+              when: 'the search text exceeds the upstream limit',
+              recovery: 'DISTINCTIVE_LENGTH_HINT shorten the query or split it into several.',
+            },
+          ],
+        });
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', query: 'a'.repeat(1890) }, ctx),
+        ).rejects.toMatchObject({
+          data: {
+            reason: 'query_too_long',
+            recovery: { hint: expect.stringContaining('DISTINCTIVE_LENGTH_HINT') },
+          },
         });
       });
 
