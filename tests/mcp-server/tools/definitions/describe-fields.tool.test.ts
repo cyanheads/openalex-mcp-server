@@ -143,6 +143,157 @@ describe('describeFieldsTool', () => {
       expect(groupBy.fields).toContain('is_oa');
     });
 
+    /**
+     * A live sweep grouped every field the group_by view listed, on all eight entity types
+     * (2026-09-23). These are the ones OpenAlex refused: a 400 ("Cannot group by …", "Group by
+     * referenced_works is not supported at this time.", or — for the authors concept keys — an
+     * invalid-ID 400), or a 500 on every attempt. Each stays a valid filter. (gh #86)
+     */
+    const SWEEP_REJECTS: Record<string, string[]> = {
+      works: [
+        'biblio.first_page',
+        'biblio.last_page',
+        'citation_normalized_percentile.value',
+        'cited_by',
+        'display_name',
+        'doi',
+        'fwci',
+        'ids.mag',
+        'ids.pmcid',
+        'ids.pmid',
+        'mag',
+        'pmcid',
+        'pmid',
+        'referenced_works',
+        'related_to',
+        'sustainable_development_goals.score',
+        'topics_count',
+        // HTTP 500 on every probe
+        'best_oa_location.raw_type',
+        'cites',
+        'has_embeddings',
+        'locations.raw_type',
+        'primary_location.raw_type',
+      ],
+      authors: ['concept.id', 'concepts.id', 'display_name', 'x_concepts.id'],
+      sources: [
+        'apc_prices.price',
+        'display_name',
+        'first_publication_year',
+        'ids.mag',
+        'is_high_oa_rate_since_year',
+        'is_in_doaj_since_year',
+        'is_in_jstage_since_year',
+        'last_publication_year',
+        'oa_flip_year',
+      ],
+      institutions: ['display_name'],
+      topics: ['display_name'],
+      keywords: ['display_name'],
+      publishers: ['display_name'],
+      funders: ['display_name'],
+    };
+
+    /** Fields the same sweep grouped successfully, including the near neighbours of rejects. */
+    const SWEEP_GROUPED: Record<string, string[]> = {
+      works: [
+        'publication_year',
+        'cited_by_count',
+        'authors_count',
+        'referenced_works_count',
+        'concepts_count',
+        'locations_count',
+        'apc_list.value',
+        'cited_by_percentile_year.min',
+        'citation_normalized_percentile.is_in_top_1_percent',
+        'concepts.id',
+        'authorships.author.id',
+        'openalex',
+        'ids.openalex',
+        'raw_affiliation_strings',
+      ],
+      authors: ['works_count', 'summary_stats.2yr_mean_citedness', 'orcid', 'id', 'has_orcid'],
+      sources: ['works_count', 'issn', 'concepts.id', 'x_concepts.id', 'apc_prices.currency'],
+      institutions: ['x_concepts.id', 'ror', 'summary_stats.h_index'],
+      topics: ['id', 'works_count'],
+      keywords: ['id', 'cited_by_count'],
+      publishers: ['ids.ror', 'country_codes'],
+      funders: ['awards_count', 'ror'],
+    };
+
+    /** group_by view size per entity type after the sweep — every other listed field grouped. */
+    const GROUP_BY_TOTALS: Record<string, number> = {
+      works: 160,
+      authors: 33,
+      sources: 32,
+      institutions: 28,
+      topics: 9,
+      keywords: 4,
+      publishers: 19,
+      funders: 20,
+    };
+
+    it.each(Object.entries(SWEEP_REJECTS))(
+      'drops the fields OpenAlex refuses to group %s by, keeping them as filters (gh #86)',
+      async (entityType, rejects) => {
+        const ctx = createMockContext();
+        const [filter, groupBy] = await Promise.all(
+          (['filter', 'group_by'] as const).map((context) =>
+            describeFieldsTool.handler(
+              describeFieldsTool.input.parse({ entity_type: entityType, context }),
+              ctx,
+            ),
+          ),
+        );
+
+        for (const field of rejects) {
+          expect(filter?.fields, `${field} left the ${entityType} filter view`).toContain(field);
+          expect(groupBy?.fields, `${field} still listed for ${entityType} group_by`).not.toContain(
+            field,
+          );
+        }
+        for (const field of SWEEP_GROUPED[entityType] ?? []) {
+          expect(groupBy?.fields, `${field} groups today but was dropped`).toContain(field);
+        }
+        expect(groupBy?.total).toBe(GROUP_BY_TOTALS[entityType]);
+        expect(groupBy?.fields).toHaveLength(GROUP_BY_TOTALS[entityType] ?? -1);
+      },
+    );
+
+    it('keeps a field rejected on one entity type listed where it groups (gh #86)', async () => {
+      // concepts.id 400s as an authors group_by key but groups works, sources, and institutions.
+      const ctx = createMockContext();
+      const view = (entity_type: string) =>
+        describeFieldsTool.handler(
+          describeFieldsTool.input.parse({ entity_type, context: 'group_by' }),
+          ctx,
+        );
+
+      expect((await view('authors')).fields).not.toContain('concepts.id');
+      for (const entityType of ['works', 'sources', 'institutions']) {
+        expect((await view(entityType)).fields).toContain('concepts.id');
+      }
+    });
+
+    it('renders the pruned group_by view in content[] too (gh #86)', async () => {
+      const ctx = createMockContext();
+      const result = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({
+          entity_type: 'works',
+          context: 'group_by',
+          query: 'fwci',
+        }),
+        ctx,
+      );
+      const text = (describeFieldsTool.format?.(result) ?? [])
+        .map((b) => ('text' in b ? b.text : ''))
+        .join('\n');
+
+      expect(text).toContain('**works** / **group_by** — 160 valid fields');
+      expect(text).not.toMatch(/^- fwci$/m);
+      expect(text).toMatch(/^- publication_year$/m);
+    });
+
     it('does not surface publication_date when querying the group_by context (gh #42 repro)', async () => {
       const ctx = createMockContext();
       const groupByInput = describeFieldsTool.input.parse({
