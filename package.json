@@ -99,6 +99,9 @@
     "@types/node": "^26.6.2",
     "depcheck": "^1.4.7",
     "ignore": "^7.0.9",
+    "mdast-util-from-markdown": "^2.0.3",
+    "mdast-util-gfm": "^3.1.0",
+    "micromark-extension-gfm": "^3.0.0",
     "tsc-alias": "^1.9.5",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
