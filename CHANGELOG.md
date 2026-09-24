@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.16](changelog/0.7.x/0.7.16.md) — 2026-09-24
+
+Provider text arrives clean on both surfaces (entities decoded, markup removed, Markdown escaped in content[]), plus a flagged unknown group_by bucket, local rejection of sample with semantic search or sort, and corrected group_by field lists and error reasons.
+
 ## [0.7.15](changelog/0.7.x/0.7.15.md) — 2026-09-22
 
 Keyword identifiers, semantic-mode `page` pagination, AND'd filter aliases, and honest pagination/notice handling across the paginating tools.

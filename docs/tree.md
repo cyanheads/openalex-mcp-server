@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-09-22 16:31:33
+Generated on: 2026-09-24 06:22:01
 
 ```text
 openalex-mcp-server/
@@ -154,6 +154,7 @@ openalex-mcp-server/
 │   │       │   ├── describe-fields.tool.ts
 │   │       │   ├── resolve-name.tool.ts
 │   │       │   └── search-entities.tool.ts
+│   │       ├── escape-markdown.ts
 │   │       ├── render-budget.ts
 │   │       └── render-entity-record.ts
 │   ├── services/
@@ -161,13 +162,17 @@ openalex-mcp-server/
 │   │       ├── budget.ts
 │   │       ├── field-catalog.json
 │   │       ├── field-ranker.ts
+│   │       ├── html-entities.json
 │   │       ├── openalex-service.ts
+│   │       ├── provider-text.ts
 │   │       ├── types.ts
 │   │       └── url-redaction.ts
 │   └── index.ts
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
+│   ├── helpers/
+│   │   └── markdown.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
@@ -179,6 +184,7 @@ openalex-mcp-server/
 │   │       │   ├── describe-fields.tool.test.ts
 │   │       │   ├── resolve-name.tool.test.ts
 │   │       │   └── search-entities.tool.test.ts
+│   │       ├── escape-markdown.test.ts
 │   │       ├── render-budget.test.ts
 │   │       └── render-entity-record.test.ts
 │   └── services/
@@ -186,6 +192,7 @@ openalex-mcp-server/
 │           ├── budget.test.ts
 │           ├── field-ranker.test.ts
 │           ├── openalex-service.test.ts
+│           ├── provider-text.test.ts
 │           ├── security.test.ts
 │           └── url-redaction.test.ts
 ├── .dockerignore
