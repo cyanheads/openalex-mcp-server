@@ -25,6 +25,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import { mergeUpstreamBudget, parseUpstreamBudget, type UpstreamBudget } from './budget.js';
 import fieldCatalog from './field-catalog.json' with { type: 'json' };
 import { rankFields } from './field-ranker.js';
+import { normalizeProviderText, normalizeProviderValue } from './provider-text.js';
 import {
   type AnalyzeParams,
   type AnalyzeResult,
@@ -35,6 +36,7 @@ import {
   ENTITY_TYPES,
   type EntityRecord,
   type EntityType,
+  type GroupRecord,
   type SearchParams,
   type SearchResult,
 } from './types.js';
@@ -344,60 +346,6 @@ function reconstructAbstract(invertedIndex: Record<string, number[]>): string {
   return words.map(([, word]) => word).join(' ');
 }
 
-const NAMED_HTML_ENTITIES: Record<string, string> = {
-  amp: '&',
-  apos: "'",
-  gt: '>',
-  lt: '<',
-  nbsp: ' ',
-  quot: '"',
-};
-
-const MAX_UNICODE_CODE_POINT = 0x10ffff;
-
-function codePointToString(code: number, fallback: string): string {
-  return Number.isInteger(code) && code >= 0 && code <= MAX_UNICODE_CODE_POINT
-    ? String.fromCodePoint(code)
-    : fallback;
-}
-
-/**
- * Decode HTML entities that OpenAlex sometimes returns in `display_name` and similar fields
- * (e.g. `Nature Clinical Practice Gastroenterology &#38; Hepatology`). Handles numeric
- * (`&#38;`), hex (`&#x27E9;`), and the common named entities. The trailing semicolon is
- * optional — upstream sometimes drops it (`&#38 Hepatology`) and HTML5 parsers tolerate
- * this; matching strictly would leave malformed entities literal in the output. Unknown or
- * out-of-range entities pass through unchanged so we never silently corrupt data.
- */
-function decodeHtmlEntities(input: string): string {
-  if (!input.includes('&')) return input;
-
-  return input.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);?/gi, (match, body: string) => {
-    const lower = body.toLowerCase();
-    if (lower.startsWith('#x')) {
-      return codePointToString(Number.parseInt(lower.slice(2), 16), match);
-    }
-    if (lower.startsWith('#')) {
-      return codePointToString(Number.parseInt(lower.slice(1), 10), match);
-    }
-    return NAMED_HTML_ENTITIES[lower] ?? match;
-  });
-}
-
-/** Recursively decode HTML entities in every string leaf of a JSON value. */
-function deepDecodeHtmlEntities<T>(value: T): T {
-  if (typeof value === 'string') return decodeHtmlEntities(value) as T;
-  if (Array.isArray(value)) return value.map(deepDecodeHtmlEntities) as T;
-  if (isRecord(value)) {
-    const next: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      next[k] = deepDecodeHtmlEntities(v);
-    }
-    return next as T;
-  }
-  return value;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -408,16 +356,20 @@ function hasAbstractInvertedIndex(
   return isRecord(record.abstract_inverted_index);
 }
 
+/**
+ * Normalize provider text on one record, once, at the service boundary — both response surfaces
+ * read the result, and nothing downstream normalizes again.
+ */
 function normalizeEntityRecord(record: EntityRecord): EntityRecord {
-  if (!hasAbstractInvertedIndex(record)) return deepDecodeHtmlEntities(record);
+  if (!hasAbstractInvertedIndex(record)) return normalizeProviderValue(record);
 
   const { abstract_inverted_index, ...rest } = record;
-  // Decode keys via the reconstructed abstract — `deepDecodeHtmlEntities` only walks
-  // values, so entities living in inverted-index word keys (e.g. `"&amp;"`) would
-  // otherwise survive into the plaintext output.
+  // Normalize the reconstructed abstract, not the index — `normalizeProviderValue` only walks
+  // values, so entities and markup living in inverted-index word keys (`"&amp;"`, `"<!--"`)
+  // would otherwise survive, and a tag split across words only exists once they are joined.
   return {
-    ...deepDecodeHtmlEntities(rest),
-    abstract: decodeHtmlEntities(reconstructAbstract(abstract_inverted_index)),
+    ...normalizeProviderValue(rest),
+    abstract: normalizeProviderText(reconstructAbstract(abstract_inverted_index)),
   };
 }
 
@@ -428,7 +380,30 @@ function normalizeEntityRecords(results: EntityRecord[]): EntityRecord[] {
 function normalizeAutocompleteRecords(
   results: AutocompleteResult['results'],
 ): AutocompleteResult['results'] {
-  return results.map((r) => deepDecodeHtmlEntities(r));
+  return results.map((r) => normalizeProviderValue(r));
+}
+
+/**
+ * Keys OpenAlex gives the missing-value bucket `:include_unknown` adds: `-111`/`-111.0` on
+ * numeric fields in count order, `unknown` on string fields and under key-ascending traversal,
+ * and `https://openalex.org/<type>/unknown` on ID fields.
+ */
+function isUnknownGroupKey(key: string): boolean {
+  return key === '-111' || key === '-111.0' || key === 'unknown' || key.endsWith('/unknown');
+}
+
+/**
+ * Normalize one aggregation group. `key` stays byte-identical to upstream — it is what a caller
+ * matches and filters on — while the label is provider text. The unknown bucket is flagged only
+ * when it was requested, since no other page can carry one.
+ */
+function normalizeGroup(group: GroupRecord, includeUnknown: boolean): GroupRecord {
+  return {
+    key: group.key,
+    key_display_name: normalizeProviderValue(group.key_display_name),
+    count: group.count,
+    ...(includeUnknown && isUnknownGroupKey(group.key) ? { is_unknown: true as const } : {}),
+  };
 }
 
 /** Entity type → the record field holding its canonical external identifier. */
@@ -818,18 +793,37 @@ const SORT_REQUIRES_SEARCH_RE = /must include a search query/i;
 
 /**
  * OpenAlex 400 emitted when group_by targets a field it cannot aggregate — a raw date, a
- * float, or a `*.search` operator: "Cannot group by date, number, or search fields." Names
- * no rejected field; the caller needs a categorical/year field, not a corrected name.
+ * float, or a `*.search` operator ("Cannot group by date, number, or search fields."), a
+ * field it refuses by name ("Cannot group by display_name."), or one it has not built
+ * ("Group by referenced_works is not supported at this time."). Either way the field name is
+ * valid; the caller needs a groupable field, not a corrected name.
  */
-const UNGROUPABLE_GROUP_BY_RE = /cannot group by/i;
+const UNGROUPABLE_GROUP_BY_RE = /cannot group by|\bgroup by \S+ is not supported\b/i;
 
 /**
  * OpenAlex 400 emitted when an entity-ID filter receives something that isn't an ID —
  * typically a name: "'Albert' is not a valid OpenAlex ID." (upstream splits the value on
  * whitespace before validating, so only the first token is named). The fix is to resolve
- * the name to an ID first, which no other 400 shape's recovery says.
+ * the name to an ID first, which no other 400 shape's recovery says. Capture group 1 is the
+ * quoted value, when present — `isGroupByIdRejection` reads it.
  */
-const INVALID_ID_VALUE_RE = /is not a valid OpenAlex ID/i;
+const INVALID_ID_VALUE_RE = /(?:'([^']*)'\s+)?is not a valid OpenAlex ID/i;
+
+/**
+ * The same invalid-ID 400 also answers a group_by upstream cannot aggregate: authors grouped
+ * by `concepts.id`, `concept.id`, or `x_concepts.id` gets "'41008148' is not a valid OpenAlex
+ * ID.", naming a concept ID from upstream's own aggregation. Upstream validates `filter` before
+ * `group_by`, so a quoted value the request's filter carries is the caller's bad ID; anything
+ * else on a group_by request — including a request with no filter at all — is the group_by.
+ */
+function isGroupByIdRejection(
+  quotedValue: string | undefined,
+  requestParams: Record<string, string>,
+): boolean {
+  if (!requestParams.group_by) return false;
+  const filter = requestParams.filter;
+  return !filter || (quotedValue !== undefined && !filter.includes(quotedValue));
+}
 
 /**
  * OpenAlex 400 emitted when the search text exceeds the length it accepts: the body's `error`
@@ -847,17 +841,50 @@ const QUERY_TOO_LONG_RE = /\bsearch\b(?: query)?(?: is)? too long\b/i;
  * always claiming a rejected field name. Ordering: the over-long-query and ID-value checks run
  * first because they are the shapes naming a concrete upstream concept; the field-name check is
  * anchored at string start; the rest are keyword probes; anything unmatched falls through to a
- * neutral `_other` reason so no shape inherits the field-name recovery by default.
+ * neutral `_other` reason so no shape inherits the field-name recovery by default. The
+ * invalid-ID shape alone also reads the request's own `filter`/`group_by` params, because
+ * upstream sends it for two different mistakes.
  */
-function classifyInvalidParamsReason(rawMessage: string | undefined): string {
+function classifyInvalidParamsReason(
+  rawMessage: string | undefined,
+  requestParams: Record<string, string>,
+): string {
   if (rawMessage !== undefined) {
     if (QUERY_TOO_LONG_RE.test(rawMessage)) return 'query_too_long';
-    if (INVALID_ID_VALUE_RE.test(rawMessage)) return 'upstream_invalid_id_value';
+    const invalidId = INVALID_ID_VALUE_RE.exec(rawMessage);
+    if (invalidId) {
+      return isGroupByIdRejection(invalidId[1], requestParams)
+        ? 'upstream_ungroupable_group_by'
+        : 'upstream_invalid_id_value';
+    }
     if (REJECTED_FIELD_RE.test(rawMessage)) return 'upstream_invalid_params';
     if (SORT_REQUIRES_SEARCH_RE.test(rawMessage)) return 'upstream_sort_requires_search';
     if (UNGROUPABLE_GROUP_BY_RE.test(rawMessage)) return 'upstream_ungroupable_group_by';
   }
   return 'upstream_invalid_params_other';
+}
+
+/**
+ * Longest `q`, in Unicode code points, that `/autocomplete/{entity_type}` answers. Past it, a
+ * query holding an ASCII letter gets an HTML 500 on every attempt, on all eight typed endpoints;
+ * cross-entity `/autocomplete` has no such bound. The bound is upstream's to move, so it only
+ * relabels a 500 that already happened rather than rejecting input: if OpenAlex raises it, the
+ * branch never fires; if it lowers it, the shorter failures stay `upstream_unavailable`.
+ */
+const AUTOCOMPLETE_QUERY_MAX_CODE_POINTS = 1000;
+
+/**
+ * The code-point length of a typed autocomplete `q` past `AUTOCOMPLETE_QUERY_MAX_CODE_POINTS` —
+ * the one request shape whose HTTP 500 is a caller error rather than an outage — or undefined.
+ * Counted in code points, as upstream counts: `length` would count an emoji twice.
+ */
+function overLongAutocompleteQuery(
+  path: string,
+  params: Record<string, string>,
+): number | undefined {
+  if (!path.startsWith('/autocomplete/') || params.q === undefined) return;
+  const codePoints = [...params.q].length;
+  return codePoints > AUTOCOMPLETE_QUERY_MAX_CODE_POINTS ? codePoints : undefined;
 }
 
 /** Reason for a 429 caused by daily-budget exhaustion rather than burst throttling. */
@@ -887,14 +914,18 @@ function classifyRateLimitReason(rawMessage: string | undefined): string {
  * failure shapes under one error code — 400 (rejected field / relevance sort without a
  * search / ungroupable group_by / non-ID filter value) and 429 (burst throttle vs. spent
  * daily budget) — and each shape needs its own caller recovery, so both discriminate on the
- * upstream message. Every other code maps to a single reason.
+ * upstream message, and the 400 invalid-ID shape on the request params too. Every other code
+ * maps to a single reason.
  */
 function resolveThrowReason(
   code: JsonRpcErrorCode,
   mappedReason: string,
   rawMessage: string | undefined,
+  requestParams: Record<string, string>,
 ): string {
-  if (code === JsonRpcErrorCode.InvalidParams) return classifyInvalidParamsReason(rawMessage);
+  if (code === JsonRpcErrorCode.InvalidParams) {
+    return classifyInvalidParamsReason(rawMessage, requestParams);
+  }
   if (code === JsonRpcErrorCode.RateLimited) return classifyRateLimitReason(rawMessage);
   return mappedReason;
 }
@@ -1055,7 +1086,7 @@ class OpenAlexService {
           logResponseMetrics(parsed, budget, path, ctx);
           return parsed;
         } catch (error) {
-          this.throwNormalizedRequestError(error, path, ctx);
+          this.throwNormalizedRequestError(error, path, params, ctx);
         }
       },
       {
@@ -1068,13 +1099,36 @@ class OpenAlexService {
     );
   }
 
-  private throwNormalizedRequestError(error: unknown, path: string, ctx: Context): never {
+  private throwNormalizedRequestError(
+    error: unknown,
+    path: string,
+    params: Record<string, string>,
+    ctx: Context,
+  ): never {
     if (!(error instanceof McpError)) {
       throw error;
     }
 
     const statusCode =
       typeof error.data?.statusCode === 'number' ? error.data.statusCode : undefined;
+
+    // A typed autocomplete `q` past the bound 500s on every attempt, with an HTML body that
+    // names nothing — read as ServiceUnavailable it would be retried and reported as an outage.
+    // `retryable: false` keeps it out of `withRetry`, and the recovery says to shorten the name.
+    const overLongQuery = statusCode === 500 ? overLongAutocompleteQuery(path, params) : undefined;
+    if (overLongQuery !== undefined) {
+      throw invalidParams(
+        `OpenAlex autocomplete failed on a ${overLongQuery.toLocaleString('en-US')}-character query — ${path} accepts at most ${AUTOCOMPLETE_QUERY_MAX_CODE_POINTS.toLocaleString('en-US')} characters.`,
+        {
+          ...error.data,
+          path,
+          reason: 'query_too_long',
+          ...ctx.recoveryFor('query_too_long'),
+          retryable: false,
+        },
+        { cause: error },
+      );
+    }
     // Status-mapped failures classify off the HTTP status. Everything else — the client-side
     // `REQUEST_TIMEOUT_MS` abort, DNS/connection failures, and the `parseResponse` throws
     // (empty body, HTML, invalid JSON) — never carries a status, so the error's own code is
@@ -1097,7 +1151,7 @@ class OpenAlexService {
     const { factory } = normalized;
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
-    const reason = resolveThrowReason(code, normalized.reason, rawMessage);
+    const reason = resolveThrowReason(code, normalized.reason, rawMessage, params);
     // A truncated body's appended valid-fields list is misleading. For an invalid-field
     // 400, replace it with catalog-backed ranked suggestions; otherwise strip it. The two
     // are mutually exclusive — appendFieldSuggestions already drops the partial list, so it
@@ -1239,6 +1293,9 @@ class OpenAlexService {
     // plus a cursor with a 400 — so it walks its candidate set with `page`/`per_page` instead.
     // Sampling returns one page only, so cursor is mutually exclusive there too. Both
     // combinations are rejected at the tool layer; the service never sends them together.
+    // The tool also rejects `sample` under semantic mode (OpenAlex ignores it there, and the
+    // population request below would pair `search.semantic` with `cursor=*`) and `sample`
+    // beside `sort` (OpenAlex refuses the pair), so neither reaches this method.
     if (params.searchMode === 'semantic') {
       if (params.page !== undefined) queryParams.page = String(params.page);
     } else if (params.sample === undefined) {
@@ -1341,7 +1398,7 @@ class OpenAlexService {
         groups_count: data.meta.groups_count ?? data.group_by.length,
         next_cursor: data.meta.next_cursor ?? null,
       },
-      groups: deepDecodeHtmlEntities(data.group_by),
+      groups: data.group_by.map((group) => normalizeGroup(group, params.includeUnknown === true)),
     };
   }
 
@@ -1423,7 +1480,7 @@ export function getOpenAlexService(): OpenAlexService {
  * Return the typed field catalog keyed by entity type → context → field list.
  * Only `filter` and `select` arrays are stored. `group_by` resolves to the `filter` key here;
  * the describe-fields handler then prunes the fields group_by cannot target (raw dates,
- * `*.search` operators, and `from_*`/`to_*` range modifiers).
+ * `*.search` operators, `from_*`/`to_*` range modifiers, and a per-type set from a live sweep).
  */
 export function getFieldCatalog(): Record<EntityType, { filter: string[]; select: string[] }> {
   return fieldCatalog as Record<EntityType, { filter: string[]; select: string[] }>;

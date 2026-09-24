@@ -125,6 +125,19 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       recovery: 'Sampling returns a single page only; remove `page` or remove `sample`.',
     },
     {
+      reason: 'sample_with_semantic',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search (no `id`) provided `sample` with search_mode "semantic", which OpenAlex does not sample — it returns the same ranked candidates under every seed.',
+      recovery:
+        'Switch search_mode to keyword or exact to draw a random sample, or remove `sample` and walk the semantic candidates with `page`.',
+    },
+    {
+      reason: 'sample_with_sort',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search (no `id`) provided both `sample` and `sort`, which OpenAlex refuses together.',
+      recovery: 'A random sample has no order to sort by; remove `sort` or remove `sample`.',
+    },
+    {
       reason: 'seed_without_sample',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A search (no `id`) provided `seed` without `sample`.',
@@ -267,7 +280,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .enum(['keyword', 'exact', 'semantic'])
       .default('keyword')
       .describe(
-        `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity, ranking at most ${SEMANTIC_PER_PAGE_CAP} candidates at ~1 req/sec and paginated with \`page\` rather than \`cursor\`.`,
+        `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity over a query-dependent candidate set whose size \`meta.count\` reports, at ~1 req/sec, up to ${SEMANTIC_PER_PAGE_CAP} per page, and paginated with \`page\` rather than \`cursor\`.`,
       ),
     filters: z
       .record(z.string(), z.string())
@@ -279,7 +292,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Sort field. Prefix with "-" for descending. Comma-separate for a multi-key sort, applied left to right, with the "-" prefix set per key ("-publication_year,cited_by_count" sorts by year descending, then citations ascending). Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail.',
+        'Sort field. Prefix with "-" for descending. Comma-separate for a multi-key sort, applied left to right, with the "-" prefix set per key ("-publication_year,cited_by_count" sorts by year descending, then citations ascending). Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail. Not combinable with `sample` — a search passing both is rejected.',
       ),
     select: z
       .array(z.string())
@@ -309,7 +322,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        `Page number (1-based) for semantic search, the one mode that paginates with \`page\` instead of \`cursor\`. Semantic search ranks at most ${SEMANTIC_PER_PAGE_CAP} candidates, so the last reachable page is ceil(${SEMANTIC_PER_PAGE_CAP} / per_page) — e.g. page 17 with per_page=3. Passing it under any other search_mode is rejected.`,
+        'Page number (1-based) for semantic search, the one mode that paginates with `page` instead of `cursor`. Semantic search ranks a query-dependent candidate set whose size `meta.count` reports, so the last reachable page is ceil(meta.count / per_page) — e.g. page 14 for a count of 70 with per_page=5. Passing it under any other search_mode is rejected.',
       ),
     sample: z
       .number()
@@ -318,7 +331,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .max(SAMPLE_MAX)
       .optional()
       .describe(
-        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — neither \`cursor\` nor \`page\` pagination applies to sampling, and a search that passes either alongside it is rejected. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
+        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — neither \`cursor\` nor \`page\` pagination applies to sampling, and a search that passes either alongside it is rejected. Keyword and exact modes only: OpenAlex does not sample a semantic search, so \`sample\` with search_mode "semantic" is rejected. Cannot be combined with \`sort\` — a sample has no order, and a search passing both is rejected. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
       ),
     seed: z
       .string()
@@ -333,7 +346,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         count: z
           .number()
           .describe(
-            `Total results matching the query/filters. Under search_mode "semantic" it is instead the capped candidate count — at most ${SEMANTIC_PER_PAGE_CAP} — not an exhaustive match total.`,
+            'Total results matching the query/filters. Under search_mode "semantic" it is instead the size of the ranked candidate set — the most results `page` can reach — not an exhaustive match total.',
           ),
         per_page: z
           .number()
@@ -364,7 +377,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           ),
       )
       .describe(
-        'OpenAlex entity objects passed through unchanged. Additional fields depend on entity_type and select.',
+        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — and an abstract arrives reconstructed as `abstract`. Additional fields depend on entity_type and select.',
       ),
   }),
 
@@ -382,7 +395,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), and on every semantic search to disclose that `meta.count` is a capped candidate total. Absent otherwise.',
+        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), and on every semantic search to disclose that `meta.count` is a candidate total rather than a match total. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -495,6 +508,32 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         );
       }
 
+      // OpenAlex ignores `sample` and `seed` under `search.semantic` and returns the ranked page,
+      // so forwarding the pair would label a relevance ranking as a random sample. The population
+      // request would also carry `cursor=*` beside `search.semantic`, which upstream rejects.
+      // Checked after `sample_with_page`, which is reachable under semantic mode alone.
+      if (input.sample !== undefined && input.search_mode === 'semantic') {
+        throw ctx.fail(
+          'sample_with_semantic',
+          'Semantic search does not sample — OpenAlex returns the same ranked candidates under every seed.',
+          {
+            ...ctx.recoveryFor('sample_with_semantic'),
+            sample: input.sample,
+            searchMode: input.search_mode,
+          },
+        );
+      }
+
+      // OpenAlex answers any sort beside `sample` with a 400 ("sample does not work with sort").
+      // A blank or whitespace-only sort is never sent upstream, so it is no conflict.
+      if (input.sample !== undefined && input.sort?.trim()) {
+        throw ctx.fail(
+          'sample_with_sort',
+          'A random sample cannot be sorted — `sample` cannot be combined with `sort`.',
+          { ...ctx.recoveryFor('sample_with_sort'), sample: input.sample, sort: input.sort },
+        );
+      }
+
       if (input.seed !== undefined && input.sample === undefined) {
         throw ctx.fail(
           'seed_without_sample',
@@ -554,11 +593,11 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     }
 
     // `meta.count` reports the ranked candidate set under semantic search, not the population
-    // matching the query — a caller reading it as a match total plans a traversal that ends
-    // at the cap.
+    // matching the query. Its size is query-dependent (OpenAlex serves 70 for some queries,
+    // 50 for others), so the notice states the count it got rather than a fixed ceiling.
     if (!input.id && input.search_mode === 'semantic') {
       notices.push(
-        `Semantic search ranks a capped candidate set, so \`meta.count\` (${result.meta.count}) is that ceiling — at most ${SEMANTIC_PER_PAGE_CAP} — not the total number of matching records. Reach the rest of the candidates with \`page\`.`,
+        `Semantic search ranks a candidate set rather than every match, so \`meta.count\` (${result.meta.count}) is the number of candidates \`page\` can reach, not the total number of matching records. Reach the rest of the candidates with \`page\`.`,
       );
     }
 

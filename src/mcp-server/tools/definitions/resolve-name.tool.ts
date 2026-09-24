@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import {
   getOpenAlexService,
@@ -97,6 +98,15 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       thrownBy: 'service',
     },
     {
+      reason: 'query_too_long',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex autocomplete failed (HTTP 500) on a `query` longer than the 1,000 characters it accepts when entity_type is set.',
+      retryable: false,
+      recovery:
+        'Shorten `query` to 1,000 characters or fewer — pass the name itself, not a citation or abstract — and call again with the shorter text.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_invalid_params_other',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'OpenAlex rejected the autocomplete request (HTTP 400) for a reason other than an invalid field name.',
@@ -148,7 +158,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
               .string()
               .nullable()
               .describe(
-                'Human-readable name. null only for an identifier lookup that landed on a record OpenAlex holds no title for (paratext works and other untitled entries) — use `id` to identify it.',
+                'Human-readable name as plain text, with HTML entities decoded and markup removed. null only for an identifier lookup that landed on a record OpenAlex holds no title for (paratext works and other untitled entries) — use `id` to identify it.',
               ),
             entity_type: z
               .string()
@@ -166,7 +176,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
               .string()
               .nullable()
               .describe(
-                'Disambiguation context — last institution (authors), host organization (sources), place or country (institutions); author names (works) from a name search, publication year from an identifier lookup. null when the record carries none.',
+                'Disambiguation context as plain text — last institution (authors), host organization (sources), place or country (institutions); author names (works) from a name search, publication year from an identifier lookup. null when the record carries none.',
               ),
           })
           .describe(
@@ -281,12 +291,14 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     }
     const lines: string[] = [];
     for (const r of result.results) {
-      lines.push(`**${r.display_name ?? '(untitled)'}** (${r.entity_type})`);
-      const details: string[] = [r.id];
-      if (r.external_id) details.push(r.external_id);
+      // Trimmed inside the bold wrapper: `**` next to a space no longer opens or closes it.
+      const name = r.display_name === null ? '(untitled)' : escapeMarkdown(r.display_name.trim());
+      lines.push(`**${name}** (${escapeMarkdown(r.entity_type)})`);
+      const details: string[] = [escapeMarkdown(r.id, 'line-start')];
+      if (r.external_id) details.push(escapeMarkdown(r.external_id));
       details.push(`${r.cited_by_count} citations`);
       details.push(r.works_count === null ? 'n/a works' : `${r.works_count} works`);
-      if (r.hint) details.push(r.hint);
+      if (r.hint) details.push(escapeMarkdown(r.hint));
       lines.push(details.join(' | '));
       lines.push('');
     }

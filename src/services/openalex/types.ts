@@ -159,6 +159,11 @@ export interface EntityRecord {
 
 export interface GroupRecord {
   count: number;
+  /**
+   * Set only on the missing-value bucket `include_unknown` adds, whose key is an OpenAlex
+   * sentinel (`-111`, `unknown`, `…/unknown`) rather than a measured value.
+   */
+  is_unknown?: true;
   key: string;
   key_display_name: string;
 }

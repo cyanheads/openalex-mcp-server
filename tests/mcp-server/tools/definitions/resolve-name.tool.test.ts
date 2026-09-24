@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/resolve-name.tool.test
  */
 
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
@@ -11,6 +12,7 @@ import {
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutocompleteResult } from '@/services/openalex/types.js';
+import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
 
 const mockAutocomplete = vi.fn<() => Promise<AutocompleteResult>>();
 const mockResolveIdentifier = vi.fn<() => Promise<AutocompleteResult>>();
@@ -91,6 +93,52 @@ describe('resolveNameTool', () => {
           recovery: { hint: expect.stringMatching(/resolve that name/i) },
         },
       });
+    });
+
+    /**
+     * An over-long typed autocomplete query fails upstream with a 500 on every attempt; the
+     * service reclassifies it, so the contract must declare the reason for its recovery to
+     * resolve. The wire path through the real service is covered in the service suite. (gh #81)
+     */
+    it('declares query_too_long as a non-retryable, service-thrown InvalidParams reason', () => {
+      const entry = resolveNameTool.errors?.find((e) => e.reason === 'query_too_long');
+      expect(entry?.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(entry?.thrownBy).toBe('service');
+      expect(entry?.retryable).toBe(false);
+      expect(entry?.recovery).toMatch(/shorten/i);
+      expect(entry?.recovery).toMatch(/1,000/);
+    });
+
+    it('carries the query_too_long recovery to both surfaces', async () => {
+      mockAutocomplete.mockImplementation((async (_params: unknown, ctx: Context) => {
+        throw invalidParams('OpenAlex autocomplete cannot take a query this long.', {
+          reason: 'query_too_long',
+          retryable: false,
+          ...ctx.recoveryFor('query_too_long'),
+        });
+      }) as never);
+
+      const result = await runToolContract(resolveNameTool, {
+        entity_type: 'authors',
+        query: 'a'.repeat(1001),
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'query_too_long', recovery: { hint: expect.stringMatching(/shorten/i) } },
+        },
+      });
+      const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
+      expect(text).toMatch(/Recovery: .*shorten/i);
+      expect(text).toContain('(reason query_too_long · not retryable)');
+    });
+
+    it('puts no length limit on query, so tools/list is unchanged', () => {
+      const query = z.toJSONSchema(resolveNameTool.input).properties?.query;
+      expect(query).not.toHaveProperty('maxLength');
+      expect(query).toMatchObject({ type: 'string', minLength: 1 });
+      expect(resolveNameTool.input.parse({ query: 'a'.repeat(5000) }).query).toHaveLength(5000);
     });
   });
 
@@ -533,6 +581,34 @@ describe('resolveNameTool', () => {
       const output = text({ results: [{ ...harvard, display_name: null }] });
       expect(output).toContain('(untitled)');
       expect(output).not.toContain('null');
+    });
+
+    it('keeps a provider name and hint literal inside the bold wrapper (gh #76)', () => {
+      const output = text({
+        results: [
+          {
+            id: 'https://openalex.org/S1',
+            display_name: '**Bold** &constructor; <genus> `x` [a](b)',
+            entity_type: 'source',
+            external_id: 'https://doi.org/10.1000/a_b_',
+            cited_by_count: 1,
+            works_count: 1,
+            hint: 'Pub <genus> &lt; _x_ 5~10',
+          },
+          { ...harvard, display_name: 'Fish <Actinopterygii>' },
+        ],
+      });
+
+      const allowed = new Set(['paragraph', 'text', 'strong', 'link']);
+      expect(nodeTypes(output).filter((t) => !allowed.has(t))).toEqual([]);
+      const rendered = renderedText(output);
+      expect(rendered).toContain('**Bold** &constructor; <genus> `x` [a](b) (source)');
+      expect(rendered).toContain(
+        'https://openalex.org/S1 | https://doi.org/10.1000/a_b_ | 1 citations | 1 works | Pub <genus> &lt; _x_ 5~10',
+      );
+      expect(rendered).toContain('Fish <Actinopterygii> (institution)');
+      // The identifier line reads byte-identical in the raw Markdown.
+      expect(output).toContain('https://openalex.org/S1 | https://doi.org/10.1000/a_b_ |');
     });
   });
 });

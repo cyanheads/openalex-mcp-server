@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
@@ -95,9 +96,9 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     {
       reason: 'upstream_ungroupable_group_by',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'group_by targets a raw date, float, or *.search field OpenAlex cannot aggregate (HTTP 400).',
+      when: 'group_by targets a field OpenAlex cannot aggregate — a raw date, a decimal score, a *.search operator, a field such as display_name, doi, or referenced_works, or a concept key on authors, which OpenAlex reports as an invalid OpenAlex ID (HTTP 400).',
       recovery:
-        'Group by a categorical or year field (e.g. publication_year, type, oa_status, or an integer count field) — raw date fields and *.search operators cannot be grouped. Call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+        'Group by a field OpenAlex can aggregate, such as publication_year, type, or oa_status — call openalex_describe_fields(entity_type, "group_by") for the full groupable set of this entity type.',
       thrownBy: 'service',
     },
     {
@@ -133,7 +134,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .min(1)
       .describe(
-        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — check entity docs if unsure.',
+        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
       ),
     filters: z
       .record(z.string(), z.string())
@@ -145,7 +146,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .boolean()
       .default(false)
       .describe(
-        'Include a group for entities with no value for the grouped field. Hidden by default.',
+        'Add a group for entities with no value for the grouped field. Hidden by default. That group carries `is_unknown: true`; OpenAlex keys it -111 or -111.0 on numeric fields, "unknown" on text fields and under order "key", and an ID ending in /unknown on ID fields — a sentinel, not a measured value. The key is not a filter value: passing -111 as a filter matches a numeric range, not the entities with no value. Boolean fields have no separate group — a missing value counts as false.',
       ),
     per_page: z
       .number()
@@ -185,9 +186,21 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .array(
         z
           .object({
-            key: z.string().describe('Group key (OpenAlex ID or raw value).'),
-            key_display_name: z.string().describe('Human-readable group label.'),
+            key: z
+              .string()
+              .describe('Group key (OpenAlex ID or raw value), exactly as OpenAlex returns it.'),
+            key_display_name: z
+              .string()
+              .describe(
+                'Human-readable group label as plain text, with HTML entities decoded and markup removed.',
+              ),
             count: z.number().describe('Number of entities in this group.'),
+            is_unknown: z
+              .literal(true)
+              .optional()
+              .describe(
+                'Present only on the group include_unknown adds for entities with no value; its key is an OpenAlex sentinel (-111, -111.0, unknown, or an ID ending in /unknown), not a measured value.',
+              ),
           })
           .describe('A single aggregation group with its key, display label, and entity count.'),
       )
@@ -320,17 +333,17 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     }
 
     // Time-series groupings are returned upstream in count-desc — useful for "top N years"
-    // but jarring when reading a trend. Only the rendered text is reordered;
-    // structuredContent stays in upstream order for callers that want it.
-    const renderOrder = isTimeSeriesGrouping(result.groups)
-      ? [...result.groups].sort((a, b) => a.key.localeCompare(b.key))
+    // but jarring when reading a trend. Only the rendered text is reordered, with the
+    // unknown bucket after the last period; structuredContent stays in upstream order.
+    const known = result.groups.filter((g) => !g.is_unknown);
+    const renderOrder = isTimeSeriesGrouping(known)
+      ? [
+          ...known.sort((a, b) => a.key.localeCompare(b.key)),
+          ...result.groups.filter((g) => g.is_unknown),
+        ]
       : result.groups;
 
-    const lines = renderOrder.map((g) => {
-      const label =
-        g.key === g.key_display_name ? g.key_display_name : `${g.key_display_name} (${g.key})`;
-      return `${label}: ${g.count}`;
-    });
+    const lines = renderOrder.map((g) => `${renderGroupLabel(g)}: ${g.count}`);
     const footer = result.meta.next_cursor
       ? `\n\n*More groups available — next_cursor: \`${result.meta.next_cursor}\`*`
       : '';
@@ -347,6 +360,26 @@ const YEAR_OR_DATE_PATTERN = /^\d{4}(-\d{2}-\d{2})?$/;
 
 function isTimeSeriesGrouping(groups: ReadonlyArray<{ key: string }>): boolean {
   return groups.length > 1 && groups.every((g) => YEAR_OR_DATE_PATTERN.test(g.key));
+}
+
+type Group = { key: string; key_display_name: string; is_unknown?: true | undefined };
+
+/**
+ * The label a group line opens with. The unknown bucket is named as such — its key is a
+ * sentinel, and `-111.0: 48777` reads as a measured value. A label that begins the line is
+ * escaped for that position; the key is upstream's own and stays byte-identical unless it
+ * carries Markdown syntax.
+ */
+function renderGroupLabel(g: Group): string {
+  const key = escapeMarkdown(g.key);
+  if (g.is_unknown) {
+    const redundant =
+      g.key_display_name === g.key || g.key_display_name.toLowerCase() === 'unknown';
+    const label = redundant ? '' : `, label ${escapeMarkdown(g.key_display_name)}`;
+    return `unknown (no value; key ${key}${label})`;
+  }
+  const display = escapeMarkdown(g.key_display_name, 'line-start');
+  return g.key === g.key_display_name ? display : `${display} (${key})`;
 }
 
 function buildAnalyzeEcho(input: {

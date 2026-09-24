@@ -5,7 +5,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SELECT } from '@/services/openalex/types.js';
 
@@ -959,6 +959,401 @@ describe('OpenAlexService', () => {
       );
       expect(result.groups[0]?.key_display_name).toBe('University & Research Inst');
     });
+
+    // Characterization — behavior #2 established that the fuller decoder must keep.
+
+    it('decodes a legacy named entity missing its semicolon (live sources S2765019955)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'S2765019955', display_name: 'Head &amp Neck' }],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search({ entityType: 'sources' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('Head & Neck');
+    });
+
+    it('decodes in a single pass — a double-encoded entity keeps one level', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'W1', display_name: 'double &amp;lt; stays &amp;#38;' }],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('double &lt; stays &#38;');
+    });
+
+    it('decodes an encoded comparison and leaves a literal one alone', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            meta: { count: 1, per_page: 1 },
+            results: [{ id: 'W1', display_name: 'A &lt; B and A < B' }],
+          }),
+          { status: 200 },
+        ),
+      );
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      expect(result.results[0]?.display_name).toBe('A < B and A < B');
+    });
+  });
+
+  // --- Provider text normalization: full entity table, markup (gh #76) ---
+
+  describe('provider text normalization (gh #76)', () => {
+    function respondWith(body: unknown) {
+      vi.mocked(globalThis.fetch).mockImplementation(() =>
+        Promise.resolve(new Response(JSON.stringify(body), { status: 200 })),
+      );
+    }
+
+    async function searchOne(record: Record<string, unknown>) {
+      respondWith({ meta: { count: 1, per_page: 1 }, results: [{ id: 'W1', ...record }] });
+      const service = await getService();
+      const result = await service.search({ entityType: 'works' }, createMockContext());
+      return result.results[0] as Record<string, unknown>;
+    }
+
+    it.each([
+      ['&cacute;', 'ć'],
+      ['&lstrok;', 'ł'],
+      ['&alpha;', 'α'],
+      ['&Alpha;', 'Α'],
+      ['&le;', '≤'],
+      ['&times;', '×'],
+      ['&frac12;', '½'],
+      ['&sup2;', '²'],
+      ['&NotNestedGreaterGreater;', '⪢̸'],
+    ])('decodes the WHATWG named reference %s', async (entity, decoded) => {
+      const record = await searchOne({ display_name: `x ${entity} y` });
+      expect(record.display_name).toBe(`x ${decoded} y`);
+    });
+
+    // Live titles carry these recased by an upper- or title-cased source (W4313549949, W4210800286).
+    it.each([
+      ['&NBSP;', ' '],
+      ['&Nbsp;', ' '],
+      ['&Quot;', '"'],
+      ['&Amp;', '&'],
+      ['&APOS;', "'"],
+      ['&Lt;', '≪'],
+    ])(
+      'decodes the recased reference %s by its own table entry, else its lowercase name',
+      async (entity, decoded) => {
+        const record = await searchOne({ display_name: `x ${entity} y` });
+        expect(record.display_name).toBe(`x ${decoded} y`);
+      },
+    );
+
+    it('decodes the live author name W4407736232 carries', async () => {
+      const record = await searchOne({
+        display_name: 'Test',
+        authorships: [{ raw_author_name: 'Radovi&cacute; Vesela' }],
+      });
+      expect((record.authorships as { raw_author_name: string }[])[0]?.raw_author_name).toBe(
+        'Radović Vesela',
+      );
+    });
+
+    it.each([
+      '&constructor;',
+      '&toString;',
+      '&__proto__;',
+      '&hasOwnProperty;',
+      '&valueOf;',
+      '&madeupentity;',
+      '&constructor',
+    ])('leaves the non-entity %s literal instead of reading Object.prototype', async (text) => {
+      const record = await searchOne({ display_name: `Proto ${text} end` });
+      expect(record.display_name).toBe(`Proto ${text} end`);
+    });
+
+    it('leaves a legacy name followed by = or an alphanumeric literal (URL query strings)', async () => {
+      const url = 'http://e.x/F?func=service&copy=1&lang=de&not=2&notit;&ampx&sup23';
+      const record = await searchOne({
+        display_name: 'Test',
+        primary_location: { landing_page_url: url },
+      });
+      expect((record.primary_location as { landing_page_url: string }).landing_page_url).toBe(url);
+    });
+
+    it('decodes entities before handling tags, so an encoded tag unwraps (W4382882763)', async () => {
+      const record = await searchOne({
+        display_name: 'Test',
+        primary_location: {
+          raw_source_name: 'Revision of the Genus &lt;i&gt;Urosigalphus&lt;/i&gt; Ashmead',
+        },
+      });
+      expect((record.primary_location as { raw_source_name: string }).raw_source_name).toBe(
+        'Revision of the Genus Urosigalphus Ashmead',
+      );
+    });
+
+    it('removes HTML comments from a title and a reconstructed abstract (W2607219574)', async () => {
+      const comment = '<!-- No EquationSource Format="TEX", only image -->';
+      const record = await searchOne({
+        display_name: `Invariant approximations, generalized "Equation missing" ${comment}-contractions`,
+        abstract_inverted_index: {
+          We: [0],
+          prove: [1],
+          '<!--': [2],
+          No: [3],
+          EquationSource: [4],
+          'Format="TEX",': [5],
+          only: [6],
+          image: [7],
+          '-->': [8],
+          'results.': [9],
+        },
+      });
+      expect(record.display_name).toBe(
+        'Invariant approximations, generalized "Equation missing" -contractions',
+      );
+      expect(record.abstract).toBe('We prove  results.');
+    });
+
+    it('unwraps inline-formula/tex-math markup in an abstract (W7114890785)', async () => {
+      const record = await searchOne({
+        display_name: 'Test',
+        abstract_inverted_index: {
+          the: [0],
+          '<inline-formula': [1],
+          'xmlns:mml="http://www.w3.org/1998/Math/MathML"': [2],
+          'xmlns:xlink="http://www.w3.org/1999/xlink"><tex-math': [3],
+          'notation="LaTeX">$\\bf': [4],
+          '{B\\times': [5],
+          '\\tau': [6],
+          '_{c}}$</tex-math></inline-formula>': [7],
+          product: [8],
+        },
+      });
+      expect(record.abstract).toBe('the $\\bf {B\\times \\tau _{c}}$ product');
+    });
+
+    it.each([
+      ['Fish <Actinopterygii>'],
+      ['Pinus <genus>'],
+      ['redshift 1.7<z<3'],
+      ['indices i1<i2<i3'],
+      ['A < B'],
+      ['https://doi.org/10.1002/(sici)1097-4636(199604)30:4<521::aid-jbm11>3.0.co;2-u'],
+      ['<notatag> <i2> <em'],
+    ])('keeps non-allowlisted angle-bracket text literal: %s', async (text) => {
+      const record = await searchOne({ display_name: text });
+      expect(record.display_name).toBe(text);
+    });
+
+    it('unwraps allowlisted inline markup, JATS, and MathML', async () => {
+      const record = await searchOne({
+        display_name:
+          '<i>E. coli</i> <B>bold</B> <jats:italic>x</jats:italic> <span class="a">s</span> <mml:math><mml:mi>y</mml:mi></mml:math> <sc>Sc</sc>',
+      });
+      expect(record.display_name).toBe('E. coli bold x s y Sc');
+    });
+
+    it('turns block elements into paragraph breaks and sub/sup into TeX-style marks', async () => {
+      const record = await searchOne({
+        display_name: 'Test',
+        abstract_inverted_index: {
+          '<jats:p>First': [0],
+          'H<sub>2</sub>O': [1],
+          '10<sup>-3</sup>.</jats:p><jats:p>Second.<br/>Third.</jats:p>': [2],
+        },
+      });
+      expect(record.abstract).toBe('First H_{2}O 10^{-3}.\n\nSecond.\n\nThird.');
+    });
+
+    it('strips tags to a fixed point, so no allowlisted tag re-forms', async () => {
+      const record = await searchOne({ display_name: 'a <<i>i>b<<<b>b>b> c <!<!---->-- x --> d' });
+      expect(record.display_name).toBe('a b c  d');
+      expect(String(record.display_name)).not.toMatch(/<(?:i|b)>/);
+    });
+
+    it('normalizes a value several levels down inside arrays of objects', async () => {
+      const record = await searchOne({
+        display_name: 'Test',
+        authorships: [
+          { author: { display_name: 'First' } },
+          {
+            institutions: [
+              { display_name: 'Inst' },
+              {
+                lineage: [
+                  { display_name: '&lt;b&gt;Deep&lt;/b&gt; &amp; &alpha;-Lab &constructor;' },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+      const authorships = record.authorships as {
+        institutions?: { lineage?: { display_name: string }[] }[];
+      }[];
+      expect(authorships[1]?.institutions?.[1]?.lineage?.[0]?.display_name).toBe(
+        'Deep & α-Lab &constructor;',
+      );
+    });
+
+    it('keeps empty strings, numbers, and booleans as they are', async () => {
+      const record = await searchOne({
+        display_name: '',
+        cited_by_count: 0,
+        is_oa: false,
+        abstract_inverted_index: {},
+      });
+      expect(record).toMatchObject({
+        display_name: '',
+        cited_by_count: 0,
+        is_oa: false,
+        abstract: '',
+      });
+    });
+
+    it('keeps a null display_name null on a sparse record (gh #51)', async () => {
+      const record = await searchOne({ display_name: null, type: 'paratext' });
+      expect(record.display_name).toBeNull();
+      expect(record.type).toBe('paratext');
+    });
+
+    it('normalizes an autocomplete match in one pass', async () => {
+      respondWith({
+        results: [
+          {
+            id: 'https://openalex.org/S1',
+            display_name: '**Bold** &constructor; &frac12;',
+            entity_type: 'source',
+            cited_by_count: 1,
+            works_count: 1,
+            external_id: null,
+            hint: 'Pub &lt;i&gt;x&lt;/i&gt; &amp;lt;',
+          },
+        ],
+      });
+      const service = await getService();
+      const result = await service.autocomplete(
+        { entityType: 'sources', query: 'bold' },
+        createMockContext(),
+      );
+      expect(result.results[0]).toMatchObject({
+        display_name: '**Bold** &constructor; ½',
+        hint: 'Pub x &lt;',
+      });
+    });
+
+    it('normalizes the identifier path exactly once (resolveIdentifier reuses search)', async () => {
+      respondWith({
+        id: 'https://openalex.org/A1',
+        display_name: 'Radovi&cacute; &amp;lt;V&amp;gt;',
+        last_known_institutions: [{ display_name: '&lt;i&gt;Inst&lt;/i&gt; &amp;amp; Co' }],
+      });
+      const service = await getService();
+      const result = await service.resolveIdentifier(
+        { entityType: 'authors', id: 'A1', scheme: 'openalex' },
+        createMockContext(),
+      );
+      expect(result.results[0]).toMatchObject({
+        display_name: 'Radović &lt;V&gt;',
+        hint: 'Inst &amp; Co',
+      });
+    });
+
+    it('normalizes analyze labels but keeps the group key byte-identical to upstream', async () => {
+      respondWith({
+        meta: { count: 3 },
+        group_by: [
+          {
+            key: 'Law &amp; Society',
+            key_display_name: '# Journal &constructor; <i>Ann</i> &frac12;',
+            count: 2,
+          },
+          { key: 'https://openalex.org/S2', key_display_name: '&lt;genus&gt; source', count: 1 },
+        ],
+      });
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'primary_location.source.id' },
+        createMockContext(),
+      );
+      expect(result.groups).toEqual([
+        {
+          key: 'Law &amp; Society',
+          key_display_name: '# Journal &constructor; Ann ½',
+          count: 2,
+        },
+        { key: 'https://openalex.org/S2', key_display_name: '<genus> source', count: 1 },
+      ]);
+    });
+  });
+
+  // --- Unknown group_by bucket (gh #75) ---
+
+  describe('unknown group_by bucket (gh #75)', () => {
+    function respondWithGroups(groups: { key: string; key_display_name: string; count: number }[]) {
+      vi.mocked(globalThis.fetch).mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ meta: { count: 100 }, group_by: groups }), {
+            status: 200,
+          }),
+        ),
+      );
+    }
+
+    it.each([
+      ['apc_paid.value_usd', '-111.0', '-111.0'],
+      ['apc_list.value_usd', '-111', '-111'],
+      ['apc_paid.value_usd (order: key)', 'unknown', 'unknown'],
+      ['primary_topic.subfield.id', 'https://openalex.org/subfields/unknown', 'unknown'],
+    ])('flags the %s bucket keyed %s with is_unknown', async (_field, key, display) => {
+      respondWithGroups([
+        { key, key_display_name: display, count: 48777 },
+        { key: '0.0', key_display_name: '0.0', count: 12 },
+      ]);
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'apc_paid.value_usd', includeUnknown: true },
+        createMockContext(),
+      );
+      expect(result.groups).toEqual([
+        { key, key_display_name: display, count: 48777, is_unknown: true },
+        { key: '0.0', key_display_name: '0.0', count: 12 },
+      ]);
+    });
+
+    it('never flags a group when include_unknown is off', async () => {
+      respondWithGroups([
+        { key: '-111', key_display_name: '-111', count: 5 },
+        { key: 'unknown', key_display_name: 'unknown', count: 3 },
+      ]);
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'publication_year', includeUnknown: false },
+        createMockContext(),
+      );
+      expect(result.groups.every((g) => !('is_unknown' in g))).toBe(true);
+    });
+
+    it('flags nothing on a page with no unknown bucket', async () => {
+      respondWithGroups([
+        { key: '2024', key_display_name: '2024', count: 5 },
+        { key: '2023', key_display_name: '2023', count: 3 },
+      ]);
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'publication_year', includeUnknown: true },
+        createMockContext(),
+      );
+      expect(result.groups.every((g) => !('is_unknown' in g))).toBe(true);
+    });
   });
 
   // --- Select translation (abstract → abstract_inverted_index, year → publication_year, …) ---
@@ -1405,6 +1800,41 @@ describe('OpenAlexService', () => {
       expect(head.searchParams.get('cursor')).toBe('*');
       expect(head.searchParams.has('seed')).toBe(false);
     });
+
+    /**
+     * The tool rejects `sample` under semantic mode and alongside `sort` before the service is
+     * reached; sampling under the two remaining modes keeps its population lookup. (gh #83, #85)
+     */
+    it.each([
+      ['keyword', 'keyword', 'search'],
+      ['exact', 'exact', 'search.exact'],
+    ] as const)(
+      'keeps the population lookup for a %s-mode sample',
+      async (_label, searchMode, searchKey) => {
+        vi.mocked(globalThis.fetch).mockImplementation((input) => {
+          const url = new URL(input as string);
+          const count = url.searchParams.has('sample') ? 5 : 147_663;
+          return Promise.resolve(
+            new Response(JSON.stringify({ meta: { count, per_page: count }, results: [] }), {
+              status: 200,
+            }),
+          );
+        });
+        const service = await getService();
+        const result = await service.search(
+          { entityType: 'works', query: 'groundwater recharge', searchMode, sample: 5, seed: '1' },
+          createMockContext(),
+        );
+
+        expect(result.meta.count).toBe(147_663);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+        const head = populationUrl();
+        expect(head.searchParams.get(searchKey)).toBe('groundwater recharge');
+        expect(head.searchParams.get('cursor')).toBe('*');
+        expect(head.searchParams.has('sample')).toBe(false);
+        expect(sampleUrl().searchParams.get(searchKey)).toBe('groundwater recharge');
+      },
+    );
   });
 
   // --- Required-field injection (regression: gh #11) ---
@@ -2300,6 +2730,191 @@ describe('OpenAlexService', () => {
       await service.autocomplete({ query: 'harvard' }, createMockContext());
       expect(lastFetchUrl().pathname).toBe('/autocomplete');
     });
+
+    /**
+     * `/autocomplete/{entity_type}` answers a `q` over 1,000 Unicode code points (holding an
+     * ASCII letter) with an HTML 500 on every attempt; cross-entity `/autocomplete` never does.
+     * These run through the real `fetchWithTimeout` → `withRetry` → classification path, so the
+     * attempt count is the retry loop's own. (gh #81)
+     */
+    describe('over-long query 500 (gh #81)', () => {
+      /** The body OpenAlex returned for a 1,001-character `q` on /autocomplete/authors. */
+      const UPSTREAM_500_HTML =
+        '<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.</p>\n';
+
+      const RECOVERY = 'DISTINCTIVE_SHORTEN_HINT shorten the name and retry the request.';
+
+      function contractCtx() {
+        return createMockContext({
+          errors: [
+            {
+              reason: 'query_too_long',
+              code: JsonRpcErrorCode.InvalidParams,
+              when: 'the autocomplete query is over the upstream length bound',
+              recovery: RECOVERY,
+            },
+            {
+              reason: 'upstream_unavailable',
+              code: JsonRpcErrorCode.ServiceUnavailable,
+              when: 'OpenAlex is unavailable',
+              retryable: true,
+              recovery: 'DISTINCTIVE_UNAVAILABLE_HINT wait and retry.',
+            },
+          ],
+        });
+      }
+
+      function mockStatus(status: number): void {
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(
+            new Response(UPSTREAM_500_HTML, {
+              status,
+              statusText: status === 500 ? 'Internal Server Error' : 'Service Unavailable',
+              headers: { 'Content-Type': 'text/html; charset=utf-8' },
+            }),
+          ),
+        );
+      }
+
+      /** Run one autocomplete under fake timers so a retry loop can't stall the test. */
+      async function settle(params: { entityType?: 'authors' | 'works'; query: string }) {
+        vi.useFakeTimers();
+        const service = await getService();
+        const outcome = service.autocomplete(params, contractCtx()).then(
+          () => {
+            throw new Error('expected autocomplete to reject');
+          },
+          (error: unknown) =>
+            error as { code: number; message: string; data: Record<string, unknown> },
+        );
+        await vi.runAllTimersAsync();
+        return outcome;
+      }
+
+      it.each([
+        ['1,001 ASCII letters', 'a'.repeat(1001)],
+        ['1,001 code points that are 1,402 UTF-16 units', `${'a'.repeat(600)}${'😀'.repeat(401)}`],
+        ['a padded name over the bound', `Albert Einstein ${'д'.repeat(990)}`],
+      ])('classifies a typed 500 on %s as query_too_long after one attempt', async (_l, query) => {
+        mockStatus(500);
+
+        const error = await settle({ entityType: 'authors', query });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'query_too_long',
+            retryable: false,
+            recovery: { hint: RECOVERY },
+            path: '/autocomplete/authors',
+            statusCode: 500,
+          },
+        });
+        expect(error.message).toMatch(/1,000 characters/);
+        expect(error.message).not.toMatch(/failed after/);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['exactly 1,000 code points', 'authors', 'a'.repeat(1000)],
+        [
+          '801 code points that are 1,002 UTF-16 units',
+          'authors',
+          `${'a'.repeat(600)}${'😀'.repeat(201)}`,
+        ],
+        ['a short name', 'works', 'groundwater'],
+      ] as const)(
+        'keeps a typed 500 on %s as retried upstream_unavailable',
+        async (_label, entityType, query) => {
+          mockStatus(500);
+
+          const error = await settle({ entityType, query });
+
+          expect(error).toMatchObject({
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            data: { reason: 'upstream_unavailable', statusCode: 500 },
+          });
+          expect(error.data.retryable).toBeUndefined();
+          expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+        },
+      );
+
+      it('keeps a cross-entity 500 on an over-long query as retried upstream_unavailable', async () => {
+        mockStatus(500);
+
+        const error = await settle({ query: 'a'.repeat(1001) });
+
+        expect(error).toMatchObject({ data: { reason: 'upstream_unavailable' } });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('keeps a 503 on an over-long typed query as retried upstream_unavailable', async () => {
+        mockStatus(503);
+
+        const error = await settle({ entityType: 'authors', query: 'a'.repeat(1001) });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'upstream_unavailable', statusCode: 503 },
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('sends an over-long query upstream unchanged and returns what OpenAlex answers', async () => {
+        // No local bound: a letter-free typed query and any cross-entity query over 1,000 code
+        // points return 200 upstream today, and must keep doing so.
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(new Response(JSON.stringify({ results: [] }), { status: 200 })),
+        );
+        const service = await getService();
+        const digits = '1'.repeat(1001);
+
+        const typed = await service.autocomplete(
+          { entityType: 'authors', query: digits },
+          contractCtx(),
+        );
+        expect(typed.results).toEqual([]);
+        expect(lastFetchUrl().searchParams.get('q')).toBe(digits);
+
+        const crossEntity = await service.autocomplete({ query: 'a'.repeat(5000) }, contractCtx());
+        expect(crossEntity.results).toEqual([]);
+        expect(lastFetchUrl().searchParams.get('q')).toHaveLength(5000);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+      });
+
+      it('carries query_too_long and its recovery on both tool surfaces', async () => {
+        mockStatus(500);
+        await getService();
+        const { resolveNameTool } = await import(
+          '@/mcp-server/tools/definitions/resolve-name.tool.js'
+        );
+
+        const result = await runToolContract(resolveNameTool, {
+          entity_type: 'authors',
+          query: 'a'.repeat(1001),
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.InvalidParams,
+            data: {
+              reason: 'query_too_long',
+              retryable: false,
+              recovery: { hint: expect.stringMatching(/shorten/i) },
+            },
+          },
+        });
+        const text = (result.content ?? [])
+          .map((block) => ('text' in block ? block.text : ''))
+          .join('\n');
+        expect(text).toMatch(/Recovery: .*shorten/i);
+        expect(text).toContain('query_too_long');
+        expect(text).toContain('not retryable');
+        expect(text).not.toMatch(/wait and retry/i);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   // --- Error handling ---
@@ -2379,6 +2994,19 @@ describe('OpenAlexService', () => {
           code: JsonRpcErrorCode.InvalidParams,
           data: { reason: 'upstream_ungroupable_group_by' },
         });
+      });
+
+      it('maps a by-name group_by refusal to upstream_ungroupable_group_by (gh #86)', async () => {
+        // Verbatim upstream body for works group_by=display_name.
+        mock400('Cannot group by display_name.');
+        const service = await getService();
+        await expect(
+          service.analyze({ entityType: 'works', groupBy: 'display_name' }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_ungroupable_group_by' },
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
       });
 
       it('maps a non-ID filter value 400 to upstream_invalid_id_value (gh #49)', async () => {
@@ -2538,6 +3166,195 @@ describe('OpenAlexService', () => {
           },
         });
       });
+    });
+
+    /**
+     * Two group_by rejections arrive without "Cannot group by": the concept keys on authors
+     * come back as an invalid-ID 400 naming a concept ID the caller never sent, and
+     * `referenced_works` as "Group by … is not supported at this time." An invalid-ID 400 whose
+     * quoted value sits in the request's `filter` stays an invalid-ID failure — upstream
+     * validates the filter before group_by. Bodies are verbatim upstream responses. These run
+     * through the real `fetchWithTimeout` → classification path. (gh #87)
+     */
+    describe('group_by rejections outside "Cannot group by" (gh #87)', () => {
+      function mock400(message: string): void {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ error: 'Invalid query parameters error.', message }), {
+            status: 400,
+            statusText: 'Bad Request',
+          }),
+        );
+      }
+
+      async function analyzeReason(params: {
+        entityType: 'authors' | 'works';
+        groupBy: string;
+        filters?: Record<string, string>;
+      }): Promise<unknown> {
+        const service = await getService();
+        const error = await service.analyze(params, createMockContext()).then(
+          () => {
+            throw new Error('expected analyze to reject');
+          },
+          (e: unknown) => e as { code: number; data: { reason?: unknown } },
+        );
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+        return error.data.reason;
+      }
+
+      function toolText(result: { content?: { type: string; text?: string }[] }): string {
+        return (result.content ?? []).map((block) => block.text ?? '').join('\n');
+      }
+
+      it.each([
+        [
+          'a name in an ID filter',
+          'works',
+          'publication_year',
+          { 'authorships.author.id': 'Albert Einstein' },
+          "'Albert' is not a valid OpenAlex ID.",
+        ],
+        [
+          'a URL-form ID filter with a non-ID tail',
+          'works',
+          'publication_year',
+          { 'authorships.author.id': 'https://openalex.org/Zzz' },
+          "'Zzz' is not a valid OpenAlex ID.",
+        ],
+        [
+          'a bad ID filter beside an ungroupable concept group_by',
+          'authors',
+          'x_concepts.id',
+          { 'last_known_institutions.id': 'harvard' },
+          "'harvard' is not a valid OpenAlex ID.",
+        ],
+      ] as const)(
+        'keeps an invalid-ID 400 on %s as upstream_invalid_id_value',
+        async (_label, entityType, groupBy, filters, message) => {
+          mock400(message);
+          await expect(analyzeReason({ entityType, groupBy, filters })).resolves.toBe(
+            'upstream_invalid_id_value',
+          );
+        },
+      );
+
+      it('keeps "Cannot group by" on a filtered request as upstream_ungroupable_group_by', async () => {
+        mock400('Cannot group by display_name.');
+        await expect(
+          analyzeReason({
+            entityType: 'works',
+            groupBy: 'display_name',
+            filters: { publication_year: '2024' },
+          }),
+        ).resolves.toBe('upstream_ungroupable_group_by');
+      });
+
+      it('keeps a filtered invalid-ID 400 on upstream_invalid_id_value on both tool surfaces', async () => {
+        mock400("'Albert' is not a valid OpenAlex ID.");
+        await getService();
+        const { analyzeTrendsTool } = await import(
+          '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+        );
+
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: 'publication_year',
+          filters: { 'authorships.author.id': 'Albert Einstein' },
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.InvalidParams,
+            data: {
+              reason: 'upstream_invalid_id_value',
+              recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+            },
+          },
+        });
+        const text = toolText(result);
+        expect(text).toMatch(/Recovery: .*openalex_resolve_name/);
+        expect(text).toContain('upstream_invalid_id_value');
+      });
+
+      it.each([
+        ['concepts.id', "'41008148' is not a valid OpenAlex ID."],
+        ['concept.id', "'41008148' is not a valid OpenAlex ID."],
+        ['x_concepts.id', "'41008148' is not a valid OpenAlex ID."],
+      ])(
+        'maps an unfiltered authors group_by=%s invalid-ID 400 to upstream_ungroupable_group_by',
+        async (groupBy, message) => {
+          mock400(message);
+          await expect(analyzeReason({ entityType: 'authors', groupBy })).resolves.toBe(
+            'upstream_ungroupable_group_by',
+          );
+        },
+      );
+
+      it('maps a concept group_by invalid-ID 400 whose value is not in the filter to upstream_ungroupable_group_by', async () => {
+        // Upstream names a concept ID from its own aggregation, never one the filter carried.
+        mock400("'71924100' is not a valid OpenAlex ID.");
+        await expect(
+          analyzeReason({
+            entityType: 'authors',
+            groupBy: 'concepts.id',
+            filters: { works_count: '>100' },
+          }),
+        ).resolves.toBe('upstream_ungroupable_group_by');
+      });
+
+      it('maps "Group by … is not supported at this time" to upstream_ungroupable_group_by', async () => {
+        mock400('Group by referenced_works is not supported at this time.');
+        await expect(
+          analyzeReason({ entityType: 'works', groupBy: 'referenced_works' }),
+        ).resolves.toBe('upstream_ungroupable_group_by');
+      });
+
+      it.each([
+        [
+          'authors grouped by concepts.id',
+          { entity_type: 'authors', group_by: 'concepts.id', per_page: 3 },
+          "'41008148' is not a valid OpenAlex ID.",
+        ],
+        [
+          'works grouped by referenced_works',
+          { entity_type: 'works', group_by: 'referenced_works' },
+          'Group by referenced_works is not supported at this time.',
+        ],
+      ] as const)(
+        'carries upstream_ungroupable_group_by on both tool surfaces for %s',
+        async (_label, input, message) => {
+          mock400(message);
+          await getService();
+          const { analyzeTrendsTool } = await import(
+            '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+          );
+
+          const result = await runToolContract(analyzeTrendsTool, input);
+
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({
+            error: {
+              code: JsonRpcErrorCode.InvalidParams,
+              message,
+              data: {
+                reason: 'upstream_ungroupable_group_by',
+                recovery: {
+                  hint: expect.stringMatching(
+                    /openalex_describe_fields\(entity_type, "group_by"\)/,
+                  ),
+                },
+              },
+            },
+          });
+          const text = toolText(result);
+          expect(text).toContain(message);
+          expect(text).toMatch(/Recovery: .*openalex_describe_fields/);
+          expect(text).toContain('upstream_ungroupable_group_by');
+          expect(text).not.toMatch(/openalex_resolve_name/);
+        },
+      );
     });
 
     it('surfaces OpenAlex 422 responses as validation errors', async () => {

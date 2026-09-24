@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import {
   invalidParams,
   JsonRpcErrorCode,
@@ -388,6 +389,221 @@ describe('searchEntitiesTool', () => {
     });
   });
 
+  /**
+   * OpenAlex ignores `sample` under `search.semantic` (the ranked page comes back under every
+   * seed) and refuses any `sort` alongside `sample`. Both are settled locally, before the round
+   * trip; an `id` lookup never applies either parameter and keeps passing them through with the
+   * dropped-parameter notice. (gh #83, #85)
+   */
+  describe('sample conflicts (gh #83, #85)', () => {
+    const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+
+    const single: SearchResult = {
+      meta: { count: 1, per_page: 1, next_cursor: null },
+      results: [{ id: 'W2741809807', display_name: 'The state of OA' }],
+    };
+
+    it.each([
+      ['sample alone', { sample: 5 }],
+      ['sample with seed', { sample: 5, seed: '1' }],
+      ['a sample above the semantic per-page cap', { sample: 60 }],
+      ['the largest sample', { sample: 100, seed: 'x' }],
+    ] as const)(
+      'rejects %s under semantic mode on both surfaces with no upstream call',
+      async (_label, extra) => {
+        // A resolved value makes `not.toHaveBeenCalled()` load-bearing: a forwarded call would
+        // succeed rather than fail for some other reason.
+        mockSearch.mockResolvedValue(sampleResult);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          query: 'groundwater recharge',
+          search_mode: 'semantic',
+          select: ['id'],
+          ...extra,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'sample_with_semantic',
+              recovery: { hint: expect.stringMatching(/keyword or exact/i) },
+            },
+          },
+        });
+        const rendered = renderedText(result.content);
+        expect(rendered).toContain('sample_with_semantic');
+        expect(rendered).toMatch(/keyword or exact/i);
+        expect(rendered).toMatch(/page/);
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      [
+        'a keyword query sorted by citations',
+        { query: 'groundwater recharge', sort: 'cited_by_count' },
+      ],
+      ['a relevance sort', { query: 'groundwater recharge', sort: '-relevance_score' }],
+      [
+        'a filter-only listing sorted by date',
+        { filters: { publication_year: '2023' }, sort: 'publication_date' },
+      ],
+      [
+        'an exact query with a multi-key sort',
+        { query: 'aquifer', search_mode: 'exact', sort: '-publication_year,cited_by_count' },
+      ],
+      ['a seeded sample', { query: 'groundwater recharge', seed: '1', sort: '-cited_by_count' }],
+    ] as const)(
+      'rejects sample with sort — %s — on both surfaces with no upstream call',
+      async (_label, extra) => {
+        mockSearch.mockResolvedValue(sampleResult);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          sample: 5,
+          select: ['id'],
+          ...extra,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'sample_with_sort',
+              recovery: { hint: expect.stringMatching(/remove `sort` or remove `sample`/i) },
+            },
+          },
+        });
+        const rendered = renderedText(result.content);
+        expect(rendered).toContain('sample_with_sort');
+        expect(rendered).toMatch(/remove `sort` or remove `sample`/i);
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('keeps page as the reported conflict when semantic sample also pages', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'groundwater',
+        search_mode: 'semantic',
+        sample: 5,
+        page: 2,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'sample_with_page' } },
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['sample and semantic mode', { sample: 5, search_mode: 'semantic', query: 'groundwater' }],
+      ['sample and sort', { sample: 5, sort: 'cited_by_count' }],
+      [
+        'sample, semantic mode, and sort',
+        { sample: 60, search_mode: 'semantic', query: 'x', sort: '-cited_by_count', seed: '1' },
+      ],
+    ] as const)(
+      'still resolves an id lookup carrying %s, naming them in the notice',
+      async (_label, extra) => {
+        mockSearch.mockResolvedValue(single);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W2741809807',
+          ...extra,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(mockSearch).toHaveBeenCalledTimes(1);
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        expect(notice).toMatch(/not applied/i);
+        const rendered = renderedText(result.content);
+        for (const name of Object.keys(extra).filter((key) => key !== 'query')) {
+          expect(notice, `${name} missing from the notice`).toContain(name);
+          expect(rendered, `${name} missing from content[]`).toContain(name);
+        }
+        expect(rendered).toContain('W2741809807');
+      },
+    );
+
+    it.each([
+      ['keyword', 'keyword'],
+      ['exact', 'exact'],
+    ] as const)('forwards a %s-mode sample with no sort to the service', async (_l, searchMode) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'groundwater recharge',
+        search_mode: searchMode,
+        sample: 5,
+        seed: '1',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ searchMode, sample: 5, seed: '1', sort: undefined }),
+        ctx,
+      );
+    });
+
+    it('forwards a sort with no sample to the service', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const ctx = createMockContext();
+      const input = searchEntitiesTool.input.parse({
+        entity_type: 'works',
+        query: 'groundwater recharge',
+        sort: 'cited_by_count',
+      });
+
+      await searchEntitiesTool.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ sort: 'cited_by_count', sample: undefined }),
+        ctx,
+      );
+    });
+
+    it.each(['', '  '])(
+      'treats the blank sort %j from a form client as no sort, which the service never sends',
+      async (sort) => {
+        mockSearch.mockResolvedValue(sampleResult);
+        const ctx = createMockContext();
+        const input = searchEntitiesTool.input.parse({ entity_type: 'works', sample: 5, sort });
+
+        await expect(searchEntitiesTool.handler(input, ctx)).resolves.toBeDefined();
+        expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ sample: 5 }), ctx);
+      },
+    );
+
+    it('declares both reasons as handler-local ValidationErrors', () => {
+      for (const reason of ['sample_with_semantic', 'sample_with_sort']) {
+        const entry = searchEntitiesTool.errors?.find((e) => e.reason === reason);
+        expect(entry, `${reason} missing from the contract`).toBeDefined();
+        expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
+        // Unmarked, so `error-contract-unthrown` keeps checking the handler throws them.
+        expect(entry).not.toHaveProperty('thrownBy');
+      }
+    });
+
+    it('documents the conflicts on the sample and sort descriptions', () => {
+      const sample = searchEntitiesTool.input.shape.sample.description ?? '';
+      const sort = searchEntitiesTool.input.shape.sort.description ?? '';
+      expect(sample).toMatch(/semantic/i);
+      expect(sample).toMatch(/sort/);
+      expect(sort).toMatch(/sample/);
+    });
+  });
+
   describe('enrichment', () => {
     it('populates echo and totalCount on success', async () => {
       mockSearch.mockResolvedValue(sampleResult);
@@ -409,8 +625,8 @@ describe('searchEntitiesTool', () => {
       expect(enrichment.echo).toContain('filters={"is_oa":"true"}');
       expect(enrichment.echo).toContain('sort=-cited_by_count');
       expect(enrichment.echo).toContain('search_mode=semantic');
-      // Semantic responses always disclose that `meta.count` is the candidate ceiling.
-      expect(enrichment.notice).toMatch(/capped candidate set/i);
+      // Semantic responses always disclose that `meta.count` is a candidate count.
+      expect(enrichment.notice).toMatch(/candidate set rather than every match/i);
     });
 
     it('carries the budget reading the service writes through to structuredContent', () => {
@@ -990,7 +1206,7 @@ describe('searchEntitiesTool', () => {
   });
 
   /**
-   * Semantic search ranks a capped candidate set and pages it with `page`; OpenAlex rejects a
+   * Semantic search ranks a candidate set and pages it with `page`; OpenAlex rejects a
    * cursor on a semantic query, and no other mode accepts `page`. Both mismatches are settled
    * locally so neither costs a round trip. (gh #71)
    */
@@ -1116,7 +1332,7 @@ describe('searchEntitiesTool', () => {
       ).toThrow();
     });
 
-    it('discloses the capped candidate count on both surfaces for a semantic response', async () => {
+    it('discloses the candidate count on both surfaces for a semantic response', async () => {
       mockSearch.mockResolvedValue({
         meta: { count: 50, per_page: 3, next_cursor: null },
         results: [{ id: 'W001', display_name: 'Paper Alpha' }],
@@ -1138,10 +1354,59 @@ describe('searchEntitiesTool', () => {
       expect(rendered).toContain('50');
     });
 
+    /**
+     * The candidate count is query-dependent — OpenAlex reports 70 for "groundwater recharge"
+     * and serves candidates 51-55 on page 11 at per_page 5 — so the notice interpolates the real
+     * count and asserts no fixed ceiling of its own. (gh #84)
+     */
+    it('reports a candidate count above 50 without claiming a 50-candidate ceiling', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 70, per_page: 5, next_cursor: null },
+        results: [{ id: 'W2046654411', display_name: 'Groundwater recharge' }],
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'groundwater recharge',
+        search_mode: 'semantic',
+        per_page: 5,
+        page: 11,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { notice?: string; meta: { count: number } };
+      expect(structured.meta.count).toBe(70);
+      const rendered = renderedText(result.content);
+      for (const [surface, text] of [
+        ['structuredContent.notice', structured.notice ?? ''],
+        ['content[]', rendered],
+      ] as const) {
+        expect(text, surface).toMatch(/`meta\.count` \(70\)/);
+        expect(text, surface).toMatch(/candidate/i);
+        expect(text, surface).not.toMatch(/at most 50/i);
+        expect(text, surface).not.toMatch(/\bceiling\b/i);
+      }
+    });
+
+    it('states no fixed semantic candidate ceiling on any definition surface', () => {
+      const schemaText = JSON.stringify([
+        z.toJSONSchema(searchEntitiesTool.input),
+        z.toJSONSchema(searchEntitiesTool.output),
+        z.toJSONSchema(z.object(searchEntitiesTool.enrichment ?? {})),
+        searchEntitiesTool.description,
+      ]);
+      expect(schemaText).not.toMatch(/at most 50 candidates/i);
+      expect(schemaText).not.toMatch(/candidate count — at most/i);
+      expect(schemaText).not.toMatch(/ceil\(50/);
+      expect(schemaText).not.toMatch(/page 17 with per_page=3/);
+      // The per-page bound is real and stays documented.
+      expect(searchEntitiesTool.input.shape.per_page.description ?? '').toMatch(/caps at 50/);
+    });
+
     it.each([
       ['keyword', 'keyword'],
       ['exact', 'exact'],
-    ])('leaves a %s response without a capped-count notice', async (_label, searchMode) => {
+    ])('leaves a %s response without a candidate-count notice', async (_label, searchMode) => {
       mockSearch.mockResolvedValue(sampleResult);
       const ctx = createMockContext();
       const input = searchEntitiesTool.input.parse({
@@ -1201,7 +1466,7 @@ describe('searchEntitiesTool', () => {
       expect(searchEntitiesTool.input.shape.search_mode.description ?? '').toMatch(/page/i);
     });
 
-    it('names the capped candidate total in the meta.count description', () => {
+    it('names the semantic candidate total in the meta.count description', () => {
       expect(searchEntitiesTool.output.shape.meta.shape.count.description ?? '').toMatch(
         /semantic/i,
       );

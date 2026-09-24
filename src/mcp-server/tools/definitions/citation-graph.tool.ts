@@ -225,7 +225,9 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
             'A single OpenAlex work record on the citation graph. Additional fields vary by `select`.',
           ),
       )
-      .describe('Works on the citation graph in this direction.'),
+      .describe(
+        'Works on the citation graph in this direction. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed.',
+      ),
   }),
 
   // Agent-facing context for the success path — the query as parsed (seed + direction),

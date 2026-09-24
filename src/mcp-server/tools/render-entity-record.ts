@@ -6,6 +6,7 @@
  * @module mcp-server/tools/render-entity-record
  */
 
+import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
 import type { EntityRecord } from '@/services/openalex/types.js';
 
 const ACRONYMS = new Set([
@@ -49,6 +50,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * A scalar leaf as Markdown. Strings are provider text and go through `escapeMarkdown`; numbers
+ * and booleans carry no syntax. Every leaf lands mid-line — after a label, a path, or a list
+ * marker — so the inline position applies.
+ */
+function renderScalar(value: Scalar): string {
+  return typeof value === 'string' ? escapeMarkdown(value) : String(value);
+}
+
+function renderScalarList(values: (Scalar | null)[]): string {
+  return values.map((item) => (item === null ? '—' : renderScalar(item))).join(', ');
+}
+
+/**
  * Flatten a value to "path: value" strings, one per scalar leaf. Nested objects use dot
  * notation (`subfield.display_name`); arrays of scalars collapse to a single comma-joined
  * pair (`countries: us, gb`); arrays of objects produce one entry per element with bracket
@@ -57,11 +71,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 function flattenLeaves(value: unknown, prefix = ''): string[] {
   if (value === null || value === undefined) return prefix ? [`${prefix}: —`] : [];
-  if (isScalar(value)) return [prefix ? `${prefix}: ${String(value)}` : String(value)];
+  if (isScalar(value)) return [prefix ? `${prefix}: ${renderScalar(value)}` : renderScalar(value)];
   if (Array.isArray(value)) {
     if (value.length === 0) return [`${prefix || 'value'}: (empty)`];
     if (value.every(isScalarOrNull)) {
-      const joined = value.map((item) => (item === null ? '—' : String(item))).join(', ');
+      const joined = renderScalarList(value);
       return [prefix ? `${prefix}: ${joined}` : joined];
     }
     return value.flatMap((item, i) => flattenLeaves(item, `${prefix}[${i}]`));
@@ -81,12 +95,10 @@ function compactPairs(value: Record<string, unknown>): string {
 function renderField(field: string, value: unknown): string {
   const label = toFieldLabel(field);
   if (value == null) return `**${label}:** —`;
-  if (isScalar(value)) return `**${label}:** ${String(value)}`;
+  if (isScalar(value)) return `**${label}:** ${renderScalar(value)}`;
   if (Array.isArray(value)) {
     if (value.length === 0) return `**${label}:** (empty)`;
-    if (value.every(isScalarOrNull)) {
-      return `**${label}:** ${value.map((item) => (item === null ? '—' : String(item))).join(', ')}`;
-    }
+    if (value.every(isScalarOrNull)) return `**${label}:** ${renderScalarList(value)}`;
     const items = value.map((item, i) =>
       isPlainObject(item)
         ? `- [${i}] ${compactPairs(item)}`
@@ -101,11 +113,16 @@ function renderField(field: string, value: unknown): string {
 /**
  * Render an OpenAlex entity record as markdown lines: a `### display_name` header,
  * the ID, then each remaining field as a labeled line. Caller joins the lines into
- * the final text block.
+ * the final text block. Provider text is escaped for Markdown; field names are OpenAlex
+ * schema keys and render as they are.
  */
 export function renderEntityRecord(record: EntityRecord): string[] {
   const { id, display_name, ...rest } = record;
-  const lines = ['', `### ${display_name || id}`, `**ID:** ${id}`];
+  const lines = [
+    '',
+    `### ${escapeMarkdown(display_name || id, 'heading')}`,
+    `**ID:** ${escapeMarkdown(id)}`,
+  ];
   for (const [field, value] of Object.entries(rest)) {
     lines.push(renderField(field, value));
   }

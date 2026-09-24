@@ -11,6 +11,7 @@ import {
 } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
+import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
 
 const mockAnalyze = vi.fn<() => Promise<AnalyzeResult>>();
 
@@ -448,7 +449,9 @@ describe('analyzeTrendsTool', () => {
         code: JsonRpcErrorCode.InvalidParams,
         data: {
           reason: 'upstream_ungroupable_group_by',
-          recovery: { hint: expect.stringMatching(/categorical or year field/i) },
+          recovery: {
+            hint: expect.stringMatching(/openalex_describe_fields\(entity_type, "group_by"\)/),
+          },
         },
       });
     });
@@ -666,6 +669,197 @@ describe('analyzeTrendsTool', () => {
       });
       expect(output).toContain('nxt-abc');
       expect(output).toContain('200 groups on this page');
+    });
+
+    it('escapes provider labels at the line start so none becomes a Markdown block (gh #76)', () => {
+      const labels = [
+        '# Journal &constructor; *Ann* <genus>',
+        '- Listy Source',
+        '+ Plus Source',
+        '1. Ordered Source',
+        '2) Paren Source',
+        '[ref]: http://x.test',
+        '> Quoted Source',
+        'Fish <Actinopterygii>',
+        '[Ir(tpy)(ppy)H](+) `code` 5~10 ~~x~~ _e_ a\\*b',
+        '    indented',
+      ];
+      const groups = labels.map((label, index) => ({
+        key: `https://openalex.org/S${index}`,
+        key_display_name: label,
+        count: 10 - index,
+      }));
+      const output = text({
+        meta: { count: 100, groups_count: groups.length, next_cursor: null },
+        groups,
+      });
+
+      // Two paragraphs of text; the only links are the GFM autolinks of the URL keys.
+      expect(nodeTypes(output).filter((t) => !['text', 'link'].includes(t))).toEqual([
+        'paragraph',
+        'paragraph',
+      ]);
+      const rendered = renderedText(output);
+      for (const [index, label] of labels.entries()) {
+        expect(rendered).toContain(
+          `${label.trimStart()} (https://openalex.org/S${index}): ${10 - index}`,
+        );
+      }
+    });
+
+    it('renders a URL group key byte-identical', () => {
+      const output = text({
+        meta: { count: 3, groups_count: 1, next_cursor: null },
+        groups: [
+          {
+            key: 'https://openalex.org/subfields/some_field_',
+            key_display_name: 'Some Field',
+            count: 3,
+          },
+        ],
+      });
+      expect(output).toContain('Some Field (https://openalex.org/subfields/some_field_): 3');
+    });
+  });
+
+  describe('unknown bucket (gh #75)', () => {
+    const text = (result: AnalyzeResult) => {
+      const blocks = analyzeTrendsTool.format?.(result) ?? [];
+      return (blocks[0] as { type: 'text'; text: string }).text;
+    };
+
+    it('carries is_unknown through structuredContent and labels the bucket as unknown', async () => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 54351, groups_count: 2, next_cursor: null },
+        groups: [
+          { key: '-111.0', key_display_name: '-111.0', count: 48777, is_unknown: true },
+          { key: '0.0', key_display_name: '0.0', count: 171 },
+        ],
+      });
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'apc_paid.value_usd',
+        include_unknown: true,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as AnalyzeResult).groups).toEqual([
+        { key: '-111.0', key_display_name: '-111.0', count: 48777, is_unknown: true },
+        { key: '0.0', key_display_name: '0.0', count: 171 },
+      ]);
+      const content = (result.content[0] as { text: string }).text;
+      expect(content).toContain('unknown (no value; key -111.0): 48777');
+      expect(content).not.toMatch(/^-111\.0: 48777$/m);
+      expect(content).toContain('0.0: 171');
+    });
+
+    it.each([
+      ['-111', '-111', 'unknown (no value; key -111): 85'],
+      ['unknown', 'unknown', 'unknown (no value; key unknown): 85'],
+      [
+        'https://openalex.org/subfields/unknown',
+        'unknown',
+        'unknown (no value; key https://openalex.org/subfields/unknown): 85',
+      ],
+      ['unknown', 'Not recorded', 'unknown (no value; key unknown, label Not recorded): 85'],
+    ])('labels the %s bucket (display %s) as unknown', (key, display, line) => {
+      const output = text({
+        meta: { count: 100, groups_count: 1, next_cursor: null },
+        groups: [{ key, key_display_name: display, count: 85, is_unknown: true }],
+      });
+      expect(output).toContain(line);
+    });
+
+    it('renders a year trend ascending with the unknown bucket last, upstream order kept', async () => {
+      const groups = [
+        { key: '2024', key_display_name: '2024', count: 300 },
+        { key: '-111', key_display_name: '-111', count: 85, is_unknown: true as const },
+        { key: '2022', key_display_name: '2022', count: 200 },
+        { key: '2023', key_display_name: '2023', count: 250 },
+      ];
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 835, groups_count: 4, next_cursor: null },
+        groups,
+      });
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'publication_year',
+        include_unknown: true,
+      });
+
+      expect((result.structuredContent as AnalyzeResult).groups.map((g) => g.key)).toEqual([
+        '2024',
+        '-111',
+        '2022',
+        '2023',
+      ]);
+      const content = (result.content[0] as { text: string }).text;
+      const order = ['2022: 200', '2023: 250', '2024: 300', 'unknown (no value; key -111): 85'].map(
+        (line) => content.indexOf(line),
+      );
+      expect(order.every((position) => position >= 0)).toBe(true);
+      expect([...order].sort((a, b) => a - b)).toEqual(order);
+    });
+
+    it('labels the unknown bucket on a full key-order page that continues by cursor', async () => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 54351, groups_count: 2, next_cursor: 'next-page' },
+        groups: [
+          { key: '0.0', key_display_name: '0.0', count: 62 },
+          { key: 'unknown', key_display_name: 'unknown', count: 48777, is_unknown: true },
+        ],
+      });
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'apc_paid.value_usd',
+        include_unknown: true,
+        order: 'key',
+        per_page: 2,
+      });
+      const content = result.content.map((b) => (b as { text: string }).text).join('\n');
+      expect(content).toContain('0.0: 62\nunknown (no value; key unknown): 48777');
+      expect((result.structuredContent as { notice?: string }).notice).toContain('next_cursor');
+    });
+
+    it('reports an exhausted continuation the same way with include_unknown set', async () => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 54351, groups_count: 0, next_cursor: null },
+        groups: [],
+      });
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'apc_paid.value_usd',
+        include_unknown: true,
+        order: 'key',
+        cursor: 'past-the-end',
+      });
+      expect(result.isError).toBeFalsy();
+      expect((result.content[0] as { text: string }).text).toContain('No groups found');
+      expect((result.structuredContent as { notice?: string }).notice).toContain(
+        'Pagination exhausted',
+      );
+    });
+
+    it('rejects a non-boolean include_unknown before the round trip', async () => {
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'apc_paid.value_usd',
+        include_unknown: 'yes' as unknown as boolean,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(mockAnalyze).not.toHaveBeenCalled();
+    });
+
+    it('documents keying, the boolean case, and that the key is not a filter value', () => {
+      const description = analyzeTrendsTool.input.shape.include_unknown.description ?? '';
+      expect(description).toContain('is_unknown');
+      expect(description).toContain('-111');
+      expect(description).toContain('/unknown');
+      expect(description).toMatch(/boolean/i);
+      expect(description).toMatch(/not a filter value/i);
     });
   });
 });

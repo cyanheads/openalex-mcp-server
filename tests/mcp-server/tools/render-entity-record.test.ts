@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
+import { nodeTypes, renderedText } from '../../helpers/markdown.js';
 
 describe('renderEntityRecord', () => {
   it('renders the heading from display_name', () => {
@@ -164,14 +165,119 @@ describe('renderEntityRecord', () => {
     expect(lines).toContain('### Frühjahr Analyse — 日本語');
   });
 
-  it('handles a string value that contains special markdown characters', () => {
+  it('escapes a string value carrying Markdown syntax so it renders as the literal text (gh #76)', () => {
     const lines = renderEntityRecord({
       id: 'W001',
       display_name: 'Paper',
       summary: 'Key findings: **bold** and <html>',
     });
     const text = lines.join('\n');
-    expect(text).toContain('Key findings: **bold** and <html>');
+    expect(text).toContain('Key findings: \\*\\*bold\\*\\* and \\<html>');
+    expect(renderedText(text)).toContain('Key findings: **bold** and <html>');
+  });
+
+  // Characterization: identifier and URL leaves read the same after escaping as before it.
+  it('renders URL and ID leaves byte-identical', () => {
+    const record = {
+      id: 'https://openalex.org/W2741809807',
+      display_name: 'Paper',
+      doi: 'https://doi.org/10.1002/(sici)1097-4636(199604)30:4<521::aid-jbm11>3.0.co;2-u',
+      ids: {
+        openalex: 'https://openalex.org/W2741809807',
+        pmid: 'https://pubmed.ncbi.nlm.nih.gov/12345678',
+      },
+      primary_location: {
+        landing_page_url: 'https://example.org/article_view?id=12&lang=de&doc_library=a_b_',
+        source: { id: 'https://openalex.org/S137773608', issn_l: '0028-0836' },
+      },
+      authorships: [
+        {
+          author: {
+            id: 'https://openalex.org/A5023888391',
+            orcid: 'https://orcid.org/0000-0002-1825-009X',
+          },
+        },
+      ],
+    };
+    const text = renderEntityRecord(record).join('\n');
+    expect(text).toContain('**ID:** https://openalex.org/W2741809807');
+    expect(text).toContain(`**DOI:** ${record.doi}`);
+    expect(text).toContain('openalex: https://openalex.org/W2741809807');
+    expect(text).toContain('pmid: https://pubmed.ncbi.nlm.nih.gov/12345678');
+    expect(text).toContain(`landing_page_url: ${record.primary_location.landing_page_url}`);
+    expect(text).toContain('source.id: https://openalex.org/S137773608, source.issn_l: 0028-0836');
+    expect(text).toContain('author.orcid: https://orcid.org/0000-0002-1825-009X');
+  });
+
+  describe('Markdown escaping of provider text (gh #76)', () => {
+    const provider = [
+      'Fish <Actinopterygii>',
+      '[Ir(tpy)(ppy)H](+) and [Cd(H3L)2](ClO4)',
+      '(*plastic) AND (pollut*',
+      '**Figure 1 … **',
+      '`code` span',
+      'range 5~10 nm and 20~30 nm',
+      '_emphasis_ but snake_case stays',
+      'TeX \\{x\\} and \\bf and a trailing \\',
+      'x &lt; y &amp; z &#38; w',
+      'A < B, P<0.001, <!-- c --> <?pi?> </close>',
+    ];
+
+    it('keeps every provider string literal in the heading, labeled fields, pairs, and list items', () => {
+      const text = renderEntityRecord({
+        id: 'W1',
+        display_name: provider.join(' | '),
+        abstract: provider.join(' '),
+        keywords: provider.map((display_name, i) => ({
+          id: `https://openalex.org/keywords/k${i}`,
+          display_name,
+        })),
+        primary_location: {
+          raw_source_name: provider[0],
+          nested: { deeper: { deepest: provider[1] } },
+        },
+        concepts: provider,
+      }).join('\n');
+
+      const allowed = new Set([
+        'heading',
+        'paragraph',
+        'text',
+        'strong',
+        'list',
+        'listItem',
+        'link',
+      ]);
+      expect(nodeTypes(text).filter((t) => !allowed.has(t))).toEqual([]);
+      const rendered = renderedText(text);
+      expect(rendered.split('\n')[0]).toBe(provider.join(' | '));
+      expect(rendered).toContain(`Abstract: ${provider.join(' ')}`);
+      for (const [i, value] of provider.entries()) {
+        expect(rendered).toContain(
+          `[${i}] id: https://openalex.org/keywords/k${i}, display_name: ${value}`,
+        );
+      }
+      expect(rendered).toContain(`nested.deeper.deepest: ${provider[1]}`);
+      expect(rendered).toContain(`Concepts: ${provider.join(', ')}`);
+    });
+
+    it('keeps a trailing # in the heading as text', () => {
+      const text = renderEntityRecord({ id: 'W1', display_name: 'Learning C# #' }).join('\n');
+      expect(renderedText(text).split('\n')[0]).toBe('Learning C# #');
+    });
+
+    it('collapses line breaks and tabs in provider text into spaces', () => {
+      const text = renderEntityRecord({
+        id: 'W1',
+        display_name: 'Line one\n# injected heading',
+        abstract: 'para\r\n - item\n1. item\ttab',
+      }).join('\n');
+      expect(nodeTypes(text).filter((t) => t === 'heading')).toHaveLength(1);
+      expect(nodeTypes(text)).not.toContain('list');
+      const rendered = renderedText(text);
+      expect(rendered.split('\n')[0]).toBe('Line one # injected heading');
+      expect(rendered).toContain('Abstract: para  - item 1. item tab');
+    });
   });
 
   it('handles deeply nested objects', () => {
