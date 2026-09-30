@@ -4,10 +4,43 @@
  * @module services/openalex/openalex-service.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
+import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SELECT } from '@/services/openalex/types.js';
+
+/** The `structuredContent.error` a failed tool call returns. */
+interface ErrorEnvelope {
+  code: number;
+  data: Record<string, unknown>;
+  message: string;
+}
+
+/**
+ * Run `call` inside a throwaway tool that declares `errors`, through `runToolContract`, and
+ * return the error envelope a client receives. The service puts only `data.reason` on a throw;
+ * the framework fills the matching entry's recovery from the calling tool's contract, so a
+ * recovery assertion reads the envelope rather than the service throw.
+ */
+async function failThroughContract(
+  errors: readonly ErrorContract[],
+  call: (ctx: Context) => Promise<unknown>,
+): Promise<ErrorEnvelope> {
+  const probe = tool('contract_probe', {
+    description: 'Runs one service call under a declared error contract.',
+    input: z.object({}),
+    output: z.object({}),
+    errors,
+    async handler(_input, ctx) {
+      await call(ctx);
+      return {};
+    },
+  });
+  const result = await runToolContract(probe, {});
+  expect(result.isError).toBe(true);
+  return (result.structuredContent as { error: ErrorEnvelope }).error;
+}
 
 /** The `X-RateLimit-*` header trio OpenAlex emits on every successful response. */
 function budgetHeaders(values: {
@@ -75,6 +108,7 @@ describe('OpenAlexService', () => {
   });
 
   afterEach(() => {
+    mockConfig.apiKey = 'test-key';
     mockConfig.mailto = '';
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -475,8 +509,22 @@ describe('OpenAlexService', () => {
       ['a name with a colon', 'Nature: a weekly journal'],
       ['a short numeric string', '1234'],
       ['an empty-ish query', '   '],
+      // Prefixes that lower-case to an Object.prototype member — a scheme lookup that read
+      // inherited members routed these to the by-ID path with a function, or the prototype
+      // object itself, as the entity type. (gh #93)
+      ['a constructor: prefix', 'Constructor: a theory'],
+      ['an upper-case CONSTRUCTOR: prefix', 'CONSTRUCTOR:x'],
+      ['a __proto__: prefix', '__proto__: prototypes in practice'],
+      ['an upper-case __PROTO__: prefix', '__PROTO__:x'],
     ])('leaves %s to autocomplete', async (_label, query) => {
       expect(await infer(query)).toBeUndefined();
+    });
+
+    it('leaves camel-case prototype-member prefixes to autocomplete (gh #93)', async () => {
+      // Characterization: the scheme is lower-cased before the table lookup, so `toString` and
+      // `hasOwnProperty` read as `tostring` / `hasownproperty` and never named a member.
+      expect(await infer('toString: a history of string conversion')).toBeUndefined();
+      expect(await infer('hasOwnProperty: ownership in law')).toBeUndefined();
     });
 
     it('stamps the folded scheme onto the id it hands the by-ID lookup (gh #66)', async () => {
@@ -1079,12 +1127,13 @@ describe('OpenAlexService', () => {
     });
 
     it('leaves a legacy name followed by = or an alphanumeric literal (URL query strings)', async () => {
+      // A source name is provider text, and repositories often give their URL as one.
       const url = 'http://e.x/F?func=service&copy=1&lang=de&not=2&notit;&ampx&sup23';
       const record = await searchOne({
         display_name: 'Test',
-        primary_location: { landing_page_url: url },
+        primary_location: { raw_source_name: url },
       });
-      expect((record.primary_location as { landing_page_url: string }).landing_page_url).toBe(url);
+      expect((record.primary_location as { raw_source_name: string }).raw_source_name).toBe(url);
     });
 
     it('decodes entities before handling tags, so an encoded tag unwraps (W4382882763)', async () => {
@@ -1293,6 +1342,239 @@ describe('OpenAlexService', () => {
         { key: 'https://openalex.org/S2', key_display_name: '<genus> source', count: 1 },
       ]);
     });
+
+    /**
+     * XML/JATS delimiters and double-escaped line breaks (gh #89). Strings are copied from each
+     * named record's upstream text as of 2026-09-30.
+     */
+    describe('delimiters and literal \\n (gh #89)', () => {
+      const CDATA_TITLE = '<![CDATA[Immune cellular response to HPV: current concepts]]>';
+      const TITLE = 'Immune cellular response to HPV: current concepts';
+      const IOP_ABSTRACT = String.raw`sodium blueshifted by <?CDATA $(8\pm 2)$?> <?MML ( 8 ± 2 ) ?> km s −1 , this likely implies`;
+      const IOP_NORMALIZED = String.raw`sodium blueshifted by $(8\pm 2)$ km s −1 , this likely implies`;
+      const LOST_CLOSER = String.raw`it satisfies AX=bX≥O ]] <![CDATA[$$AX = bX \geqslant O$$ where A is`;
+      const LOST_CLOSER_NORMALIZED = String.raw`it satisfies AX=bX≥O $$AX = bX \geqslant O$$ where A is`;
+
+      /** The inverted index OpenAlex serves in place of an abstract: word → positions. */
+      function invertedIndex(text: string): Record<string, number[]> {
+        const index: Record<string, number[]> = {};
+        text.split(' ').forEach((word, position) => {
+          index[word] = [...(index[word] ?? []), position];
+        });
+        return index;
+      }
+
+      it('unwraps a CDATA-wrapped title and display_name (W2143241432)', async () => {
+        const record = await searchOne({ display_name: CDATA_TITLE, title: CDATA_TITLE });
+        expect(record.display_name).toBe(TITLE);
+        expect(record.title).toBe(TITLE);
+      });
+
+      it('turns the literal \\n in a title into spaces (W3100494400)', async () => {
+        const record = await searchOne({
+          title: String.raw`VISIR / VLT mid-infrared imaging of Seyfert\n nuclei: \n nuclear dust emission and the Seyfert-2 dichotomy`,
+        });
+        expect(record.title).toBe(
+          'VISIR / VLT mid-infrared imaging of Seyfert nuclei: nuclear dust emission and the Seyfert-2 dichotomy',
+        );
+      });
+
+      it.each([
+        ['an IOP instruction pair (W3105622196)', IOP_ABSTRACT, IOP_NORMALIZED],
+        ['a lost ]] before a CDATA opener (W2337004314)', LOST_CLOSER, LOST_CLOSER_NORMALIZED],
+      ])(
+        'normalizes %s in an abstract rebuilt from its inverted index',
+        async (_l, raw, expected) => {
+          const record = await searchOne({
+            display_name: 'Test',
+            abstract_inverted_index: invertedIndex(raw),
+          });
+          expect(record.abstract).toBe(expected);
+        },
+      );
+
+      it('normalizes a raw_author_name nested two levels down', async () => {
+        const record = await searchOne({
+          display_name: 'Test',
+          authorships: [
+            { author: { display_name: 'First' } },
+            { raw_author_name: String.raw`A.\n <?CDATA Smith?>` },
+          ],
+        });
+        expect((record.authorships as { raw_author_name?: string }[])[1]?.raw_author_name).toBe(
+          'A. Smith',
+        );
+      });
+
+      it('carries the normalized text on both tool surfaces', async () => {
+        respondWith({
+          id: 'https://openalex.org/W2143241432',
+          display_name: CDATA_TITLE,
+          title: CDATA_TITLE,
+          abstract_inverted_index: invertedIndex(`${IOP_ABSTRACT} ${LOST_CLOSER}`),
+        });
+        await getService();
+        const { searchEntitiesTool } = await import(
+          '@/mcp-server/tools/definitions/search-entities.tool.js'
+        );
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W2143241432',
+          select: ['title', 'abstract'],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const work = (result.structuredContent as { results: Record<string, unknown>[] })
+          .results[0];
+        expect(work?.title).toBe(TITLE);
+        expect(work?.abstract).toBe(`${IOP_NORMALIZED} ${LOST_CLOSER_NORMALIZED}`);
+        const text = (result.content ?? [])
+          .map((block) => ('text' in block ? block.text : ''))
+          .join('\n');
+        expect(text).toContain(`### ${TITLE}`);
+        expect(text).toContain(`**Abstract:** ${IOP_NORMALIZED} ${LOST_CLOSER_NORMALIZED}`);
+        expect(text).not.toMatch(/CDATA|<\?MML|\]\]/);
+      });
+    });
+
+    /**
+     * Identifiers leave byte-identical to upstream, so each one resolves when passed back. W7134264040's
+     * DOI is stored with a literal `&amp;`; the decoded `&itemid=129` form is not found.
+     */
+    describe('identifiers pass through (gh #94)', () => {
+      const DOI = 'https://doi.org/10.1051/0004-6361/200912724&amp;itemid=129';
+      const WORK = {
+        id: 'https://openalex.org/W7134264040',
+        display_name: 'Seyfert &amp; <i>nuclei</i>',
+        doi: DOI,
+        ids: { openalex: 'https://openalex.org/W7134264040', doi: DOI },
+        primary_location: {
+          landing_page_url: DOI,
+          pdf_url: 'https://e.x/get.pdf?a=1&amp;b=2',
+          source: {
+            id: 'https://openalex.org/S1',
+            display_name: 'Astron. &amp; Astrophys.',
+            host_organization_lineage: ['https://openalex.org/P1&amp;x'],
+          },
+        },
+        authorships: [
+          {
+            author: { display_name: 'A. &amp; B.', orcid: 'https://orcid.org/0000-0001&lt;2' },
+            raw_author_name: 'A. &amp; B.',
+          },
+        ],
+      };
+
+      it('returns identifiers byte-identical and display text normalized, nested levels included', async () => {
+        const record = await searchOne(WORK);
+        expect(record).toEqual({
+          ...WORK,
+          display_name: 'Seyfert & nuclei',
+          primary_location: {
+            ...WORK.primary_location,
+            source: { ...WORK.primary_location.source, display_name: 'Astron. & Astrophys.' },
+          },
+          authorships: [
+            {
+              author: { display_name: 'A. & B.', orcid: 'https://orcid.org/0000-0001&lt;2' },
+              raw_author_name: 'A. & B.',
+            },
+          ],
+        });
+      });
+
+      it('returns autocomplete identifiers byte-identical and names normalized', async () => {
+        respondWith({
+          results: [
+            {
+              id: 'https://openalex.org/A1&amp;',
+              display_name: 'A. &amp; B.',
+              entity_type: 'author',
+              cited_by_count: 1,
+              works_count: 1,
+              external_id: 'https://orcid.org/0000-0001&amp;2',
+              hint: 'Inst &amp; Co',
+            },
+          ],
+        });
+        const service = await getService();
+        const result = await service.autocomplete(
+          { entityType: 'authors', query: 'a' },
+          createMockContext(),
+        );
+        expect(result.results[0]).toMatchObject({
+          id: 'https://openalex.org/A1&amp;',
+          display_name: 'A. & B.',
+          external_id: 'https://orcid.org/0000-0001&amp;2',
+          hint: 'Inst & Co',
+        });
+      });
+
+      it('carries the upstream DOI on both surfaces of openalex_search_entities', async () => {
+        respondWith(WORK);
+        await getService();
+        const { searchEntitiesTool } = await import(
+          '@/mcp-server/tools/definitions/search-entities.tool.js'
+        );
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W7134264040',
+          select: ['doi', 'ids', 'primary_location'],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const work = (result.structuredContent as { results: Record<string, unknown>[] })
+          .results[0];
+        expect(work?.doi).toBe(DOI);
+        expect(work?.ids).toEqual(WORK.ids);
+        const text = (result.content ?? [])
+          .map((block) => ('text' in block ? block.text : ''))
+          .join('\n');
+        expect(text).toContain(`**DOI:** ${DOI}`);
+        expect(text).toContain(`landing_page_url: ${DOI}`);
+      });
+
+      it('carries the upstream DOI on both surfaces of openalex_resolve_name', async () => {
+        respondWith({
+          results: [
+            {
+              id: WORK.id,
+              display_name: 'Seyfert &amp; nuclei',
+              entity_type: 'work',
+              cited_by_count: 1,
+              works_count: null,
+              external_id: DOI,
+              hint: 'A. &amp; B.',
+            },
+          ],
+        });
+        await getService();
+        const { resolveNameTool } = await import(
+          '@/mcp-server/tools/definitions/resolve-name.tool.js'
+        );
+
+        const result = await runToolContract(resolveNameTool, {
+          entity_type: 'works',
+          query: 'seyfert nuclei',
+        });
+
+        expect(result.isError).toBeFalsy();
+        const match = (result.structuredContent as { results: Record<string, unknown>[] })
+          .results[0];
+        expect(match).toMatchObject({
+          id: WORK.id,
+          display_name: 'Seyfert & nuclei',
+          external_id: DOI,
+          hint: 'A. & B.',
+        });
+        const text = (result.content ?? [])
+          .map((block) => ('text' in block ? block.text : ''))
+          .join('\n');
+        expect(text).toContain(DOI);
+      });
+    });
   });
 
   // --- Unknown group_by bucket (gh #75) ---
@@ -1483,6 +1765,40 @@ describe('OpenAlexService', () => {
       expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,h_index');
     });
 
+    /**
+     * The alias maps are plain object literals, so reading a name an `Object.prototype` member
+     * carries returned the inherited member — a function, or the prototype object itself for
+     * `__proto__` — and its string form went upstream as the field name. (gh #93)
+     */
+    it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+      'passes a %s select field through unchanged on both alias maps (gh #93)',
+      async (field) => {
+        const service = await getService();
+        for (const entityType of ['works', 'authors'] as const) {
+          await service.search({ entityType, select: [field] }, createMockContext());
+          expect(lastFetchUrl().searchParams.get('select')).toBe(`id,display_name,${field}`);
+        }
+      },
+    );
+
+    it('translates real aliases beside a prototype-member name in one request (gh #93)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', select: ['authors', 'constructor', 'year'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,authorships,constructor,publication_year',
+      );
+      await service.search(
+        { entityType: 'authors', select: ['toString', 'h_index'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,toString,summary_stats',
+      );
+    });
+
     it('fails open on an unmapped field name for an aliased entity type (gh #64)', async () => {
       // #17's rule: a miss passes through untranslated so upstream's 400 names the valid fields.
       const service = await getService();
@@ -1546,6 +1862,25 @@ describe('OpenAlexService', () => {
       );
       expect(filterParam()).toBe('cites:W2741809807');
     });
+
+    /**
+     * `JSON.parse` builds the filters the way a JSON-RPC argument arrives, keeping `__proto__` an
+     * own key. The works alias map is a plain object literal, so these keys used to resolve to
+     * inherited members and reach upstream as `function Object() { … }` or `[object Object]`.
+     * (gh #93)
+     */
+    it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+      'passes a works filter key named %s through unchanged beside a real alias (gh #93)',
+      async (key) => {
+        const service = await getService();
+        const filters = JSON.parse(`{${JSON.stringify(key)}:"x","year":"2024"}`) as Record<
+          string,
+          string
+        >;
+        await service.search({ entityType: 'works', filters }, createMockContext());
+        expect(filterParam()).toBe(`${key}:x,publication_year:2024`);
+      },
+    );
 
     it('rewrites year → publication_year for works (range value passes through)', async () => {
       const service = await getService();
@@ -2310,6 +2645,61 @@ describe('OpenAlexService', () => {
       expect(result.meta.count).toBe(100);
     });
 
+    /**
+     * `authorships.countries` counts only each work's first 100 authorships; its full-count
+     * counterpart `authorships.institutions.country_code` counts them all and carries no notice.
+     */
+    it.each([
+      ['authorships.countries', true],
+      ['authorships.institutions.country_code', false],
+    ] as const)(
+      'grouped by %s, discloses the first-100 cap on both tool surfaces: %s (gh #91)',
+      async (groupBy, discloses) => {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              meta: { count: 1 },
+              group_by: [
+                {
+                  key: 'https://openalex.org/countries/US',
+                  key_display_name: 'United States',
+                  count: 1,
+                },
+              ],
+            }),
+            { status: 200 },
+          ),
+        );
+        await getService();
+        const { analyzeTrendsTool } = await import(
+          '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+        );
+
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: groupBy,
+          filters: { openalex: 'W1858542512' },
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+        expect(lastFetchUrl().searchParams.get('group_by')).toBe(groupBy);
+        const { notice } = result.structuredContent as { notice?: string };
+        const text = (result.content ?? [])
+          .map((block) => ('text' in block ? block.text : ''))
+          .join('\n');
+        if (discloses) {
+          for (const surface of [notice ?? '', text]) {
+            expect(surface).toMatch(/first 100 authorships/);
+            expect(surface).toContain('authorships.institutions.country_code');
+          }
+        } else {
+          expect(notice).toBeUndefined();
+          expect(text).not.toMatch(/first 100/);
+        }
+      },
+    );
+
     it('appends :include_unknown when requested', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
@@ -2345,21 +2735,21 @@ describe('OpenAlexService', () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ meta: { count: 1 }, results: [] }), { status: 200 }),
       );
-      const ctx = createMockContext({
-        errors: [
-          {
-            reason: 'upstream_missing_group_by',
-            code: JsonRpcErrorCode.ServiceUnavailable,
-            when: 'the response carried no aggregation',
-            recovery: 'DISTINCTIVE_GROUP_BY_HINT retry, then check the group_by field.',
-          },
-        ],
-      });
       const service = await getService();
 
       await expect(
-        service.analyze({ entityType: 'works', groupBy: 'type' }, ctx),
-      ).rejects.toMatchObject({
+        failThroughContract(
+          [
+            {
+              reason: 'upstream_missing_group_by',
+              code: JsonRpcErrorCode.ServiceUnavailable,
+              when: 'the response carried no aggregation',
+              recovery: 'DISTINCTIVE_GROUP_BY_HINT retry, then check the group_by field.',
+            },
+          ],
+          (ctx) => service.analyze({ entityType: 'works', groupBy: 'type' }, ctx),
+        ),
+      ).resolves.toMatchObject({
         data: {
           reason: 'upstream_missing_group_by',
           recovery: { hint: expect.stringContaining('DISTINCTIVE_GROUP_BY_HINT') },
@@ -2742,28 +3132,6 @@ describe('OpenAlexService', () => {
       const UPSTREAM_500_HTML =
         '<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.</p>\n';
 
-      const RECOVERY = 'DISTINCTIVE_SHORTEN_HINT shorten the name and retry the request.';
-
-      function contractCtx() {
-        return createMockContext({
-          errors: [
-            {
-              reason: 'query_too_long',
-              code: JsonRpcErrorCode.InvalidParams,
-              when: 'the autocomplete query is over the upstream length bound',
-              recovery: RECOVERY,
-            },
-            {
-              reason: 'upstream_unavailable',
-              code: JsonRpcErrorCode.ServiceUnavailable,
-              when: 'OpenAlex is unavailable',
-              retryable: true,
-              recovery: 'DISTINCTIVE_UNAVAILABLE_HINT wait and retry.',
-            },
-          ],
-        });
-      }
-
       function mockStatus(status: number): void {
         vi.mocked(globalThis.fetch).mockImplementation(() =>
           Promise.resolve(
@@ -2780,7 +3148,7 @@ describe('OpenAlexService', () => {
       async function settle(params: { entityType?: 'authors' | 'works'; query: string }) {
         vi.useFakeTimers();
         const service = await getService();
-        const outcome = service.autocomplete(params, contractCtx()).then(
+        const outcome = service.autocomplete(params, createMockContext()).then(
           () => {
             throw new Error('expected autocomplete to reject');
           },
@@ -2805,7 +3173,6 @@ describe('OpenAlexService', () => {
           data: {
             reason: 'query_too_long',
             retryable: false,
-            recovery: { hint: RECOVERY },
             path: '/autocomplete/authors',
             statusCode: 500,
           },
@@ -2871,12 +3238,15 @@ describe('OpenAlexService', () => {
 
         const typed = await service.autocomplete(
           { entityType: 'authors', query: digits },
-          contractCtx(),
+          createMockContext(),
         );
         expect(typed.results).toEqual([]);
         expect(lastFetchUrl().searchParams.get('q')).toBe(digits);
 
-        const crossEntity = await service.autocomplete({ query: 'a'.repeat(5000) }, contractCtx());
+        const crossEntity = await service.autocomplete(
+          { query: 'a'.repeat(5000) },
+          createMockContext(),
+        );
         expect(crossEntity.results).toEqual([]);
         expect(lastFetchUrl().searchParams.get('q')).toHaveLength(5000);
         expect(globalThis.fetch).toHaveBeenCalledTimes(2);
@@ -3027,23 +3397,24 @@ describe('OpenAlexService', () => {
 
       it('resolves the resolve_name recovery hint for an invalid-ID-value 400', async () => {
         mock400("'Harvard' is not a valid OpenAlex ID.");
-        const ctx = createMockContext({
-          errors: [
-            {
-              reason: 'upstream_invalid_id_value',
-              code: JsonRpcErrorCode.InvalidParams,
-              when: 'an entity-ID filter received a name',
-              recovery: 'DISTINCTIVE_ID_HINT call openalex_resolve_name to get the ID first.',
-            },
-          ],
-        });
         const service = await getService();
         await expect(
-          service.search(
-            { entityType: 'works', filters: { 'authorships.institutions.id': 'Harvard' } },
-            ctx,
+          failThroughContract(
+            [
+              {
+                reason: 'upstream_invalid_id_value',
+                code: JsonRpcErrorCode.InvalidParams,
+                when: 'an entity-ID filter received a name',
+                recovery: 'DISTINCTIVE_ID_HINT call openalex_resolve_name to get the ID first.',
+              },
+            ],
+            (ctx) =>
+              service.search(
+                { entityType: 'works', filters: { 'authorships.institutions.id': 'Harvard' } },
+                ctx,
+              ),
           ),
-        ).rejects.toMatchObject({
+        ).resolves.toMatchObject({
           data: {
             reason: 'upstream_invalid_id_value',
             recovery: { hint: expect.stringContaining('DISTINCTIVE_ID_HINT') },
@@ -3110,20 +3481,20 @@ describe('OpenAlexService', () => {
 
       it('resolves the query_too_long recovery hint from the caller contract', async () => {
         mock400('Your search is too long (1890 characters; the limit is 1500).');
-        const ctx = createMockContext({
-          errors: [
-            {
-              reason: 'query_too_long',
-              code: JsonRpcErrorCode.InvalidParams,
-              when: 'the search text exceeds the upstream limit',
-              recovery: 'DISTINCTIVE_LENGTH_HINT shorten the query or split it into several.',
-            },
-          ],
-        });
         const service = await getService();
         await expect(
-          service.search({ entityType: 'works', query: 'a'.repeat(1890) }, ctx),
-        ).rejects.toMatchObject({
+          failThroughContract(
+            [
+              {
+                reason: 'query_too_long',
+                code: JsonRpcErrorCode.InvalidParams,
+                when: 'the search text exceeds the upstream limit',
+                recovery: 'DISTINCTIVE_LENGTH_HINT shorten the query or split it into several.',
+              },
+            ],
+            (ctx) => service.search({ entityType: 'works', query: 'a'.repeat(1890) }, ctx),
+          ),
+        ).resolves.toMatchObject({
           data: {
             reason: 'query_too_long',
             recovery: { hint: expect.stringContaining('DISTINCTIVE_LENGTH_HINT') },
@@ -3146,20 +3517,20 @@ describe('OpenAlexService', () => {
         mock400(
           'Must include a search query (such as ?search=example) in order to sort by relevance_score.',
         );
-        const ctx = createMockContext({
-          errors: [
-            {
-              reason: 'upstream_sort_requires_search',
-              code: JsonRpcErrorCode.ValidationError,
-              when: 'relevance sort requested without an active search',
-              recovery: 'DISTINCTIVE_HINT add a query or choose another sort field.',
-            },
-          ],
-        });
         const service = await getService();
         await expect(
-          service.search({ entityType: 'works', sort: '-relevance_score' }, ctx),
-        ).rejects.toMatchObject({
+          failThroughContract(
+            [
+              {
+                reason: 'upstream_sort_requires_search',
+                code: JsonRpcErrorCode.ValidationError,
+                when: 'relevance sort requested without an active search',
+                recovery: 'DISTINCTIVE_HINT add a query or choose another sort field.',
+              },
+            ],
+            (ctx) => service.search({ entityType: 'works', sort: '-relevance_score' }, ctx),
+          ),
+        ).resolves.toMatchObject({
           data: {
             reason: 'upstream_sort_requires_search',
             recovery: { hint: expect.stringContaining('DISTINCTIVE_HINT') },
@@ -3461,25 +3832,100 @@ describe('OpenAlexService', () => {
         expect(globalThis.fetch).toHaveBeenCalledTimes(3);
       });
 
-      it('resolves the budget recovery hint from the caller contract', async () => {
-        mock429(JSON.stringify({ message: 'Insufficient budget. Resets at midnight.' }));
-        const ctx = createMockContext({
-          errors: [
-            {
-              reason: 'upstream_budget_exhausted',
-              code: JsonRpcErrorCode.RateLimited,
-              when: 'the daily usage budget is spent',
-              retryable: false,
-              recovery: 'DISTINCTIVE_BUDGET_HINT the budget refills at midnight UTC.',
-            },
-          ],
-        });
-        const service = await getService();
-        await expect(service.search({ entityType: 'works' }, ctx)).rejects.toMatchObject({
-          data: {
-            reason: 'upstream_budget_exhausted',
-            recovery: { hint: expect.stringContaining('DISTINCTIVE_BUDGET_HINT') },
+      /**
+       * The budget that ran out is the one this server spends — its keyed budget when
+       * OPENALEX_API_KEY is set. Setting a key helps only a keyless server, so only that throw
+       * carries the key advice; the contract's own recovery has to hold either way. (gh #90)
+       */
+      describe.each<[name: string, run: () => ReturnType<typeof runToolContract>]>([
+        [
+          'openalex_search_entities',
+          async () => {
+            const { searchEntitiesTool } = await import(
+              '@/mcp-server/tools/definitions/search-entities.tool.js'
+            );
+            return runToolContract(searchEntitiesTool, { entity_type: 'works', query: 'climate' });
           },
+        ],
+        [
+          'openalex_resolve_name',
+          async () => {
+            const { resolveNameTool } = await import(
+              '@/mcp-server/tools/definitions/resolve-name.tool.js'
+            );
+            return runToolContract(resolveNameTool, { query: 'climate' });
+          },
+        ],
+        [
+          'openalex_analyze_trends',
+          async () => {
+            const { analyzeTrendsTool } = await import(
+              '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+            );
+            return runToolContract(analyzeTrendsTool, {
+              entity_type: 'works',
+              group_by: 'publication_year',
+            });
+          },
+        ],
+        [
+          'openalex_get_citation_graph',
+          async () => {
+            const { getCitationGraphTool } = await import(
+              '@/mcp-server/tools/definitions/citation-graph.tool.js'
+            );
+            return runToolContract(getCitationGraphTool, {
+              seed_id: 'W2741809807',
+              direction: 'cites',
+            });
+          },
+        ],
+      ])('budget recovery on %s (gh #90)', (_name, run) => {
+        /** Run the tool against a budget 429 and return the wire hint and the rendered text. */
+        async function budgetFailure(apiKey: string): Promise<{ hint: string; text: string }> {
+          mockConfig.apiKey = apiKey;
+          mock429(
+            JSON.stringify({
+              message:
+                'Insufficient budget. This request costs $0.001 but you only have $0 remaining. Resets at midnight.',
+            }),
+          );
+          await getService();
+
+          const result = await run();
+
+          expect(result.isError).toBe(true);
+          expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+          const { error } = result.structuredContent as { error: ErrorEnvelope };
+          expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+          expect(error.data).toMatchObject({
+            reason: 'upstream_budget_exhausted',
+            retryable: false,
+          });
+          const text = (result.content ?? [])
+            .map((block) => ('text' in block ? block.text : ''))
+            .join('\n');
+          return { hint: (error.data.recovery as { hint: string }).hint, text };
+        }
+
+        it('says only what holds with a key when one is configured', async () => {
+          const { hint, text } = await budgetFailure('test-key');
+          expect(hint).toMatch(/midnight UTC/);
+          expect(hint).not.toMatch(/OPENALEX_API_KEY|openalex\.org\/settings/);
+          expect(text).toContain(`Recovery: ${hint}`);
+        });
+
+        it('adds the free-key advice when no key is configured', async () => {
+          const { hint, text } = await budgetFailure('');
+          // The service's own throw-site hint, not the contract's fill.
+          const { BUDGET_EXHAUSTED_KEYLESS_HINT } = await import(
+            '@/services/openalex/openalex-service.js'
+          );
+          expect(hint).toBe(BUDGET_EXHAUSTED_KEYLESS_HINT);
+          expect(hint).toMatch(/midnight UTC/);
+          expect(hint).toContain('OPENALEX_API_KEY');
+          expect(hint).toContain('https://openalex.org/settings/api');
+          expect(text).toContain(`Recovery: ${hint}`);
         });
       });
     });
@@ -3488,26 +3934,22 @@ describe('OpenAlexService', () => {
 
     describe('statusless fetch failures (gh #53)', () => {
       /** Contract covering both transient reasons, so the recovery hint is resolvable. */
-      function transientCtx() {
-        return createMockContext({
-          errors: [
-            {
-              reason: 'upstream_timeout',
-              code: JsonRpcErrorCode.Timeout,
-              when: 'OpenAlex did not respond within the request deadline',
-              retryable: true,
-              recovery: 'DISTINCTIVE_TIMEOUT_HINT retry after a short delay.',
-            },
-            {
-              reason: 'upstream_unavailable',
-              code: JsonRpcErrorCode.ServiceUnavailable,
-              when: 'OpenAlex is unavailable',
-              retryable: true,
-              recovery: 'DISTINCTIVE_UNAVAILABLE_HINT wait and retry.',
-            },
-          ],
-        });
-      }
+      const TRANSIENT_CONTRACT: readonly ErrorContract[] = [
+        {
+          reason: 'upstream_timeout',
+          code: JsonRpcErrorCode.Timeout,
+          when: 'OpenAlex did not respond within the request deadline',
+          retryable: true,
+          recovery: 'DISTINCTIVE_TIMEOUT_HINT retry after a short delay.',
+        },
+        {
+          reason: 'upstream_unavailable',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          when: 'OpenAlex is unavailable',
+          retryable: true,
+          recovery: 'DISTINCTIVE_UNAVAILABLE_HINT wait and retry.',
+        },
+      ];
 
       it('classifies a client-side request timeout as upstream_timeout with its recovery hint', async () => {
         vi.useFakeTimers();
@@ -3522,8 +3964,10 @@ describe('OpenAlexService', () => {
         );
 
         const service = await getService();
-        const promise = service.search({ entityType: 'works' }, transientCtx());
-        const rejection = expect(promise).rejects.toMatchObject({
+        const promise = failThroughContract(TRANSIENT_CONTRACT, (ctx) =>
+          service.search({ entityType: 'works' }, ctx),
+        );
+        const rejection = expect(promise).resolves.toMatchObject({
           code: JsonRpcErrorCode.Timeout,
           data: {
             reason: 'upstream_timeout',
@@ -3565,8 +4009,10 @@ describe('OpenAlexService', () => {
         );
 
         const service = await getService();
-        const promise = service.search({ entityType: 'works' }, transientCtx());
-        const rejection = expect(promise).rejects.toMatchObject({
+        const promise = failThroughContract(TRANSIENT_CONTRACT, (ctx) =>
+          service.search({ entityType: 'works' }, ctx),
+        );
+        const rejection = expect(promise).resolves.toMatchObject({
           code: JsonRpcErrorCode.ServiceUnavailable,
           message: expect.stringContaining('Could not reach the OpenAlex API for /works'),
           data: {
@@ -3593,8 +4039,10 @@ describe('OpenAlexService', () => {
         );
 
         const service = await getService();
-        const promise = service.search({ entityType: 'works' }, transientCtx());
-        const rejection = expect(promise).rejects.toMatchObject({
+        const promise = failThroughContract(TRANSIENT_CONTRACT, (ctx) =>
+          service.search({ entityType: 'works' }, ctx),
+        );
+        const rejection = expect(promise).resolves.toMatchObject({
           code: JsonRpcErrorCode.ServiceUnavailable,
           message: expect.stringContaining('returned HTML instead of JSON'),
           data: {
@@ -3620,8 +4068,10 @@ describe('OpenAlexService', () => {
         );
 
         const service = await getService();
-        const promise = service.search({ entityType: 'works' }, transientCtx());
-        const rejection = expect(promise).rejects.toMatchObject({
+        const promise = failThroughContract(TRANSIENT_CONTRACT, (ctx) =>
+          service.search({ entityType: 'works' }, ctx),
+        );
+        const rejection = expect(promise).resolves.toMatchObject({
           code: JsonRpcErrorCode.ServiceUnavailable,
           message: expect.stringContaining('returned invalid JSON'),
           data: {
@@ -3642,8 +4092,10 @@ describe('OpenAlexService', () => {
         );
 
         const service = await getService();
-        const promise = service.search({ entityType: 'works' }, transientCtx());
-        const rejection = expect(promise).rejects.toMatchObject({
+        const promise = failThroughContract(TRANSIENT_CONTRACT, (ctx) =>
+          service.search({ entityType: 'works' }, ctx),
+        );
+        const rejection = expect(promise).resolves.toMatchObject({
           code: JsonRpcErrorCode.ServiceUnavailable,
           message: expect.stringContaining('returned an empty response'),
           data: {
@@ -3728,10 +4180,13 @@ describe('OpenAlexService', () => {
         ['an uppercase-scheme PMCID', 'PMCID:PMC3084216'],
       ])('substitutes the conversion recovery for %s', async (_label, id) => {
         mock404();
-        const ctx = createMockContext({ errors: notFoundContract });
         const service = await getService();
 
-        await expect(service.search({ entityType: 'works', id }, ctx)).rejects.toMatchObject({
+        await expect(
+          failThroughContract(notFoundContract, (ctx) =>
+            service.search({ entityType: 'works', id }, ctx),
+          ),
+        ).resolves.toMatchObject({
           code: JsonRpcErrorCode.NotFound,
           data: {
             reason: 'entity_not_found',
@@ -3745,15 +4200,13 @@ describe('OpenAlexService', () => {
 
       it('names the NCBI ID Converter and the PMID/DOI conversion in the hint', async () => {
         mock404();
-        const ctx = createMockContext({ errors: notFoundContract });
         const service = await getService();
 
-        const rejection = await service.search({ entityType: 'works', id: 'PMC3084216' }, ctx).then(
-          () => undefined,
-          (error: unknown) => error,
+        const envelope = await failThroughContract(notFoundContract, (ctx) =>
+          service.search({ entityType: 'works', id: 'PMC3084216' }, ctx),
         );
 
-        const hint = (rejection as { data: { recovery: { hint: string } } }).data.recovery.hint;
+        const hint = (envelope.data.recovery as { hint: string }).hint;
         expect(hint).toContain('PMID');
         expect(hint).toContain('DOI');
         expect(hint).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
@@ -3766,10 +4219,13 @@ describe('OpenAlexService', () => {
         ['a PMID', 'PMID:21491125', '/works/pmid:21491125'],
       ])('keeps the generic recovery for %s', async (_label, id, path) => {
         mock404();
-        const ctx = createMockContext({ errors: notFoundContract });
         const service = await getService();
 
-        await expect(service.search({ entityType: 'works', id }, ctx)).rejects.toMatchObject({
+        await expect(
+          failThroughContract(notFoundContract, (ctx) =>
+            service.search({ entityType: 'works', id }, ctx),
+          ),
+        ).resolves.toMatchObject({
           code: JsonRpcErrorCode.NotFound,
           data: {
             reason: 'entity_not_found',

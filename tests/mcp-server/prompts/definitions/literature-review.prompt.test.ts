@@ -65,4 +65,26 @@ describe('literatureReviewPrompt', () => {
     const detail = step(await generatedText(), '**Identify key papers**');
     expect(detail).toContain('select');
   });
+
+  /**
+   * The detail lookup selects `authorships`, which the 64,000-byte response budget windows on a
+   * large collaboration; the step has to name the `slice` call that pages the rest. (gh #72)
+   */
+  it('names slice for paging a windowed authorships array', async () => {
+    const detail = step(await generatedText(), '**Identify key papers**');
+    expect(detail).toContain('slice: {"field": "authorships"');
+    expect(detail).toContain('windows');
+  });
+
+  /**
+   * OpenAlex counts `authorships.institutions.id` over every authorship of a work; only
+   * `authorships.countries`, which this workflow never groups by, stops at the first 100. The
+   * landscape step must not tell a caller its institution counts are capped. (gh #91)
+   */
+  it('claims no first-100 cap on the institutions group_by', async () => {
+    const text = await generatedText();
+    expect(step(text, '**Analyze the landscape**')).toContain('authorships.institutions.id');
+    expect(text).not.toMatch(/first 100|undercount/);
+    expect(text).not.toContain('authors_count:>100');
+  });
 });

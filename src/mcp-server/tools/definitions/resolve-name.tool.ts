@@ -37,7 +37,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
       retryable: false,
       recovery:
-        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+        "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed.",
       thrownBy: 'service',
     },
     {

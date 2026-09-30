@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/resolve-name.tool.test
  */
 
-import { type Context, z } from '@cyanheads/mcp-ts-core';
+import { z } from '@cyanheads/mcp-ts-core';
 import { invalidParams, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
@@ -74,23 +74,24 @@ describe('resolveNameTool', () => {
     });
 
     it('carries the invalid-ID-value recovery through to the caller (gh #49)', async () => {
-      const ctx = createMockContext({ errors: resolveNameTool.errors });
       mockAutocomplete.mockRejectedValue(
         invalidParams("'Einstein' is not a valid OpenAlex ID.", {
           reason: 'upstream_invalid_id_value',
-          ...ctx.recoveryFor('upstream_invalid_id_value'),
         }),
       );
-      const input = resolveNameTool.input.parse({
+
+      const result = await runToolContract(resolveNameTool, {
         query: 'climate',
         filters: { 'authorships.author.id': 'Einstein' },
       });
 
-      await expect(resolveNameTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'upstream_invalid_id_value',
-          recovery: { hint: expect.stringMatching(/resolve that name/i) },
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_invalid_id_value',
+            recovery: { hint: expect.stringMatching(/resolve that name/i) },
+          },
         },
       });
     });
@@ -110,13 +111,12 @@ describe('resolveNameTool', () => {
     });
 
     it('carries the query_too_long recovery to both surfaces', async () => {
-      mockAutocomplete.mockImplementation((async (_params: unknown, ctx: Context) => {
-        throw invalidParams('OpenAlex autocomplete cannot take a query this long.', {
+      mockAutocomplete.mockRejectedValue(
+        invalidParams('OpenAlex autocomplete cannot take a query this long.', {
           reason: 'query_too_long',
           retryable: false,
-          ...ctx.recoveryFor('query_too_long'),
-        });
-      }) as never);
+        }),
+      );
 
       const result = await runToolContract(resolveNameTool, {
         entity_type: 'authors',
@@ -405,6 +405,41 @@ describe('resolveNameTool', () => {
 
       await resolveNameTool.handler(input, ctx);
       expect(mockResolveIdentifier).not.toHaveBeenCalled();
+    });
+
+    /**
+     * A prefix named after an `Object.prototype` member is no identifier scheme. The scheme table
+     * read inherited members, so these queries were routed to the by-ID lookup with a function
+     * as their entity type instead of reaching autocomplete. (gh #93)
+     */
+    it.each(['Constructor: a theory', '__proto__: prototypes in practice'])(
+      'sends %j to autocomplete through the tool contract (gh #93)',
+      async (query) => {
+        mockAutocomplete.mockResolvedValue(sampleResults);
+
+        const result = await runToolContract(resolveNameTool, { query });
+
+        expect(result.isError).toBeFalsy();
+        expect(mockResolveIdentifier).not.toHaveBeenCalled();
+        expect(mockAutocomplete).toHaveBeenCalledWith(
+          expect.objectContaining({ query }),
+          expect.anything(),
+        );
+        expect((result.structuredContent as AutocompleteResult).results.map((r) => r.id)).toEqual(
+          sampleResults.results.map((r) => r.id),
+        );
+      },
+    );
+
+    it('sends camel-case prototype-member prefixes to autocomplete (gh #93)', async () => {
+      // Characterization: the scheme is lower-cased before lookup, so these never named a member.
+      mockAutocomplete.mockResolvedValue(sampleResults);
+      for (const query of ['toString: a history', 'hasOwnProperty: ownership in law']) {
+        const result = await runToolContract(resolveNameTool, { query });
+        expect(result.isError).toBeFalsy();
+      }
+      expect(mockResolveIdentifier).not.toHaveBeenCalled();
+      expect(mockAutocomplete).toHaveBeenCalledTimes(2);
     });
 
     it('resolves an identifier without entity_type', async () => {

@@ -51,7 +51,7 @@ Follow this workflow using the OpenAlex tools:
           }
    Use select to keep payloads manageable.
 
-3. **Identify key papers** — Re-run the step 2 search with sort: "-cited_by_count" to surface landmark works, keeping the topical filters in place: an explicit sort replaces relevance ranking, so without them you get the most-cited works in the catalog rather than in "${args.topic}". Then call openalex_search_entities with id and a select naming the fields you need (e.g. ["abstract", "authorships", "primary_location"]) for the most important ones — an id lookup on its own returns the curated default projection.
+3. **Identify key papers** — Re-run the step 2 search with sort: "-cited_by_count" to surface landmark works, keeping the topical filters in place: an explicit sort replaces relevance ranking, so without them you get the most-cited works in the catalog rather than in "${args.topic}". Then call openalex_search_entities with id and a select naming the fields you need (e.g. ["abstract", "authorships", "primary_location"]) for the most important ones — an id lookup on its own returns the curated default projection. A long array such as authorships on a large collaboration comes back as a window listed in the response's windows; page the rest with slice: {"field": "authorships", "offset": <the next offset it names>} on the same id.
 
 4. **Trace citations** — For each key paper, use openalex_get_citation_graph with direction "cites" to find subsequent work that cites it, and direction "cited_by" to find foundational work it references.
 

@@ -62,24 +62,25 @@ describe('analyzeTrendsTool', () => {
     });
 
     it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
-      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
       mockAnalyze.mockRejectedValue(
         invalidParams("'Albert' is not a valid OpenAlex ID.", {
           reason: 'upstream_invalid_id_value',
-          ...ctx.recoveryFor('upstream_invalid_id_value'),
         }),
       );
-      const input = analyzeTrendsTool.input.parse({
+
+      const result = await runToolContract(analyzeTrendsTool, {
         entity_type: 'works',
         group_by: 'publication_year',
         filters: { 'authorships.author.id': 'Albert Einstein' },
       });
 
-      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'upstream_invalid_id_value',
-          recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_invalid_id_value',
+            recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+          },
         },
       });
     });
@@ -433,43 +434,48 @@ describe('analyzeTrendsTool', () => {
 
   describe('upstream 400 recovery (gh #43)', () => {
     it('carries the ungroupable-group_by reason and recovery from the service', async () => {
-      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
       mockAnalyze.mockRejectedValue(
         invalidParams('Cannot group by date, number, or search fields.', {
           reason: 'upstream_ungroupable_group_by',
-          ...ctx.recoveryFor('upstream_ungroupable_group_by'),
         }),
       );
-      const input = analyzeTrendsTool.input.parse({
+
+      const result = await runToolContract(analyzeTrendsTool, {
         entity_type: 'works',
         group_by: 'publication_date',
       });
 
-      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'upstream_ungroupable_group_by',
-          recovery: {
-            hint: expect.stringMatching(/openalex_describe_fields\(entity_type, "group_by"\)/),
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_ungroupable_group_by',
+            recovery: {
+              hint: expect.stringMatching(/openalex_describe_fields\(entity_type, "group_by"\)/),
+            },
           },
         },
       });
     });
 
     it('carries the neutral other-400 reason and recovery from the service', async () => {
-      const ctx = createMockContext({ errors: analyzeTrendsTool.errors });
       mockAnalyze.mockRejectedValue(
         invalidParams('Invalid cursor value provided.', {
           reason: 'upstream_invalid_params_other',
-          ...ctx.recoveryFor('upstream_invalid_params_other'),
         }),
       );
-      const input = analyzeTrendsTool.input.parse({ entity_type: 'works', group_by: 'type' });
 
-      await expect(analyzeTrendsTool.handler(input, ctx)).rejects.toMatchObject({
-        data: {
-          reason: 'upstream_invalid_params_other',
-          recovery: { hint: expect.stringMatching(/upstream message/i) },
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'type',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'upstream_invalid_params_other',
+            recovery: { hint: expect.stringMatching(/upstream message/i) },
+          },
         },
       });
     });
@@ -860,6 +866,132 @@ describe('analyzeTrendsTool', () => {
       expect(description).toContain('/unknown');
       expect(description).toMatch(/boolean/i);
       expect(description).toMatch(/not a filter value/i);
+    });
+  });
+
+  /**
+   * OpenAlex builds `authorships.countries` groups from each work's first 100 authorships, so a
+   * country distribution over large collaborations undercounts; `authorships.institutions.country_code`
+   * and every other `authorships.*` group_by count all authorships. The response carried the
+   * capped counts with nothing saying so. (gh #91)
+   */
+  describe('authorships.countries first-100 cap (gh #91)', () => {
+    const CAP = /first 100 authorships/;
+    const FULL_COUNT_FIELD = 'authorships.institutions.country_code';
+    const contentText = (blocks: { type: string; text?: string }[] | undefined) =>
+      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+    const noticeOf = (result: { structuredContent?: unknown }) =>
+      (result.structuredContent as { notice?: string } | undefined)?.notice;
+
+    const countryGroups: AnalyzeResult = {
+      meta: { count: 1, groups_count: 2, next_cursor: null },
+      groups: [
+        { key: 'https://openalex.org/countries/US', key_display_name: 'United States', count: 1 },
+        { key: 'https://openalex.org/countries/DE', key_display_name: 'Germany', count: 1 },
+      ],
+    };
+
+    it.each<[groupBy: string, extra: Record<string, unknown>]>([
+      ['authorships.countries', {}],
+      ['authorships.countries', { include_unknown: true }],
+      ['authorships.countries:include_unknown', {}],
+    ])(
+      'discloses the cap and the full-count field on both surfaces for works grouped by %s %o, from one service call',
+      async (groupBy, extra) => {
+        mockAnalyze.mockResolvedValue(countryGroups);
+
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: groupBy,
+          filters: { openalex: 'W1858542512' },
+          ...extra,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(mockAnalyze).toHaveBeenCalledTimes(1);
+        for (const surface of [noticeOf(result) ?? '', contentText(result.content)]) {
+          expect(surface).toMatch(CAP);
+          expect(surface).toContain(FULL_COUNT_FIELD);
+          expect(surface).not.toContain('authors_count:>100');
+        }
+        expect((result.structuredContent as AnalyzeResult).groups).toEqual(countryGroups.groups);
+      },
+    );
+
+    it.each<[label: string, page: AnalyzeResult, extra: Record<string, unknown>, other: string]>([
+      [
+        'a full page (cap reached)',
+        { ...countryGroups, meta: { ...countryGroups.meta, groups_count: 2 } },
+        { per_page: 2 },
+        'top 2 groups by count',
+      ],
+      [
+        'an empty first page',
+        { meta: { count: 0, groups_count: 0, next_cursor: null }, groups: [] },
+        {},
+        'No groups returned',
+      ],
+      [
+        'a cursor continuation past the last group',
+        { meta: { count: 1, groups_count: 0, next_cursor: null }, groups: [] },
+        { order: 'key', cursor: 'past-the-end' },
+        'Pagination exhausted',
+      ],
+    ])('keeps the other notice beside the cap on %s', async (_label, page, extra, other) => {
+      mockAnalyze.mockResolvedValue(page);
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'authorships.countries',
+        ...extra,
+      });
+
+      const notice = noticeOf(result) ?? '';
+      expect(notice).toContain(other);
+      expect(notice).toMatch(CAP);
+      const text = contentText(result.content);
+      expect(text).toContain(other);
+      expect(text).toMatch(CAP);
+      expect(mockAnalyze).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      // Measured to count every authorship of a 2,932-author work, not its first 100.
+      ['works', 'authorships.institutions.country_code'],
+      ['works', 'authorships.institutions.type'],
+      ['works', 'authorships.institutions.id'],
+      ['works', 'authorships.institutions.ror'],
+      ['works', 'authorships.institutions.lineage'],
+      ['works', 'authorships.affiliations.institution_ids'],
+      ['works', 'authorships.author.id'],
+      ['works', 'authorships.author.orcid'],
+      ['works', 'publication_year'],
+      ['works', 'authors_count'],
+      ['authors', 'last_known_institutions.country_code'],
+      ['sources', 'authorships.countries'],
+    ] as const)('adds no cap notice for %s grouped by %s', async (entityType, groupBy) => {
+      mockAnalyze.mockResolvedValue(countryGroups);
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: entityType,
+        group_by: groupBy,
+        filters: { openalex: 'W1858542512' },
+      });
+
+      expect(noticeOf(result)).toBeUndefined();
+      expect(contentText(result.content)).not.toMatch(CAP);
+    });
+
+    it('states the cap on authorships.countries alone in the group_by and notice descriptions', () => {
+      const groupBy = analyzeTrendsTool.input.shape.group_by.description ?? '';
+      expect(groupBy).toMatch(/authorships\.countries[^.]*first 100 authorships/);
+      expect(groupBy).toMatch(/authorships\.institutions\.country_code[^.]*every authorship/);
+      const notice = analyzeTrendsTool.enrichment?.notice.description ?? '';
+      expect(notice).toMatch(/authorships\.countries[^.]*first 100 authorships/);
+      for (const description of [groupBy, notice]) {
+        expect(description).not.toContain('authorships.*');
+        expect(description).not.toContain('authors_count:>100');
+      }
     });
   });
 });

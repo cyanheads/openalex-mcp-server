@@ -6,12 +6,25 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
-import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
-import { ENTITY_TYPES, type EntityRecord } from '@/services/openalex/types.js';
+import {
+  type BudgetDisclosure,
+  type BudgetedPage,
+  fitRecordsToBudget,
+  fitSliceToBudget,
+  formatRecordPage,
+  joinNotices,
+  measurePageFrame,
+  omittedOutputSchema,
+  overBudgetOutputSchema,
+  windowsOutputSchema,
+} from '@/mcp-server/tools/response-budget.js';
+import { getOpenAlexService, translateSelectField } from '@/services/openalex/openalex-service.js';
+import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 const SEMANTIC_PER_PAGE_CAP = 50;
 const SAMPLE_MAX = 100;
+/** What `meta.count` counts, in the rendered header. */
+const RESULT_NOUN = 'result(s)';
 
 type SearchEchoInput = {
   entity_type: string;
@@ -80,7 +93,7 @@ function isContinuationPage(input: {
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. Responses cap at 64,000 bytes per surface unless the least a call can return is larger (`over_budget`); `omitted` and `windows` give the calls that continue a cut, and `slice` pages a long array.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -144,6 +157,20 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       recovery: 'Pass `sample` to enable random sampling, or remove `seed`.',
     },
     {
+      reason: 'slice_without_id',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search passed `slice` without `id` — slice pages one array of one record.',
+      recovery:
+        "Pass the record's `id` alongside `slice`, or drop `slice` to run the search; a `windows` entry's `next` call carries both.",
+    },
+    {
+      reason: 'slice_field_not_array',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The `slice` field is `*`, or is not an array on the record at `id` — absent, null, a scalar, or an object.',
+      recovery:
+        'Name a top-level array field of that record, such as authorships, referenced_works, or locations; openalex_describe_fields(entity_type, "select") lists the field names.',
+    },
+    {
       reason: 'entity_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'Lookup by id matched no OpenAlex entity.',
@@ -165,7 +192,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
       retryable: false,
       recovery:
-        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+        "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed.",
       thrownBy: 'service',
     },
     {
@@ -267,7 +294,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). An array too long for the response budget comes back as a window (`windows`); page the rest with `slice`. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -298,7 +325,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. Invalid field names produce an error identifying the rejected field. Example: ["doi", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. Invalid field names produce an error identifying the rejected field. Large projections may be cut to fit the response budget (`omitted`, `windows`). Not applied with `slice`. Example: ["doi", "authorships", "primary_topic"].',
       ),
     per_page: z
       .number()
@@ -307,7 +334,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .max(100)
       .default(25)
       .describe(
-        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The cap applies to searches only; an `id` lookup returns its one record regardless of both.',
+        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The cap applies to searches only; an `id` lookup returns its one record regardless of both. A budget-cut page returns fewer (`omitted`).',
       ),
     cursor: z
       .string()
@@ -339,6 +366,24 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .describe(
         'Deterministic seed for `sample`. Same seed + same filters = same results — pass when reproducibility matters. Has no effect without `sample`, and a search that passes it alone is rejected.',
       ),
+    slice: z
+      .object({
+        field: z
+          .string()
+          .describe(
+            'Top-level array field to page, such as "authorships" or "referenced_works". Leave it empty to skip slicing.',
+          ),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .default(0)
+          .describe('0-based index of the first element to return.'),
+      })
+      .optional()
+      .describe(
+        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. Walks any partial array, including a possibly capped 100-authorship list.',
+      ),
   }),
   output: z.object({
     meta: z
@@ -351,19 +396,25 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         per_page: z
           .number()
           .describe(
-            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this.',
+            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
           ),
         next_cursor: z
           .string()
           .nullable()
-          .describe('Cursor for next page. null if no more results.'),
+          .describe(
+            'Cursor for next page. null if no more results. Continues after the full upstream page, `omitted` records included.',
+          ),
       })
       .describe('Result metadata including pagination.'),
     results: z
       .array(
         z
           .object({
-            id: z.string().describe('OpenAlex ID (e.g., "W2741809807", "A1234567890").'),
+            id: z
+              .string()
+              .describe(
+                'OpenAlex ID URL (e.g., "https://openalex.org/W2741809807"). `windows` and `omitted` name records by the bare ID ("W2741809807"); a keyword keeps its URL.',
+              ),
             display_name: z
               .string()
               .nullable()
@@ -371,14 +422,17 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
                 'Entity name or work title. null when OpenAlex holds no title for the record (paratext works and other untitled entries) — use `id` to identify it.',
               ),
           })
-          .passthrough()
+          .loose()
           .describe(
             'A single OpenAlex entity record. `id` is always present and `display_name` is always returned (though it may be null); additional fields vary by entity_type and `select`.',
           ),
       )
       .describe(
-        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — and an abstract arrives reconstructed as `abstract`. Additional fields depend on entity_type and select.',
+        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`. Additional fields depend on entity_type and select. Records cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
       ),
+    omitted: omittedOutputSchema,
+    windows: windowsOutputSchema,
+    over_budget: overBudgetOutputSchema,
   }),
 
   // Agent-facing context for the success path — the query/filters as parsed, the
@@ -395,7 +449,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), and on every semantic search to disclose that `meta.count` is a candidate total rather than a match total. Absent otherwise.',
+        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), on every semantic search to disclose that `meta.count` is a candidate total rather than a match total, when the response budget cut records, windowed an array, or ran over, when a list record carries exactly 100 authorships (possibly capped), when a `slice` offset is past the end of its array, and when `slice` was passed with `select`, which it replaces. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -428,6 +482,24 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   },
 
   async handler(input, ctx) {
+    // A form client sends an empty `slice.field` for an unset slice; an empty field is no slice.
+    const slice = input.slice?.field ? input.slice : undefined;
+    if (slice && !input.id) {
+      throw ctx.fail(
+        'slice_without_id',
+        '`slice` pages one array of the record at `id`, and no `id` was supplied.',
+        { slice },
+      );
+    }
+    // `*` would fetch the full record only to find no field of that name; refuse it up front.
+    if (slice?.field === '*') {
+      throw ctx.fail(
+        'slice_field_not_array',
+        '`slice.field` is `*`, which names every field rather than one array.',
+        { field: slice.field, id: input.id },
+      );
+    }
+
     /**
      * Reject list-query parameter combinations OpenAlex cannot serve. Every check here
      * constrains a *list* query. `id` takes the singleton path in `OpenAlexService.search()`,
@@ -444,7 +516,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'semantic_without_query',
           'Semantic search needs `query` text to embed — none was supplied.',
-          { ...ctx.recoveryFor('semantic_without_query'), searchMode: input.search_mode },
+          { searchMode: input.search_mode },
         );
       }
 
@@ -452,12 +524,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'semantic_per_page_cap',
           `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-          {
-            ...ctx.recoveryFor('semantic_per_page_cap'),
-            searchMode: input.search_mode,
-            perPage: input.per_page,
-            cap: SEMANTIC_PER_PAGE_CAP,
-          },
+          { searchMode: input.search_mode, perPage: input.per_page, cap: SEMANTIC_PER_PAGE_CAP },
         );
       }
 
@@ -467,11 +534,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'semantic_with_cursor',
           'Semantic search does not accept `cursor` — walk its candidates with `page` (1-based) instead.',
-          {
-            ...ctx.recoveryFor('semantic_with_cursor'),
-            searchMode: input.search_mode,
-            cursor: input.cursor,
-          },
+          { searchMode: input.search_mode, cursor: input.cursor },
         );
       }
 
@@ -481,11 +544,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'page_without_semantic',
           `\`page\` applies to semantic search only — search_mode is "${input.search_mode}", which paginates with \`cursor\`.`,
-          {
-            ...ctx.recoveryFor('page_without_semantic'),
-            searchMode: input.search_mode,
-            page: input.page,
-          },
+          { searchMode: input.search_mode, page: input.page },
         );
       }
 
@@ -493,7 +552,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'sample_with_cursor',
           'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
-          { ...ctx.recoveryFor('sample_with_cursor'), sample: input.sample, cursor: input.cursor },
+          { sample: input.sample, cursor: input.cursor },
         );
       }
 
@@ -504,7 +563,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'sample_with_page',
           'Sampling returns one page only — `sample` cannot be combined with `page` pagination.',
-          { ...ctx.recoveryFor('sample_with_page'), sample: input.sample, page: input.page },
+          { sample: input.sample, page: input.page },
         );
       }
 
@@ -516,11 +575,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'sample_with_semantic',
           'Semantic search does not sample — OpenAlex returns the same ranked candidates under every seed.',
-          {
-            ...ctx.recoveryFor('sample_with_semantic'),
-            sample: input.sample,
-            searchMode: input.search_mode,
-          },
+          { sample: input.sample, searchMode: input.search_mode },
         );
       }
 
@@ -530,7 +585,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'sample_with_sort',
           'A random sample cannot be sorted — `sample` cannot be combined with `sort`.',
-          { ...ctx.recoveryFor('sample_with_sort'), sample: input.sample, sort: input.sort },
+          { sample: input.sample, sort: input.sort },
         );
       }
 
@@ -538,7 +593,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         throw ctx.fail(
           'seed_without_sample',
           '`seed` is only meaningful with `sample` — pass `sample` to enable random sampling.',
-          { ...ctx.recoveryFor('seed_without_sample'), seed: input.seed },
+          { seed: input.seed },
         );
       }
     }
@@ -552,7 +607,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         searchMode: input.search_mode,
         filters: input.filters,
         sort: input.sort,
-        select: input.select,
+        select: slice ? [slice.field] : input.select,
         perPage: input.per_page,
         cursor: input.cursor,
         page: input.page,
@@ -601,34 +656,65 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       );
     }
 
-    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
+    if (slice && input.select) {
+      notices.push(
+        '`slice` returns only `id`, `display_name`, and the sliced field, so `select` was not applied.',
+      );
+    }
 
-    return {
-      meta: {
-        count: result.meta.count,
-        per_page: result.meta.per_page,
-        next_cursor: result.meta.next_cursor,
-      },
-      results: result.results,
+    const meta = {
+      count: result.meta.count,
+      per_page: result.meta.per_page,
+      next_cursor: result.meta.next_cursor,
     };
-  },
+    const measureFrame = (disclosure: BudgetDisclosure, budgetNotice: string | undefined) =>
+      measurePageFrame({ meta, results: [], ...disclosure }, RESULT_NOUN, {
+        echo,
+        totalCount: result.meta.count,
+        totalLabel: 'Total',
+        notice: joinNotices([...notices, budgetNotice]),
+      });
 
-  format: (result) => {
-    const lines: string[] = [];
-    const countLabel = `${result.meta.count} result(s) — ${result.meta.per_page} per page`;
-    const header = result.meta.next_cursor
-      ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
-      : `**${countLabel}**`;
-    lines.push(header);
-
-    if (result.results.length === 0) {
-      return [{ type: 'text', text: lines.join('\n') }];
+    let page: BudgetedPage;
+    if (slice) {
+      // The one-field projection lands under the canonical key — `authors` arrives as `authorships`.
+      const field = translateSelectField(input.entity_type, slice.field);
+      const [record] = result.results;
+      const items = record?.[field];
+      if (!record || !Array.isArray(items)) {
+        throw ctx.fail(
+          'slice_field_not_array',
+          `\`${slice.field}\` is not an array on the record at ${input.id}.`,
+          { field: slice.field, id: input.id },
+        );
+      }
+      if (slice.offset > items.length) {
+        notices.push(
+          `slice.offset ${slice.offset} is past the end of \`${field}\`, which holds ${items.length} element(s), so nothing follows.`,
+        );
+      }
+      page = fitSliceToBudget({
+        record,
+        field,
+        offset: slice.offset,
+        entityType: input.entity_type,
+        measureFrame,
+      });
+    } else {
+      page = fitRecordsToBudget({
+        records: result.results,
+        entityType: input.entity_type,
+        path: input.id ? 'lookup' : 'list',
+        select: input.select,
+        measureFrame,
+      });
     }
 
-    for (const record of result.results) {
-      lines.push(...renderEntityRecord(record as EntityRecord));
-    }
+    const notice = joinNotices([...notices, page.notice]);
+    if (notice) ctx.enrich.notice(notice);
 
-    return [{ type: 'text', text: lines.join('\n') }];
+    return { meta, results: page.results, ...page.disclosure };
   },
+
+  format: (result) => formatRecordPage(result, RESULT_NOUN),
 });

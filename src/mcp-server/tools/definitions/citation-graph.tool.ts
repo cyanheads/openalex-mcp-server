@@ -6,11 +6,20 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
+import {
+  fitRecordsToBudget,
+  formatRecordPage,
+  joinNotices,
+  measurePageFrame,
+  omittedOutputSchema,
+  overBudgetOutputSchema,
+  windowsOutputSchema,
+} from '@/mcp-server/tools/response-budget.js';
 import { getOpenAlexService, translateFilterKey } from '@/services/openalex/openalex-service.js';
-import type { EntityRecord } from '@/services/openalex/types.js';
 
 const OPENALEX_URL_PREFIX = 'https://openalex.org/';
+/** What `meta.count` counts, in the rendered header. */
+const EDGE_NOUN = 'edge(s)';
 
 const DIRECTIONS = ['cites', 'cited_by', 'related_to'] as const;
 type Direction = (typeof DIRECTIONS)[number];
@@ -33,7 +42,7 @@ function buildCitationEcho(input: {
 
 export const getCitationGraphTool = tool('openalex_get_citation_graph', {
   description:
-    "Walk the citation graph one hop from a seed work. Direction picks the edge: incoming citations (`cites`), the seed's own references (`cited_by`), or OpenAlex's algorithmically-related works (`related_to`). Note: `direction` follows OpenAlex's filter convention, which inverts the common English reading — `cites` returns works that cite the seed; `cited_by` returns works the seed cites. Results use the works schema; combine with filters/sort to narrow further.",
+    "Walk the citation graph one hop from a seed work. Direction picks the edge: incoming citations (`cites`), the seed's own references (`cited_by`), or OpenAlex's algorithmically-related works (`related_to`). Note: `direction` follows OpenAlex's filter convention, which inverts the common English reading — `cites` returns works that cite the seed; `cited_by` returns works the seed cites. Results use the works schema; combine with filters/sort to narrow further. Responses cap at 64,000 bytes per surface unless the least a call can return is larger (`over_budget`); `omitted` and `windows` give the openalex_search_entities calls that continue a cut.",
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/citation-graph.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -53,7 +62,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
       retryable: false,
       recovery:
-        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+        "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed.",
       thrownBy: 'service',
     },
     {
@@ -174,7 +183,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted.',
+        'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted. Large projections may be cut to fit the response budget (`omitted`, `windows`).',
       ),
     per_page: z
       .number()
@@ -182,7 +191,9 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .min(1)
       .max(100)
       .default(25)
-      .describe('Results per page (1-100). Default 25.'),
+      .describe(
+        'Results per page (1-100). Default 25. A budget-cut page returns fewer (`omitted`).',
+      ),
     cursor: z
       .string()
       .min(1)
@@ -200,12 +211,14 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         per_page: z
           .number()
           .describe(
-            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this.',
+            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
           ),
         next_cursor: z
           .string()
           .nullable()
-          .describe('Cursor for next page. null if no more results.'),
+          .describe(
+            'Cursor for next page. null if no more results. Continues after the full upstream page, `omitted` works included.',
+          ),
       })
       .describe('Result metadata including pagination.'),
     results: z
@@ -220,14 +233,17 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
                 'Work title. null when OpenAlex holds no title for the record (paratext works and other untitled entries) — use `id` to identify it.',
               ),
           })
-          .passthrough()
+          .loose()
           .describe(
             'A single OpenAlex work record on the citation graph. Additional fields vary by `select`.',
           ),
       )
       .describe(
-        'Works on the citation graph in this direction. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed.',
+        'Works on the citation graph in this direction. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them. Works cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
       ),
+    omitted: omittedOutputSchema,
+    windows: windowsOutputSchema,
+    over_budget: overBudgetOutputSchema,
   }),
 
   // Agent-facing context for the success path — the query as parsed (seed + direction),
@@ -244,7 +260,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .optional()
       .describe(
-        'Guidance when no edges are returned. A first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead. Absent when results are present.',
+        'Guidance notice. Set when no edges are returned — a first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead — when the response budget cut works, windowed an array, or ran over, and when a work carries exactly 100 authorships (possibly capped). Absent otherwise.',
       ),
     budget: z
       .object({
@@ -292,11 +308,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       throw ctx.fail(
         'reserved_filter_key',
         `${reserved} cannot be passed in filters${resolution}, and direction reserves cites/cited_by/related_to.`,
-        {
-          ...ctx.recoveryFor('reserved_filter_key'),
-          reservedKey: reserved,
-          direction: input.direction,
-        },
+        { reservedKey: reserved, direction: input.direction },
       );
     }
 
@@ -319,7 +331,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       throw ctx.fail(
         'entity_not_found',
         `Could not resolve seed_id "${input.seed_id}" to an OpenAlex work ID.`,
-        { ...ctx.recoveryFor('entity_not_found'), seedId: input.seed_id },
+        { seedId: input.seed_id },
       );
     }
     const workId = seedRecord.id.replace(OPENALEX_URL_PREFIX, '');
@@ -352,40 +364,37 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     ctx.enrich({ echo, totalCount: result.meta.count });
     // An empty page on a `cursor` continuation means the walk already returned every edge it
     // had, so the verify-the-seed advice would send the caller after a seed that is fine.
-    if (result.results.length === 0) {
-      ctx.enrich.notice(
-        input.cursor === undefined
+    const emptyNotice =
+      result.results.length > 0
+        ? undefined
+        : input.cursor === undefined
           ? `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`
-          : `Pagination exhausted for ${echo} — the previous page held the last edge, so this one came back empty. Stop paging rather than broadening filters or changing direction.`,
-      );
-    }
+          : `Pagination exhausted for ${echo} — the previous page held the last edge, so this one came back empty. Stop paging rather than broadening filters or changing direction.`;
 
-    return {
-      meta: {
-        count: result.meta.count,
-        per_page: result.meta.per_page,
-        next_cursor: result.meta.next_cursor,
-      },
-      results: result.results,
+    const meta = {
+      count: result.meta.count,
+      per_page: result.meta.per_page,
+      next_cursor: result.meta.next_cursor,
     };
+    const page = fitRecordsToBudget({
+      records: result.results,
+      entityType: 'works',
+      path: 'list',
+      select: input.select,
+      measureFrame: (disclosure, budgetNotice) =>
+        measurePageFrame({ meta, results: [], ...disclosure }, EDGE_NOUN, {
+          echo,
+          totalCount: result.meta.count,
+          totalLabel: 'Total Edges',
+          notice: joinNotices([emptyNotice, budgetNotice]),
+        }),
+    });
+
+    const notice = joinNotices([emptyNotice, page.notice]);
+    if (notice) ctx.enrich.notice(notice);
+
+    return { meta, results: page.results, ...page.disclosure };
   },
 
-  format: (result) => {
-    const lines: string[] = [];
-    const countLabel = `${result.meta.count} edge(s) — ${result.meta.per_page} per page`;
-    const header = result.meta.next_cursor
-      ? `**${countLabel}** — next cursor: \`${result.meta.next_cursor}\``
-      : `**${countLabel}**`;
-    lines.push(header);
-
-    if (result.results.length === 0) {
-      return [{ type: 'text', text: lines.join('\n') }];
-    }
-
-    for (const record of result.results) {
-      lines.push(...renderEntityRecord(record as EntityRecord));
-    }
-
-    return [{ type: 'text', text: lines.join('\n') }];
-  },
+  format: (result) => formatRecordPage(result, EDGE_NOUN),
 });

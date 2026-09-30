@@ -28,7 +28,7 @@ await createApp({
   ],
   prompts: [literatureReviewPrompt, researchLandscapePrompt],
   instructions:
-    'Use the openalex_* tools to query the OpenAlex scholarly catalog (works, authors, sources, institutions, topics, keywords, publishers, funders): resolve names to IDs, search/filter/sort or fetch by ID, and group_by for trends. Names are ambiguous and IDs are not — call openalex_resolve_name before filtering by entity.',
+    "Use the openalex_* tools to query the OpenAlex scholarly catalog (works, authors, sources, institutions, topics, keywords, publishers, funders): resolve names to IDs, search/filter/sort or fetch by ID, and group_by for trends. Names are ambiguous and IDs are not — call openalex_resolve_name before filtering by entity. Record responses hold to 64,000 bytes per surface: a cut page names its `omitted` IDs and the call that returns them (in OpenAlex's order), and an array too long to fit comes back as a window that an `id` lookup pages with `slice`.",
   landing: {
     tagline: 'Search the OpenAlex catalog — 270M+ works, 90M+ authors, 100K+ sources.',
     requireAuth: false,

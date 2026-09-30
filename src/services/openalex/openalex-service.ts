@@ -76,7 +76,7 @@ type FilterClause = [key: string, value: string];
  *   (skip if already quoted).
  * - All other keys: throw a pre-flight validation error — OpenAlex OR-lists use `|`, not commas.
  */
-function buildFilterString(filters: FilterClause[], ctx: Context): string {
+function buildFilterString(filters: FilterClause[]): string {
   return filters
     .map(([key, value]) => {
       if (value.includes(',')) {
@@ -88,11 +88,7 @@ function buildFilterString(filters: FilterClause[], ctx: Context): string {
         // Non-search key: comma is a caller error — OpenAlex uses | for OR, not comma.
         throw invalidParams(
           `Filter \`${key}\` value contains a comma, which OpenAlex reads as a filter separator. Use \`|\` for OR (e.g. \`2020|2021\`), or a \`.search\` filter or the \`query\` parameter for free text.`,
-          {
-            ...ctx.recoveryFor('comma_in_filter_value'),
-            reason: 'comma_in_filter_value',
-            filterKey: key,
-          },
+          { reason: 'comma_in_filter_value', filterKey: key },
         );
       }
       return `${key}:${value}`;
@@ -320,7 +316,7 @@ export function inferIdentifier(query: string): ResolvedIdentifier | undefined {
   const colon = normalized.indexOf(':');
   if (colon > 0) {
     const scheme = normalized.slice(0, colon).toLowerCase();
-    const entityType = ENTITY_TYPE_BY_ID_PREFIX[scheme];
+    const entityType = ownEntry(ENTITY_TYPE_BY_ID_PREFIX, scheme);
     return entityType ? { entityType, id: normalized, scheme } : undefined;
   }
 
@@ -539,15 +535,37 @@ const FILTER_ALIASES_WORKS: Record<string, string> = {
  * aliasing rather than before.
  */
 function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
-  const withRequired = Array.from(new Set([...REQUIRED_SEARCH_FIELDS, ...fields]));
+  const upstream = [...REQUIRED_SEARCH_FIELDS, ...fields].map((field) =>
+    translateSelectField(entityType, field),
+  );
+  return Array.from(new Set(upstream));
+}
+
+/**
+ * The upstream field one caller-supplied `select` name projects to — `authors` → `authorships`
+ * on works, `h_index` → `summary_stats` where that object exists; any other name unchanged.
+ * Exported so a tool can find the record key a one-field projection lands under.
+ */
+export function translateSelectField(
+  entityType: SearchParams['entityType'],
+  field: string,
+): string {
   const aliases =
     entityType === 'works'
       ? SELECT_ALIASES_WORKS
       : SUMMARY_STATS_ENTITY_TYPES.has(entityType)
         ? SELECT_ALIASES_SUMMARY_STATS
         : undefined;
-  if (!aliases) return withRequired;
-  return Array.from(new Set(withRequired.map((field) => aliases[field] ?? field)));
+  return ownEntry(aliases, field) ?? field;
+}
+
+/**
+ * A table's own entry for `key`, or undefined. The alias and scheme tables are plain object
+ * literals, so a bracket read of a caller-supplied `constructor` or `__proto__` returns the
+ * inherited `Object.prototype` member instead of missing.
+ */
+function ownEntry<V>(table: Record<string, V> | undefined, key: string): V | undefined {
+  return table !== undefined && Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
 /**
@@ -596,7 +614,7 @@ function isOpenAlexFilterValue(value: string): boolean {
  * typos no map can preempt.
  */
 export function translateFilterKey(entityType: SearchParams['entityType'], key: string): string {
-  return entityType === 'works' ? (FILTER_ALIASES_WORKS[key] ?? key) : key;
+  return entityType === 'works' ? (ownEntry(FILTER_ALIASES_WORKS, key) ?? key) : key;
 }
 
 /**
@@ -639,8 +657,8 @@ type ErrorFactory = (
 /**
  * `JsonRpcErrorCode` → `{ factory, reason }` for shaping normalized OpenAlex throws.
  * Driven by `httpStatusToErrorCode` so the status-table stays in lockstep with the
- * framework. `reason` is the literal carried on `data.reason` and matched against
- * tool contracts via `ctx.recoveryFor`.
+ * framework. `reason` is the literal carried on `data.reason`; the framework matches it
+ * against the calling tool's contract and fills that entry's recovery hint.
  */
 const NORMALIZED_THROW_BY_CODE: Partial<
   Record<JsonRpcErrorCode, { factory: ErrorFactory; reason: string }>
@@ -837,7 +855,7 @@ const QUERY_TOO_LONG_RE = /\bsearch\b(?: query)?(?: is)? too long\b/i;
 /**
  * A single upstream HTTP 400 spans several distinct failure shapes, each needing a different
  * caller recovery. Pick the declared tool reason from the message shape so the per-tool
- * `recovery` hint (resolved via `ctx.recoveryFor`) matches the actual failure instead of
+ * `recovery` hint (filled by the framework from the reason) matches the actual failure instead of
  * always claiming a rejected field name. Ordering: the over-long-query and ID-value checks run
  * first because they are the shapes naming a concrete upstream concept; the field-name check is
  * anchored at string start; the rest are keyword probes; anything unmatched falls through to a
@@ -889,6 +907,15 @@ function overLongAutocompleteQuery(
 
 /** Reason for a 429 caused by daily-budget exhaustion rather than burst throttling. */
 const BUDGET_EXHAUSTED_REASON = 'upstream_budget_exhausted';
+
+/**
+ * Recovery for a spent daily budget on a server that sends no API key. It runs on the smaller
+ * anonymous budget, so a key is the one fix besides waiting. A keyed server's budget is already
+ * the larger one, and a caller of a shared endpoint cannot set the server's environment, so that
+ * case keeps the key-neutral recovery each tool's contract declares.
+ */
+export const BUDGET_EXHAUSTED_KEYLESS_HINT =
+  "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed. The server sends no OpenAlex API key, so it runs on the smaller anonymous budget; setting OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) raises it.";
 
 /**
  * OpenAlex returns 429 for two unrelated conditions: bursting past its per-second ceiling,
@@ -1086,7 +1113,7 @@ class OpenAlexService {
           logResponseMetrics(parsed, budget, path, ctx);
           return parsed;
         } catch (error) {
-          this.throwNormalizedRequestError(error, path, params, ctx);
+          this.throwNormalizedRequestError(error, path, params);
         }
       },
       {
@@ -1103,7 +1130,6 @@ class OpenAlexService {
     error: unknown,
     path: string,
     params: Record<string, string>,
-    ctx: Context,
   ): never {
     if (!(error instanceof McpError)) {
       throw error;
@@ -1119,13 +1145,7 @@ class OpenAlexService {
     if (overLongQuery !== undefined) {
       throw invalidParams(
         `OpenAlex autocomplete failed on a ${overLongQuery.toLocaleString('en-US')}-character query — ${path} accepts at most ${AUTOCOMPLETE_QUERY_MAX_CODE_POINTS.toLocaleString('en-US')} characters.`,
-        {
-          ...error.data,
-          path,
-          reason: 'query_too_long',
-          ...ctx.recoveryFor('query_too_long'),
-          retryable: false,
-        },
+        { ...error.data, path, reason: 'query_too_long', retryable: false },
         { cause: error },
       );
     }
@@ -1178,10 +1198,10 @@ class OpenAlexService {
       ...error.data,
       path,
       reason,
-      ...ctx.recoveryFor(reason),
       // A PMCID lookup that 404s is not a miss to verify and retry — OpenAlex indexes no
       // PMCIDs, so every tool's generic "verify the ID" recovery hands back the one instruction
-      // that cannot help. Substituted here, where all three ID-accepting tools inherit it.
+      // that cannot help. Substituted here, where all three ID-accepting tools inherit it; an
+      // explicit hint wins over the one the framework would fill from the contract.
       ...(code === JsonRpcErrorCode.NotFound && isPmcidLookup(path)
         ? { recovery: { hint: PMCID_NOT_INDEXED_HINT } }
         : {}),
@@ -1190,6 +1210,11 @@ class OpenAlexService {
       // flag is the framework's per-error opt-out from that loop; the contract's own
       // `retryable` field only informs the client and cannot stop our own retries.
       ...(reason === BUDGET_EXHAUSTED_REASON ? { retryable: false } : {}),
+      // Only a keyless server can raise its budget with a key; an explicit hint wins over the
+      // key-neutral one the framework fills from the contract.
+      ...(reason === BUDGET_EXHAUSTED_REASON && !this.apiKey
+        ? { recovery: { hint: BUDGET_EXHAUSTED_KEYLESS_HINT } }
+        : {}),
       ...(upstream?.error ? { upstreamError: upstream.error } : {}),
       ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
     };
@@ -1261,10 +1286,7 @@ class OpenAlexService {
     }
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(
-        translateFilters(params.entityType, params.filters),
-        ctx,
-      );
+      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
     }
 
     const sort = normalizeSort(params.sort);
@@ -1342,10 +1364,7 @@ class OpenAlexService {
       : params.groupBy;
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(
-        translateFilters(params.entityType, params.filters),
-        ctx,
-      );
+      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
     }
 
     if (params.perPage !== undefined) {
@@ -1384,11 +1403,7 @@ class OpenAlexService {
     if (data.group_by === undefined) {
       throw serviceUnavailable(
         `OpenAlex returned no group_by aggregation for ${path} (group_by=${params.groupBy})`,
-        {
-          path,
-          reason: 'upstream_missing_group_by',
-          ...ctx.recoveryFor('upstream_missing_group_by'),
-        },
+        { path, reason: 'upstream_missing_group_by' },
       );
     }
 
@@ -1447,7 +1462,7 @@ class OpenAlexService {
     };
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(Object.entries(params.filters), ctx);
+      queryParams.filter = buildFilterString(Object.entries(params.filters));
     }
 
     const data = (await this.request(path, queryParams, ctx)) as {

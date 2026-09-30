@@ -92,19 +92,39 @@ function compactPairs(value: Record<string, unknown>): string {
   return flattenLeaves(value).join(', ');
 }
 
-function renderField(field: string, value: unknown): string {
+/** Where an array returned in part sits in the full array. */
+export interface ArrayWindowView {
+  /** Index in the full array of the first element shown. */
+  offset: number;
+  /** Elements in the full array. */
+  total: number;
+}
+
+const count = (n: number): string => n.toLocaleString('en-US');
+
+/** The note a partly shown array carries on its label line; undefined when it shows every element. */
+function windowNote(shown: number, view: ArrayWindowView | undefined): string | undefined {
+  if (!view || shown >= view.total) return;
+  const from = view.offset > 0 ? ` from offset ${count(view.offset)}` : '';
+  return `(${count(shown)} of ${count(view.total)} shown${from} — windowed; see Window)`;
+}
+
+function renderField(field: string, value: unknown, view: ArrayWindowView | undefined): string {
   const label = toFieldLabel(field);
   if (value == null) return `**${label}:** —`;
   if (isScalar(value)) return `**${label}:** ${renderScalar(value)}`;
   if (Array.isArray(value)) {
-    if (value.length === 0) return `**${label}:** (empty)`;
-    if (value.every(isScalarOrNull)) return `**${label}:** ${renderScalarList(value)}`;
+    const note = windowNote(value.length, view);
+    const head = note ? `**${label}:** ${note}` : `**${label}:**`;
+    if (value.length === 0) return note ? head : `**${label}:** (empty)`;
+    if (value.every(isScalarOrNull)) return `${head} ${renderScalarList(value)}`;
+    const first = view?.offset ?? 0;
     const items = value.map((item, i) =>
       isPlainObject(item)
-        ? `- [${i}] ${compactPairs(item)}`
-        : `- [${i}] ${flattenLeaves(item).join(', ') || '—'}`,
+        ? `- [${first + i}] ${compactPairs(item)}`
+        : `- [${first + i}] ${flattenLeaves(item).join(', ') || '—'}`,
     );
-    return `**${label}:**\n${items.join('\n')}`;
+    return `${head}\n${items.join('\n')}`;
   }
   if (isPlainObject(value)) return `**${label}:** ${compactPairs(value)}`;
   return `**${label}:** ${String(value)}`;
@@ -115,8 +135,15 @@ function renderField(field: string, value: unknown): string {
  * the ID, then each remaining field as a labeled line. Caller joins the lines into
  * the final text block. Provider text is escaped for Markdown; field names are OpenAlex
  * schema keys and render as they are.
+ *
+ * `windows` maps an array field returned in part to where it sits in the full array: its items
+ * are numbered from `offset`, and its line says how many of `total` it shows, so a window never
+ * reads as a complete or empty array.
  */
-export function renderEntityRecord(record: EntityRecord): string[] {
+export function renderEntityRecord(
+  record: EntityRecord,
+  windows?: ReadonlyMap<string, ArrayWindowView>,
+): string[] {
   const { id, display_name, ...rest } = record;
   const lines = [
     '',
@@ -124,7 +151,7 @@ export function renderEntityRecord(record: EntityRecord): string[] {
     `**ID:** ${escapeMarkdown(id)}`,
   ];
   for (const [field, value] of Object.entries(rest)) {
-    lines.push(renderField(field, value));
+    lines.push(renderField(field, value, windows?.get(field)));
   }
   return lines;
 }

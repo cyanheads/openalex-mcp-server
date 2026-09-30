@@ -100,6 +100,56 @@ describe('renderEntityRecord', () => {
     expect(text).toContain('[1] author.display_name: Bob, author.orcid: —');
   });
 
+  it('numbers a windowed array from its start index and leaves other arrays at 0 (gh #72)', () => {
+    const lines = renderEntityRecord(
+      {
+        id: 'W001',
+        display_name: 'Paper',
+        authorships: [{ author: { display_name: 'Alice' } }, { author: { display_name: 'Bob' } }],
+        locations: [{ source: { display_name: 'arXiv' } }],
+      },
+      new Map([['authorships', { offset: 108, total: 110 }]]),
+    );
+    const text = lines.join('\n');
+    expect(text).toContain(
+      '**Authorships:** (2 of 110 shown from offset 108 — windowed; see Window)\n- [108] author.display_name: Alice\n- [109] author.display_name: Bob',
+    );
+    expect(text).not.toContain('- [0] author.display_name');
+    expect(text).toContain('**Locations:**\n- [0] source.display_name: arXiv');
+  });
+
+  describe('windowed arrays (gh #72)', () => {
+    it('marks a windowed array with no elements shown instead of rendering (empty)', () => {
+      const text = renderEntityRecord(
+        { id: 'W001', display_name: 'Paper', authorships: [], topics: [] },
+        new Map([['authorships', { offset: 0, total: 2932 }]]),
+      ).join('\n');
+      expect(text).toContain('**Authorships:** (0 of 2,932 shown — windowed; see Window)');
+      expect(text).not.toContain('**Authorships:** (empty)');
+      // An array that really is empty keeps its marker.
+      expect(text).toContain('**Topics:** (empty)');
+    });
+
+    it('marks a partly shown array of scalars on its label line', () => {
+      const text = renderEntityRecord(
+        { id: 'W001', display_name: 'Paper', referenced_works: ['W1', 'W2'] },
+        new Map([['referenced_works', { offset: 0, total: 400 }]]),
+      ).join('\n');
+      expect(text).toContain(
+        '**Referenced Works:** (2 of 400 shown — windowed; see Window) W1, W2',
+      );
+    });
+
+    it('leaves a window that shows its whole array unmarked', () => {
+      const text = renderEntityRecord(
+        { id: 'W001', display_name: 'Paper', authorships: [{ author: { display_name: 'Alice' } }] },
+        new Map([['authorships', { offset: 0, total: 1 }]]),
+      ).join('\n');
+      expect(text).toContain('**Authorships:**\n- [0] author.display_name: Alice');
+      expect(text).not.toContain('windowed');
+    });
+  });
+
   it('flattens a nested plain object to dot-notation key:value pairs', () => {
     const lines = renderEntityRecord({
       id: 'W001',

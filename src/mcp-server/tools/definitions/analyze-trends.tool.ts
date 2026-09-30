@@ -7,8 +7,13 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
+import { joinNotices } from '@/mcp-server/tools/response-budget.js';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
+
+/** Disclosure for a works group_by over `authorships.countries` (see the handler). */
+const COUNTRIES_CAP_NOTICE =
+  'OpenAlex builds authorships.countries groups from only the first 100 authorships of each work, so a country that appears only past position 100 on a large collaboration is not counted. Group by authorships.institutions.country_code to count every authorship.';
 
 export const analyzeTrendsTool = tool('openalex_analyze_trends', {
   description:
@@ -32,7 +37,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       when: 'The OpenAlex daily usage budget is spent (HTTP 429).',
       retryable: false,
       recovery:
-        'The daily budget refills at midnight UTC — retrying sooner will not succeed. Set OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) for a larger daily budget than anonymous access, or wait for the reset.',
+        "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed.",
       thrownBy: 'service',
     },
     {
@@ -134,7 +139,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .min(1)
       .describe(
-        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
       ),
     filters: z
       .record(z.string(), z.string())
@@ -223,7 +228,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no groups (recovery suggestions), when a `cursor` continuation returns none because the traversal is already finished, or when the page is full and more groups likely exist (truncation signal with narrowing advice). Absent otherwise.',
+        'Guidance notice. Set when a first call returns no groups (recovery suggestions), when a `cursor` continuation returns none because the traversal is already finished, when the page is full and more groups likely exist (truncation signal with narrowing advice), or when works are grouped by authorships.countries, which OpenAlex counts from only the first 100 authorships of each work. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -280,12 +285,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     const echo = buildAnalyzeEcho(input);
     ctx.enrich({ echo, totalCount: result.meta.count });
 
+    // `notice` is last-wins, so every sentence is collected and set once.
+    const notices: string[] = [];
+
     // An empty page on a `cursor` continuation means the key-ascending traversal already
     // enumerated every group, so there is nothing left to remove or regroup. On a first call
     // the same shape can still be an honest zero — including the all-values-unknown case,
     // where `count` is nonzero but every matched entity is null for the grouped field.
     if (result.groups.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         input.cursor === undefined
           ? `No groups returned for ${echo}. Try removing filters or grouping by a different field.`
           : `Pagination exhausted for ${echo} — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping.`,
@@ -296,7 +304,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       // "top by count"). The honest signal is whether OpenAlex returned a next_cursor; page-fill
       // is irrelevant in this mode.
       if (result.meta.next_cursor) {
-        ctx.enrich.notice(
+        notices.push(
           `Showing ${result.groups.length} groups in key-ascending order. Pass the returned \`next_cursor\` to continue the traversal.`,
         );
       }
@@ -305,10 +313,25 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       // exist. The omitted groups all have counts ≤ the smallest group shown, so we can bound the
       // gap even though OpenAlex exposes no total group count.
       const smallestCount = result.groups[result.groups.length - 1]?.count ?? 0;
-      ctx.enrich.notice(
+      notices.push(
         `Showing the top ${result.groups.length} groups by count. Smallest shown has count = ${smallestCount}; any omitted group has count ≤ ${smallestCount}. Narrow with \`filters\`, raise \`per_page\` (max 200), or enumerate all with \`order: "key"\`.`,
       );
     }
+
+    // OpenAlex aggregates authorships.countries from the first-100 window its list records carry,
+    // so the counts undercount large collaborations with nothing upstream saying so; every other
+    // authorships.* group_by counts all authorships. An empty page is included: a work whose first
+    // 100 authorships carry no country contributes no group. The service also accepts OpenAlex's
+    // own `:include_unknown` suffix in group_by.
+    if (
+      input.entity_type === 'works' &&
+      input.group_by.replace(/:include_unknown$/, '') === 'authorships.countries'
+    ) {
+      notices.push(COUNTRIES_CAP_NOTICE);
+    }
+
+    const notice = joinNotices(notices);
+    if (notice) ctx.enrich.notice(notice);
 
     return {
       meta: {

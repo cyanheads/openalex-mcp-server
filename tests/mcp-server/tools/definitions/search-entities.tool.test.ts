@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/search-entities.tool.test
  */
 
-import { z } from '@cyanheads/mcp-ts-core';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import {
   invalidParams,
   JsonRpcErrorCode,
@@ -15,8 +15,18 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SearchResult } from '@/services/openalex/types.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
+import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
+import {
+  authorship,
+  authorships,
+  contentTextBytes,
+  defaultWork,
+  slimAuthorship,
+  utf8Bytes,
+  workWithAuthorships,
+} from '../../../helpers/openalex-records.js';
 
 const mockSearch = vi.fn<() => Promise<SearchResult>>();
 
@@ -32,7 +42,12 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
   };
 });
 
-const { normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
+/** A keyless server, for the one case that runs the real service (the budget 429). */
+vi.mock('@/config/server-config.js', () => ({
+  getServerConfig: () => ({ apiKey: '', baseUrl: 'https://api.openalex.org', mailto: '' }),
+}));
+
+const { BUDGET_EXHAUSTED_KEYLESS_HINT, normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
   '@/services/openalex/openalex-service.js'
 );
 
@@ -884,19 +899,20 @@ describe('searchEntitiesTool', () => {
     });
 
     it('rejects semantic search with no query, which never ran a semantic search', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
-      const input = searchEntitiesTool.input.parse({
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         search_mode: 'semantic',
         per_page: 1,
         select: ['id'],
       });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        data: expect.objectContaining({
-          reason: 'semantic_without_query',
-          recovery: { hint: expect.stringMatching(/query/i) },
-        }),
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: expect.objectContaining({
+            reason: 'semantic_without_query',
+            recovery: { hint: expect.stringMatching(/query/i) },
+          }),
+        },
       });
       expect(mockSearch).not.toHaveBeenCalled();
     });
@@ -939,63 +955,69 @@ describe('searchEntitiesTool', () => {
 
   describe('upstream 400 recovery (gh #43)', () => {
     it('carries the sort-requires-search reason and recovery from the service', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
       mockSearch.mockRejectedValue(
         invalidParams('Must include a search query in order to sort by relevance_score.', {
           reason: 'upstream_sort_requires_search',
-          ...ctx.recoveryFor('upstream_sort_requires_search'),
         }),
       );
-      const input = searchEntitiesTool.input.parse({
+
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         sort: '-relevance_score',
       });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'upstream_sort_requires_search',
-          recovery: { hint: expect.stringMatching(/active search/i) },
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_sort_requires_search',
+            recovery: { hint: expect.stringMatching(/active search/i) },
+          },
         },
       });
     });
 
     it('carries the neutral other-400 reason and recovery from the service', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
       mockSearch.mockRejectedValue(
         invalidParams('Invalid cursor value provided.', {
           reason: 'upstream_invalid_params_other',
-          ...ctx.recoveryFor('upstream_invalid_params_other'),
         }),
       );
-      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'climate' });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        data: {
-          reason: 'upstream_invalid_params_other',
-          recovery: { hint: expect.stringMatching(/upstream message/i) },
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'climate',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'upstream_invalid_params_other',
+            recovery: { hint: expect.stringMatching(/upstream message/i) },
+          },
         },
       });
     });
 
     it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
       mockSearch.mockRejectedValue(
         invalidParams("'Albert' is not a valid OpenAlex ID.", {
           reason: 'upstream_invalid_id_value',
-          ...ctx.recoveryFor('upstream_invalid_id_value'),
         }),
       );
-      const input = searchEntitiesTool.input.parse({
+
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         filters: { 'authorships.author.id': 'Albert Einstein' },
       });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'upstream_invalid_id_value',
-          recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_invalid_id_value',
+            recovery: { hint: expect.stringMatching(/openalex_resolve_name/) },
+          },
         },
       });
     });
@@ -1023,25 +1045,84 @@ describe('searchEntitiesTool', () => {
   });
 
   describe('429 budget exhaustion (gh #54)', () => {
-    it('carries the budget reason with a non-retryable recovery', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /** Run a search whose service call fails on the budget; return the wire hint and text. */
+    async function budgetFailure(): Promise<{ hint: unknown; text: string }> {
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'climate',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.RateLimited,
+          data: { reason: 'upstream_budget_exhausted', retryable: false },
+        },
+      });
+      const { error } = result.structuredContent as {
+        error: { data: { recovery?: { hint?: unknown } } };
+      };
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      return { hint: error.data.recovery?.hint, text };
+    }
+
+    /**
+     * A keyed server's throw carries no hint of its own, so the contract's recovery reaches the
+     * caller — and it must not tell a caller to set a key the server already sends. (gh #90)
+     */
+    it('keyed: fills a key-neutral recovery from the contract', async () => {
       mockSearch.mockRejectedValue(
         rateLimited('Insufficient budget. Resets at midnight.', {
           reason: 'upstream_budget_exhausted',
           retryable: false,
-          ...ctx.recoveryFor('upstream_budget_exhausted'),
         }),
       );
-      const input = searchEntitiesTool.input.parse({ entity_type: 'works', query: 'climate' });
+      const { hint, text } = await budgetFailure();
+      expect(hint).toMatch(/midnight UTC/);
+      expect(hint).not.toMatch(/OPENALEX_API_KEY|openalex\.org\/settings/);
+      expect(text).toContain(`Recovery: ${String(hint)}`);
+    });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.RateLimited,
-        data: {
-          reason: 'upstream_budget_exhausted',
-          retryable: false,
-          recovery: { hint: expect.stringMatching(/midnight UTC/i) },
-        },
-      });
+    /**
+     * The free-key advice is written by the service on a keyless server, so the search runs on the
+     * real service (keyless via the config mock) against a stubbed budget 429 — the case fails if
+     * the service stops attaching the hint.
+     */
+    it('keyless: carries the service hint with the free-key advice on both surfaces (gh #90)', async () => {
+      const fetchMock = vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              message:
+                'Insufficient budget. This request costs $0.001 but you only have $0 remaining. Resets at midnight.',
+            }),
+            { status: 429, statusText: 'Too Many Requests' },
+          ),
+        ),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const { hint, text } = await budgetFailure();
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(hint).toBe(BUDGET_EXHAUSTED_KEYLESS_HINT);
+      expect(hint).toMatch(/midnight UTC/);
+      expect(hint).toContain('OPENALEX_API_KEY');
+      expect(hint).toContain('https://openalex.org/settings/api');
+      expect(text).toContain(`Recovery: ${BUDGET_EXHAUSTED_KEYLESS_HINT}`);
     });
 
     it('declares the budget entry non-retryable and the throttle entry retryable', () => {
@@ -1052,6 +1133,16 @@ describe('searchEntitiesTool', () => {
       expect(budget?.retryable).toBe(false);
       expect(throttle?.retryable).toBe(true);
     });
+  });
+
+  /**
+   * Identifier and URL fields skip provider-text normalization and come back byte-identical to
+   * upstream, so the `results` description cannot call every text value decoded. (gh #94)
+   */
+  it('describes identifier and URL fields as returned exactly as OpenAlex stores them', () => {
+    expect(searchEntitiesTool.output.shape.results.description ?? '').toMatch(
+      /identifier and URL fields[^.]*exactly as OpenAlex stores them/,
+    );
   });
 
   describe('untitled records (gh #51)', () => {
@@ -1426,25 +1517,26 @@ describe('searchEntitiesTool', () => {
     });
 
     it('carries the query_too_long reason, upstream limit, and recovery from the service', async () => {
-      const ctx = createMockContext({ errors: searchEntitiesTool.errors });
       mockSearch.mockRejectedValue(
         invalidParams('Your search is too long (1890 characters; the limit is 1500).', {
           reason: 'query_too_long',
-          ...ctx.recoveryFor('query_too_long'),
         }),
       );
-      const input = searchEntitiesTool.input.parse({
+
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         query: 'a'.repeat(1890),
         search_mode: 'semantic',
       });
 
-      await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        message: expect.stringContaining('the limit is 1500'),
-        data: {
-          reason: 'query_too_long',
-          recovery: { hint: expect.stringMatching(/shorten/i) },
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message: expect.stringContaining('the limit is 1500'),
+          data: {
+            reason: 'query_too_long',
+            recovery: { hint: expect.stringMatching(/shorten/i) },
+          },
         },
       });
     });
@@ -1731,6 +1823,735 @@ describe('searchEntitiesTool', () => {
         results: [],
       });
       expect(output).toContain('**0 result(s) — 25 per page**');
+    });
+  });
+
+  /**
+   * Characterization: responses that already fit the 64,000-byte budget must come back exactly
+   * as they did before the budget existed — same records, same text, no disclosure fields.
+   */
+  describe('response budget — pages that fit stay unchanged (gh #72, #73)', () => {
+    const DISCLOSURE_KEYS = ['omitted', 'windows', 'over_budget'];
+
+    function expectNoDisclosure(structured: unknown) {
+      for (const key of DISCLOSURE_KEYS) expect(structured).not.toHaveProperty(key);
+    }
+
+    it('returns a 25-record default works page byte-for-byte as rendered today', async () => {
+      const page: SearchResult = {
+        meta: { count: 500, per_page: 25, next_cursor: 'cursor-2' },
+        results: Array.from({ length: 25 }, (_, n) => defaultWork(n)),
+      };
+      mockSearch.mockResolvedValue(page);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'proton collisions' },
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.results).toEqual(page.results);
+      expect(structured.notice).toBeUndefined();
+      expectNoDisclosure(structured);
+      const expected = [
+        '**500 result(s) — 25 per page** — next cursor: `cursor-2`',
+        ...page.results.flatMap((record) => renderEntityRecord(record)),
+      ].join('\n');
+      expect(result.content[0]).toEqual({ type: 'text', text: expected });
+      expect(utf8Bytes(JSON.stringify(structured))).toBeLessThan(64_000);
+      expect(contentTextBytes(result.content)).toBeLessThan(64_000);
+    });
+
+    it('returns a list record with 99 authorships whole and unflagged', async () => {
+      const record = workWithAuthorships(1, 99, slimAuthorship);
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 25, next_cursor: null },
+        results: [record],
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { openalex: 'W3000000001' },
+        select: ['authorships'],
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.results).toEqual([record]);
+      expect(structured.notice).toBeUndefined();
+      expectNoDisclosure(structured);
+    });
+
+    it('returns an id lookup whose array fits the budget whole', async () => {
+      const record = workWithAuthorships(2, 50);
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [record],
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W3000000002',
+        select: ['authorships'],
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.results).toEqual([record]);
+      expectNoDisclosure(structured);
+      const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+      expect(text).toContain('- [49] author_position: middle');
+    });
+  });
+
+  /**
+   * The budget itself (gh #72) and the 100-authorship cap disclosure (gh #73). Every size
+   * assertion reads the assembled `CallToolResult` from `runToolContract`, enrichment trailer
+   * included, and the service fake writes the `budget` enrichment the real service writes.
+   */
+  describe('response budget (gh #72, #73)', () => {
+    const BUDGET = 64_000;
+    /** A budget reading with long float tails, so the trailer is as wide as it realistically gets. */
+    const SPEND = {
+      costUsd: 0.30000000000000004,
+      remainingUsd: 12345.678901234567,
+      resetsInSeconds: 86399.99999999999,
+      prepaidRemainingUsd: 98765.43210987654,
+    };
+    const bare = (id: string) => id.replace('https://openalex.org/', '');
+    const textOf = (result: { content: { type: string; text?: string }[] }) =>
+      result.content.map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('');
+
+    type Structured = {
+      meta: { count: number; per_page: number; next_cursor: string | null };
+      results: EntityRecord[];
+      notice?: string;
+      omitted?: {
+        ids: string[];
+        next: { tool: string; arguments: Record<string, unknown> };
+      };
+      windows?: {
+        id: string;
+        field: string;
+        offset: number;
+        shown: number;
+        total: number;
+        possibly_capped: boolean;
+        next: { tool: string; arguments: Record<string, unknown> } | null;
+      }[];
+      over_budget?: boolean;
+    };
+
+    function expectWithinBudget(result: {
+      structuredContent?: unknown;
+      content: { type: string; text?: string }[];
+    }) {
+      expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(BUDGET);
+      expect(contentTextBytes(result.content)).toBeLessThanOrEqual(BUDGET);
+    }
+
+    /**
+     * Fake service: answers an ID filter — `openalex`, or `id` for keywords — with exactly those
+     * records, in reverse page order as OpenAlex returns an ID set in its own order; an `id`
+     * lookup with the record projected to `select`; and anything else with the first `per_page`
+     * records plus a next cursor. Writes the budget enrichment the way the real service does.
+     */
+    function serve(records: EntityRecord[], nextCursor: string | null = 'cursor-2') {
+      mockSearch.mockImplementation(async (...args: unknown[]) => {
+        const [params, ctx] = args as [SearchParams, Context];
+        ctx.enrich({ budget: SPEND });
+        if (params.id) {
+          const record = records.find((r) => bare(r.id) === params.id);
+          if (!record) throw notFound(`No entity ${params.id}`, { reason: 'entity_not_found' });
+          if (params.select?.includes('*')) {
+            return { meta: { count: 1, per_page: 1, next_cursor: null }, results: [record] };
+          }
+          const projected: EntityRecord = { id: record.id, display_name: record.display_name };
+          for (const field of params.select ?? []) {
+            const key = field === 'authors' ? 'authorships' : field;
+            if (key in record) projected[key] = record[key];
+          }
+          return { meta: { count: 1, per_page: 1, next_cursor: null }, results: [projected] };
+        }
+        const wanted = (params.filters?.openalex ?? params.filters?.id)?.split('|');
+        const perPage = params.perPage ?? 25;
+        const results = wanted
+          ? records.filter((r) => wanted.includes(bare(r.id)) || wanted.includes(r.id)).reverse()
+          : records.slice(0, perPage);
+        return {
+          meta: {
+            count: records.length,
+            per_page: perPage,
+            next_cursor: wanted ? null : nextCursor,
+          },
+          results,
+        };
+      });
+    }
+
+    it('windows an oversized id lookup to the budget on both surfaces (repro 1)', async () => {
+      const record = workWithAuthorships(1_858_542_512, 2932);
+      serve([record]);
+      const id = bare(record.id);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id,
+        select: ['authorships'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      expectWithinBudget(result);
+      const structured = result.structuredContent as Structured;
+      const shown = structured.windows?.[0]?.shown ?? 0;
+      expect(shown).toBeGreaterThan(50);
+      expect(structured.windows).toEqual([
+        {
+          id,
+          field: 'authorships',
+          offset: 0,
+          shown,
+          total: 2932,
+          possibly_capped: false,
+          next: {
+            tool: 'openalex_search_entities',
+            arguments: { entity_type: 'works', id, slice: { field: 'authorships', offset: shown } },
+          },
+        },
+      ]);
+      expect(structured.results[0]?.authorships).toEqual(
+        (record.authorships as unknown[]).slice(0, shown),
+      );
+      expect(structured.notice).toMatch(/slice/);
+      const text = textOf(result);
+      expect(text).toContain(`- [${shown - 1}] author_position`);
+      expect(text).not.toContain(`- [${shown}] author_position`);
+      expect(text).toContain(`"slice":{"field":"authorships","offset":${shown}}`);
+    });
+
+    it('cuts an overflowing list page to whole records and names every omitted ID', async () => {
+      const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 8));
+      serve(records);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        select: ['authorships'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      expectWithinBudget(result);
+      const structured = result.structuredContent as Structured;
+      const kept = structured.results.length;
+      expect(kept).toBeGreaterThan(1);
+      expect(kept).toBeLessThan(25);
+      expect(structured.results).toEqual(records.slice(0, kept));
+      expect(structured.meta).toEqual({ count: 25, per_page: 25, next_cursor: 'cursor-2' });
+      const omittedIds = records.slice(kept).map((r) => bare(r.id));
+      expect(structured.omitted).toEqual({
+        ids: omittedIds,
+        next: {
+          tool: 'openalex_search_entities',
+          arguments: {
+            entity_type: 'works',
+            filters: { openalex: omittedIds.join('|') },
+            per_page: omittedIds.length,
+            select: ['authorships'],
+          },
+        },
+      });
+      expect(structured.windows).toBeUndefined();
+      expect(structured.notice).toMatch(/64,000-byte/);
+      const text = textOf(result);
+      for (const omittedId of omittedIds) expect(text).toContain(omittedId);
+      expect(text).toContain(JSON.stringify(structured.omitted?.next.arguments));
+    });
+
+    it('walks every cut continuation to the full set with no gap or overlap', async () => {
+      // ~12 KB records: each call keeps about five, so the continuation is itself cut, twice over.
+      const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 20));
+      serve(records);
+
+      type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
+      const seen: string[] = [];
+      let args: SearchArgs | undefined = {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        select: ['authorships'],
+      };
+      let calls = 0;
+      while (args && calls < 25) {
+        const result = await runToolContract(searchEntitiesTool, args);
+        calls++;
+        expect(result.isError).toBeFalsy();
+        expectWithinBudget(result);
+        const structured = result.structuredContent as Structured;
+        seen.push(...structured.results.map((r) => bare(r.id)));
+        args = structured.omitted?.next.arguments as SearchArgs | undefined;
+      }
+
+      expect(calls).toBeGreaterThan(2);
+      expect(seen).toHaveLength(25);
+      expect(new Set(seen)).toEqual(new Set(records.map((r) => bare(r.id))));
+    });
+
+    it('windows an oversized first list record and omits the rest', async () => {
+      const records = [
+        workWithAuthorships(1, 2932),
+        workWithAuthorships(2, 3),
+        workWithAuthorships(3, 3),
+      ];
+      serve(records);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        select: ['authorships'],
+      });
+
+      expectWithinBudget(result);
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toHaveLength(1);
+      const window = structured.windows?.[0];
+      expect(window).toMatchObject({
+        id: bare(records[0]!.id),
+        field: 'authorships',
+        offset: 0,
+        total: 2932,
+        possibly_capped: false,
+      });
+      expect(window?.next?.arguments).toEqual({
+        entity_type: 'works',
+        id: bare(records[0]!.id),
+        slice: { field: 'authorships', offset: window?.shown },
+      });
+      expect(structured.omitted?.ids).toEqual([bare(records[1]!.id), bare(records[2]!.id)]);
+    });
+
+    it('returns a record whose non-array fields alone overflow with every array emptied, flagged', async () => {
+      const record: EntityRecord = {
+        id: 'https://openalex.org/W77',
+        display_name: 'An abstract longer than the budget',
+        abstract: 'lorem ipsum '.repeat(6000),
+        authorships: authorships(3),
+        referenced_works: ['https://openalex.org/W1', 'https://openalex.org/W2'],
+      };
+      serve([record]);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W77',
+        select: ['*'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Structured;
+      expect(structured.over_budget).toBe(true);
+      expect(structured.results[0]?.abstract).toBe(record.abstract);
+      expect(structured.results[0]?.authorships).toEqual([]);
+      expect(structured.windows?.map((w) => [w.field, w.shown, w.total])).toEqual(
+        expect.arrayContaining([
+          ['authorships', 0, 3],
+          ['referenced_works', 0, 2],
+        ]),
+      );
+      expect(textOf(result)).toMatch(/over budget/i);
+    });
+
+    it('marks each emptied array on an over-budget record as windowed, never (empty)', async () => {
+      const record: EntityRecord = {
+        id: 'https://openalex.org/W77',
+        display_name: 'An abstract longer than the budget',
+        abstract: 'lorem ipsum '.repeat(6000),
+        authorships: authorships(3),
+        referenced_works: ['https://openalex.org/W1', 'https://openalex.org/W2'],
+        topics: [],
+      };
+      serve([record]);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W77',
+        select: ['*'],
+      });
+
+      const structured = result.structuredContent as Structured;
+      expect(structured.over_budget).toBe(true);
+      expect(structured.results[0]?.topics).toEqual([]);
+      const text = textOf(result);
+      expect(text).toContain('**Authorships:** (0 of 3 shown — windowed; see Window)');
+      expect(text).toContain('**Referenced Works:** (0 of 2 shown — windowed; see Window)');
+      expect(text).not.toContain('**Authorships:** (empty)');
+      expect(text).not.toContain('**Referenced Works:** (empty)');
+      // `topics` came back empty from OpenAlex, not from the budget.
+      expect(text).toContain('**Topics:** (empty)');
+    });
+
+    it('shows elements of every windowed array of a list record, on both surfaces', async () => {
+      // ~900-byte elements: 100 authorships (a capped list record) and 82 locations, each too
+      // large to sit beside the other emptied, so both are windowed.
+      const big = (i: number) => ({
+        ...authorship(i),
+        raw_affiliation_strings: ['Laboratory for Particle Physics, CERN, Geneva '.repeat(6)],
+      });
+      const first: EntityRecord = {
+        ...workWithAuthorships(1, 100, big),
+        locations: Array.from({ length: 82 }, (_, i) => big(1_000 + i)),
+      };
+      serve([first, workWithAuthorships(2, 3), workWithAuthorships(3, 3)]);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        per_page: 3,
+        select: ['*'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      expectWithinBudget(result);
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toHaveLength(1);
+      const byField = new Map(structured.windows?.map((w) => [w.field, w]));
+      const auth = byField.get('authorships');
+      const locs = byField.get('locations');
+      expect(auth).toMatchObject({ total: 100, possibly_capped: true });
+      expect(locs).toMatchObject({ total: 82, possibly_capped: false });
+      expect(auth?.shown).toBeGreaterThan(0);
+      expect(locs?.shown).toBeGreaterThan(0);
+      expect(structured.results[0]?.authorships).toHaveLength(auth?.shown ?? -1);
+      expect(structured.results[0]?.locations).toHaveLength(locs?.shown ?? -1);
+      const text = textOf(result);
+      expect(text).toContain(
+        `**Authorships:** (${auth?.shown} of 100 shown — windowed; see Window)`,
+      );
+      expect(text).toContain(`**Locations:** (${locs?.shown} of 82 shown — windowed; see Window)`);
+      expect(text).toContain(`- [${(auth?.shown ?? 0) - 1}] author_position`);
+    });
+
+    it('returns an omitted keywords page through the `id` filter continuation', async () => {
+      const keywords: EntityRecord[] = Array.from({ length: 10 }, (_, n) => ({
+        id: `https://openalex.org/keywords/keyword-${n}`,
+        display_name: `Keyword ${n}`,
+        description: 'x'.repeat(12_000),
+      }));
+      serve(keywords, null);
+
+      type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
+      const seen: string[] = [];
+      let args: SearchArgs | undefined = {
+        entity_type: 'keywords',
+        query: 'keyword',
+        per_page: 10,
+      };
+      let calls = 0;
+      while (args && calls < 10) {
+        const result = await runToolContract(searchEntitiesTool, args);
+        calls++;
+        expect(result.isError).toBeFalsy();
+        expectWithinBudget(result);
+        const structured = result.structuredContent as Structured;
+        seen.push(...structured.results.map((r) => r.id));
+        const next = structured.omitted?.next;
+        if (next) {
+          expect(next.arguments.filters).toEqual({ id: structured.omitted?.ids.join('|') });
+          expect(textOf(result)).toContain(JSON.stringify(next.arguments));
+        }
+        args = next?.arguments as SearchArgs | undefined;
+      }
+
+      expect(calls).toBeGreaterThan(1);
+      expect(seen).toHaveLength(keywords.length);
+      expect(new Set(seen)).toEqual(new Set(keywords.map((k) => k.id)));
+    });
+
+    it('keeps a sparse record — null title, no arrays — within the budget and undisclosed', async () => {
+      const records: EntityRecord[] = [{ id: 'https://openalex.org/W5', display_name: null }];
+      serve(records, null);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { openalex: 'W5' },
+      });
+
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toEqual(records);
+      expect(structured).not.toHaveProperty('omitted');
+      expect(structured).not.toHaveProperty('windows');
+    });
+
+    describe('possibly-capped authorships (gh #73)', () => {
+      it('flags a list record with exactly 100 authorships on both surfaces', async () => {
+        const capped = workWithAuthorships(1, 100, slimAuthorship);
+        const complete = workWithAuthorships(2, 99, slimAuthorship);
+        serve([capped, complete], null);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          filters: { 'title.search': 'collaboration' },
+          select: ['authorships'],
+        });
+
+        expectWithinBudget(result);
+        const structured = result.structuredContent as Structured;
+        expect(structured.results).toEqual([capped, complete]);
+        expect(structured.windows).toEqual([
+          {
+            id: bare(capped.id),
+            field: 'authorships',
+            offset: 0,
+            shown: 100,
+            total: 100,
+            possibly_capped: true,
+            next: {
+              tool: 'openalex_search_entities',
+              arguments: {
+                entity_type: 'works',
+                id: bare(capped.id),
+                slice: { field: 'authorships', offset: 100 },
+              },
+            },
+          },
+        ]);
+        expect(structured.notice).toMatch(/100 authorships/);
+        const text = textOf(result);
+        expect(text).toMatch(/possibly capped/i);
+        expect(text).toContain(
+          `"id":"${bare(capped.id)}","slice":{"field":"authorships","offset":100}`,
+        );
+        expect(text).not.toContain(`"id":"${bare(complete.id)}"`);
+      });
+
+      it('never flags an id lookup with exactly 100 authorships', async () => {
+        const record = workWithAuthorships(1, 100, slimAuthorship);
+        serve([record]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: bare(record.id),
+          select: ['authorships'],
+        });
+
+        const structured = result.structuredContent as Structured;
+        expect(structured).not.toHaveProperty('windows');
+        expect(structured.notice).toBeUndefined();
+      });
+
+      it('points a windowed capped record at the same id + slice continuation', async () => {
+        // ~900-byte authorships, so 100 of them overflow the budget on their own.
+        const record = workWithAuthorships(1, 100, (i) => ({
+          ...authorship(i),
+          raw_affiliation_strings: ['Laboratory for Particle Physics, CERN, Geneva '.repeat(6)],
+        }));
+        serve([record]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          filters: { openalex: bare(record.id) },
+          select: ['authorships'],
+        });
+
+        expectWithinBudget(result);
+        const structured = result.structuredContent as Structured;
+        expect(structured.windows).toHaveLength(1);
+        const window = structured.windows![0]!;
+        expect(window).toMatchObject({ field: 'authorships', total: 100, possibly_capped: true });
+        expect(window.shown).toBeLessThan(100);
+        expect(window.next?.arguments).toEqual({
+          entity_type: 'works',
+          id: bare(record.id),
+          slice: { field: 'authorships', offset: window.shown },
+        });
+      });
+    });
+
+    describe('slice', () => {
+      const record = workWithAuthorships(1_858_542_512, 2932);
+      const id = bare(record.id);
+
+      it('walks all 2,932 authorships in windows with no gap or overlap', {
+        timeout: 30_000,
+      }, async () => {
+        serve([record]);
+        const collected: unknown[] = [];
+        let offset: number | undefined = 0;
+        let calls = 0;
+        while (offset !== undefined && calls < 100) {
+          const result = await runToolContract(searchEntitiesTool, {
+            entity_type: 'works',
+            id,
+            slice: { field: 'authorships', offset },
+          });
+          calls++;
+          expect(result.isError).toBeFalsy();
+          expectWithinBudget(result);
+          const structured = result.structuredContent as Structured;
+          const window = structured.windows?.[0];
+          expect(window).toMatchObject({ id, field: 'authorships', offset, total: 2932 });
+          const items = structured.results[0]?.authorships as unknown[];
+          expect(items).toHaveLength(window?.shown ?? -1);
+          expect(textOf(result)).toContain(`- [${offset}] author_position`);
+          collected.push(...items);
+          const next = window?.next?.arguments.slice as { offset: number } | undefined;
+          if (next) expect(next.offset).toBe(offset + items.length);
+          offset = next?.offset;
+        }
+        expect(calls).toBeGreaterThan(20);
+        expect(collected).toEqual(record.authorships);
+        expect(mockSearch).toHaveBeenCalledWith(
+          expect.objectContaining({ id, select: ['authorships'] }),
+          expect.anything(),
+        );
+      });
+
+      it('returns only id, display_name, and the sliced field', async () => {
+        serve([{ ...record, doi: 'https://doi.org/10.1/x', cited_by_count: 5 }]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authorships', offset: 2900 },
+        });
+        const structured = result.structuredContent as Structured;
+        expect(Object.keys(structured.results[0] ?? {}).sort()).toEqual(
+          ['authorships', 'display_name', 'id'].sort(),
+        );
+        expect(structured.windows?.[0]).toMatchObject({ offset: 2900, shown: 32, next: null });
+      });
+
+      it('resolves the works `authors` alias to authorships', async () => {
+        serve([record]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authors', offset: 0 },
+        });
+        expect((result.structuredContent as Structured).windows?.[0]?.field).toBe('authorships');
+      });
+
+      it.each([
+        ['at the end', 2932],
+        ['past the end', 5000],
+      ])('returns an empty, final window for an offset %s', async (_label, offset) => {
+        serve([record]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authorships', offset },
+        });
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.authorships).toEqual([]);
+        expect(structured.windows?.[0]).toMatchObject({
+          offset,
+          shown: 0,
+          total: 2932,
+          next: null,
+        });
+        if (offset > 2932) expect(structured.notice).toMatch(/past the end/);
+      });
+
+      it('rejects slice without id with a typed error and recovery', async () => {
+        serve([record]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          filters: { openalex: id },
+          slice: { field: 'authorships', offset: 0 },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: { reason: 'slice_without_id', recovery: { hint: expect.stringMatching(/id/) } },
+          },
+        });
+        expect(mockSearch).not.toHaveBeenCalled();
+      });
+
+      it('rejects a slice field that is not an array on the record', async () => {
+        serve([{ ...record, doi: 'https://doi.org/10.1/x' }]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'doi', offset: 0 },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'slice_field_not_array',
+              recovery: { hint: expect.stringMatching(/array/) },
+            },
+          },
+        });
+        expect(textOf(result)).toContain('slice_field_not_array');
+      });
+
+      it('rejects a `*` slice field before fetching the record', async () => {
+        serve([record]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: '*', offset: 0 },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'slice_field_not_array',
+              recovery: { hint: expect.stringMatching(/array/) },
+            },
+          },
+        });
+        expect(textOf(result)).toContain('slice_field_not_array');
+        expect(mockSearch).not.toHaveBeenCalled();
+      });
+
+      it('flags a window whose one element alone exceeds the budget, on both surfaces', async () => {
+        const huge = { note: 'x'.repeat(70_000) };
+        const oversized: EntityRecord = {
+          id: 'https://openalex.org/W6',
+          display_name: 'Huge elements',
+          authorships: [huge, huge],
+        };
+        serve([oversized]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W6',
+          slice: { field: 'authorships', offset: 0 },
+        });
+
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured.over_budget).toBe(true);
+        expect(structured.results[0]?.authorships).toEqual([huge]);
+        expect(structured.windows?.[0]).toMatchObject({ offset: 0, shown: 1, total: 2 });
+        expect(structured.notice).toMatch(/alone exceeds the 64,000-byte response budget/);
+        const text = textOf(result);
+        expect(text).toMatch(/\*\*Over budget:\*\*/);
+        expect(text).toContain('"slice":{"field":"authorships","offset":1}');
+      });
+
+      it('rejects a negative offset at the schema layer', async () => {
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authorships', offset: -1 },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams },
+        });
+      });
+
+      it('declares both slice reasons as handler-local ValidationErrors', () => {
+        for (const reason of ['slice_without_id', 'slice_field_not_array']) {
+          const entry = searchEntitiesTool.errors?.find((e) => e.reason === reason);
+          expect(entry, `${reason} missing from the contract`).toBeDefined();
+          expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
+          expect(entry).not.toHaveProperty('thrownBy');
+        }
+      });
     });
   });
 });

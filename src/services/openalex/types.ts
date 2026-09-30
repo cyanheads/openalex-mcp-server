@@ -17,7 +17,7 @@ export const ENTITY_TYPES = [
 export type EntityType = (typeof ENTITY_TYPES)[number];
 
 /**
- * Default `select` fields applied to search queries (not single-entity lookups) when the caller
+ * Default `select` fields applied to searches and single-entity lookups alike when the caller
  * doesn't specify `select`. Prevents 20-70KB-per-record responses from blowing up context windows.
  *
  * `best_oa_location` earns its place on works despite the payload it adds (~36% on a 25-record
