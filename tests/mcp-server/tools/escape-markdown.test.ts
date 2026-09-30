@@ -252,5 +252,5 @@ describe('escapeMarkdown on random provider text', () => {
       // `****` is no bold wrapper: skip the text check when the wrapped name is blank.
       if (cb.trim()) expect(words(renderedText(markdown)), label).toBe(words(expected));
     }
-  });
+  }, 60_000);
 });

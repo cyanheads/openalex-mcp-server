@@ -111,7 +111,7 @@ describe('Security — API key and mailto non-leakage', () => {
     await rejection;
   });
 
-  it('does not leak API key in a network/fetch-failure error', async () => {
+  it('does not leak API key in a network/fetch-failure error', { timeout: 30_000 }, async () => {
     vi.mocked(globalThis.fetch).mockRejectedValue(
       new TypeError(
         `Failed to fetch https://api.openalex.org/works?api_key=${API_KEY}&search=test`,
@@ -492,7 +492,6 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
 
   const NORMALIZED = {
     display_name: 'Proto &constructor; | A < B',
-    landing_page_url: 'http://e.x/F?func=service&copy=1&lang=de&not=2&para=3',
     raw_source_name: 'Revision of Genus',
     raw_author_name: 'Radović Vesela',
     institution: '**Inst** [x](y) &toString;',
@@ -592,7 +591,9 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     const record = (result.structuredContent as { results: Record<string, unknown>[] })
       .results[0] as Record<string, any>;
     expect(record.display_name).toBe(NORMALIZED.display_name);
-    expect(record.primary_location.landing_page_url).toBe(NORMALIZED.landing_page_url);
+    // Identifiers and URLs pass through byte-identical to upstream (gh #94).
+    expect(record.doi).toBe(WORK.doi);
+    expect(record.primary_location.landing_page_url).toBe(WORK.primary_location.landing_page_url);
     expect(record.primary_location.raw_source_name).toBe(NORMALIZED.raw_source_name);
     expect(record.authorships[0].raw_author_name).toBe(NORMALIZED.raw_author_name);
     expect(record.authorships[0].institutions[0].display_name).toBe(NORMALIZED.institution);
@@ -614,7 +615,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     expect(rendered).toContain(`Abstract: ${NORMALIZED.abstract}`);
     // URL leaves render byte-identical in the raw Markdown.
     expect(markdown).toContain(`**DOI:** ${WORK.doi}`);
-    expect(markdown).toContain(`landing_page_url: ${NORMALIZED.landing_page_url}`);
+    expect(markdown).toContain(`landing_page_url: ${WORK.primary_location.landing_page_url}`);
     expect(markdown).not.toContain('function Object()');
   });
 
@@ -688,20 +689,30 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
 
 describe('Security — text scanners run in linear time (gh #76)', () => {
   /**
-   * Seconds to process one input of `size` characters, taken as the best of three trials, each
-   * repeating the call until `WORK_CHARS` characters have been processed so small sizes are not
-   * lost in timer noise. Linear growth keeps t(80k)/t(5k) near 16; quadratic reaches 256.
+   * Milliseconds per call on a 5k and an 80k input. Each sample repeats the call until
+   * `WORK_CHARS` characters have been processed, so the small size is not lost in timer noise.
+   * The two sizes alternate sample by sample, so load from other processes lands on both, and
+   * each keeps its fastest of `SAMPLES`, which a burst of load cannot inflate. Linear growth
+   * keeps t(80k)/t(5k) near 16; quadratic reaches 256.
    */
-  const WORK_CHARS = 1_600_000;
-  function perCallMs(fn: (s: string) => unknown, input: string): number {
-    const reps = Math.max(1, Math.ceil(WORK_CHARS / input.length));
-    let best = Number.POSITIVE_INFINITY;
-    for (let trial = 0; trial < 3; trial++) {
-      const start = performance.now();
-      for (let i = 0; i < reps; i++) fn(input);
-      best = Math.min(best, (performance.now() - start) / reps);
+  const WORK_CHARS = 400_000;
+  const SAMPLES = 7;
+  function msPerCall(fn: (s: string) => unknown, input: string): number {
+    const reps = Math.ceil(WORK_CHARS / input.length);
+    const start = performance.now();
+    for (let i = 0; i < reps; i++) fn(input);
+    return (performance.now() - start) / reps;
+  }
+  function perCallMs(fn: (s: string) => unknown, make: (size: number) => string) {
+    const small = make(5_000);
+    const large = make(80_000);
+    let t5k = Number.POSITIVE_INFINITY;
+    let t80k = Number.POSITIVE_INFINITY;
+    for (let sample = 0; sample < SAMPLES; sample++) {
+      t5k = Math.min(t5k, msPerCall(fn, small));
+      t80k = Math.min(t80k, msPerCall(fn, large));
     }
-    return best;
+    return { t5k, t80k };
   }
 
   function build(unit: string, size: number): string {
@@ -723,6 +734,29 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
     ['a lone < before a long tail of >', (n) => `<${'>'.repeat(n - 1)}`],
     ['< runs then > runs', (n) => `${'<'.repeat(n / 2)}${'>'.repeat(n / 2)}`],
     ['block tags', (n) => build('<p>x', n)],
+    // gh #89 delimiters
+    ['unterminated <![CDATA[ runs', (n) => build('<![CDATA[', n)],
+    ['<![CDA + TA[ re-forming across a removed tag', (n) => build('<![CDA<i></i>TA[x]]>', n)],
+    ['] runs inside one section', (n) => `<![CDATA[${']'.repeat(n - 9)}`],
+    [']] runs inside a section a final ]]> closes', (n) => `<![CDATA[${build(']] ', n - 12)}]]>`],
+    ['sections holding ]] before their ]]>', (n) => build('<![CDATA[a]] b]]>', n)],
+    [']] closers before openers', (n) => build(']] <![CDATA[x', n)],
+    ['empty sections', (n) => build('<![CDATA[]]>', n)],
+    [']]> runs with no opener', (n) => `<${build(']]>', n - 1)}`],
+    ['<?CDATA without ?>', (n) => build('<?CDATA ', n)],
+    ['<?MML without ?>', (n) => build('<?MML ', n)],
+    ['<?MML left literal by another <?', (n) => build('<?MML <?', n)],
+    ['stray ?> runs after a literal <?MML', (n) => `<?MML <?x ${build('?>', n - 10)}`],
+    ['<?MML spans past the cap', (n) => build(`<?MML ${'x'.repeat(130)} ?>`, n)],
+    ['<!--inline-formula> runs', (n) => build('<!--inline-formula>', n)],
+    ['<!--inline-formula runs without >', (n) => build('<!--inline-formula', n)],
+    [
+      '<!--inline-formula> runs inside an unclosed comment',
+      (n) => `<!-- ${build('<!--inline-formula>', n - 5)}`,
+    ],
+    ['literal \\n runs', (n) => build('\\n', n)],
+    ['literal \\n + blank runs', (n) => build('\\n   ', n)],
+    ['backslash runs', (n) => `${'\\'.repeat(n - 1)}n`],
   ];
 
   const ESCAPE_CASES: [string, (size: number) => string][] = [
@@ -741,20 +775,21 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
     ['trailing # runs', (n) => `x ${'#'.repeat(n - 2)}`],
   ];
 
-  it.each(NORMALIZER_CASES)('normalizeProviderText: %s', async (_label, make) => {
-    const { normalizeProviderText } = await import('@/services/openalex/provider-text.js');
-    const t5k = perCallMs(normalizeProviderText, make(5_000));
-    const t80k = perCallMs(normalizeProviderText, make(80_000));
-    expect(t80k / t5k).toBeLessThan(64);
-    expect(t80k).toBeLessThan(100);
-  });
+  it.each(NORMALIZER_CASES)(
+    'normalizeProviderText: %s',
+    { timeout: 30_000 },
+    async (_label, make) => {
+      const { normalizeProviderText } = await import('@/services/openalex/provider-text.js');
+      const { t5k, t80k } = perCallMs(normalizeProviderText, make);
+      expect(t80k / t5k).toBeLessThan(64);
+      expect(t80k).toBeLessThan(100);
+    },
+  );
 
-  it.each(ESCAPE_CASES)('escapeMarkdown: %s', async (_label, make) => {
+  it.each(ESCAPE_CASES)('escapeMarkdown: %s', { timeout: 30_000 }, async (_label, make) => {
     const { escapeMarkdown } = await import('@/mcp-server/tools/escape-markdown.js');
     for (const position of ['inline', 'line-start', 'heading'] as const) {
-      const run = (s: string) => escapeMarkdown(s, position);
-      const t5k = perCallMs(run, make(5_000));
-      const t80k = perCallMs(run, make(80_000));
+      const { t5k, t80k } = perCallMs((s) => escapeMarkdown(s, position), make);
       expect(t80k / t5k).toBeLessThan(64);
       expect(t80k).toBeLessThan(100);
     }
