@@ -169,6 +169,9 @@ coverage/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.bak-*
+.mcpregistry_github_token
+.mcpregistry_registry_token
 .sample-env
 sample.*
 !sample.template.*
