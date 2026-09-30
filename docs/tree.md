@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-09-24 06:22:01
+Generated on: 2026-09-30 17:59:53
 
 ```text
 openalex-mcp-server/
@@ -31,6 +31,7 @@ openalex-mcp-server/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
 │   ├── 0.7.x/
+│   ├── 0.8.x/
 │   └── template.md
 ├── claude-plans/
 ├── docs/
@@ -133,6 +134,7 @@ openalex-mcp-server/
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── generate-field-catalog.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
@@ -156,7 +158,8 @@ openalex-mcp-server/
 │   │       │   └── search-entities.tool.ts
 │   │       ├── escape-markdown.ts
 │   │       ├── render-budget.ts
-│   │       └── render-entity-record.ts
+│   │       ├── render-entity-record.ts
+│   │       └── response-budget.ts
 │   ├── services/
 │   │   └── openalex/
 │   │       ├── budget.ts
@@ -172,11 +175,13 @@ openalex-mcp-server/
 │   ├── config/
 │   │   └── server-config.test.ts
 │   ├── helpers/
-│   │   └── markdown.ts
+│   │   ├── markdown.ts
+│   │   └── openalex-records.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
-│   │   │       └── literature-review.prompt.test.ts
+│   │   │       ├── literature-review.prompt.test.ts
+│   │   │       └── research-landscape.prompt.test.ts
 │   │   └── tools/
 │   │       ├── definitions/
 │   │       │   ├── analyze-trends.tool.test.ts
@@ -186,7 +191,8 @@ openalex-mcp-server/
 │   │       │   └── search-entities.tool.test.ts
 │   │       ├── escape-markdown.test.ts
 │   │       ├── render-budget.test.ts
-│   │       └── render-entity-record.test.ts
+│   │       ├── render-entity-record.test.ts
+│   │       └── response-budget.test.ts
 │   └── services/
 │       └── openalex/
 │           ├── budget.test.ts

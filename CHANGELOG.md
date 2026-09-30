@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-09-30
+
+Search and citation-graph responses hold to a 64,000-byte budget, with continuations for cut records and a new slice input for windowed arrays, alongside provider-text and identifier fixes.
+
 ## [0.7.16](changelog/0.7.x/0.7.16.md) — 2026-09-24
 
 Provider text arrives clean on both surfaces (entities decoded, markup removed, Markdown escaped in content[]), plus a flagged unknown group_by bucket, local rejection of sample with semantic search or sort, and corrected group_by field lists and error reasons.

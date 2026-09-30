@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** openalex-mcp-server
-**Version:** 0.7.16
+**Version:** 0.8.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
