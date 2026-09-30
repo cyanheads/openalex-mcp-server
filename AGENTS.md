@@ -2,9 +2,9 @@
 
 **Server:** openalex-mcp-server
 **Version:** 0.7.16
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -151,15 +151,15 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
+| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). |
 | `ctx.requestInput` | Suspend and ask the caller for more input with `return ctx.requestInput(...)`; the handler is re-entered with answers. |
-| `ctx.inputs` | Reader over a retried request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped`. |
-| `ctx.enrich` | Success-path agent context for notices, query echoes, totals, and truncation disclosure. Reaches both client response surfaces. |
-| `ctx.content` | Non-text content blocks appended to `content[]`; never enters `structuredContent`. |
+| `ctx.inputs` | The request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped` — limited to what the client declared (`elicitation` and its form/url modes, `sampling`, `roots`). Client-supplied: a consent gate trusts only a `ctx.state` record it stored when it asked, bound to the operation, caller, and target (see the `api-context` skill). |
+| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Decides whether to ask for optional context (e.g. roots); never a reason to skip a consent prompt. |
+| `ctx.enrich` | Success-path agent context (empty-result notices, query echo, pagination totals) — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). |
+| `ctx.content` | Non-text content blocks — `.image(data, mimeType)`, `.audio(data, mimeType)`, or `ctx.content(block)` for a raw block. Prepended to `content[]` after `format()`; never enters `structuredContent`. |
 | `ctx.signal` | `AbortSignal` for cancellation. Passed to `withRetry` in the OpenAlex service, whose per-attempt signal reaches `fetch()`. |
 | `ctx.fail` | Typed throw keyed by a declared `errors[]` contract — `ctx.fail(reason, msg?, data?)`. Auto-populates `data.reason` and resolves `code` from the contract. |
-| `ctx.recoveryFor` | Opt-in resolver returning `{ recovery: { hint } }` for a declared reason. Spread into `data` at throw site to surface contract recovery on the wire. |
-| `ctx.requestId` | Unique request ID. |
+| `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
 | `ctx.tenantId` | `'default'` for stdio and `MCP_AUTH_MODE=none` over HTTP; JWT `tid` claim for `MCP_AUTH_MODE=jwt`/`oauth`. |
 
 ---
@@ -168,7 +168,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, thrownBy? }]` on `tool()` to receive a typed `ctx.fail(reason, …)` keyed by the declared reason union — `ctx.fail('typo')` is a TS error, `data.reason` is auto-populated, and the linter enforces conformance against the handler. The `recovery` field is required (≥5 words). Spread `ctx.recoveryFor('reason')` into `data` to opt the contract recovery onto the wire; `error-contract-recovery-unforwarded` warns per `ctx.fail` site that forwards neither the resolver nor its own `recovery` key.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -183,13 +183,13 @@ errors: [
     thrownBy: 'service' },
 ],
 async handler(input, ctx) {
-  if (overCap) throw ctx.fail('semantic_per_page_cap', message, { ...ctx.recoveryFor('semantic_per_page_cap') });
+  if (overCap) throw ctx.fail('semantic_per_page_cap', message);
 }
 ```
 
 **Declare contracts inline on each tool, even when similar across tools.** The contract is part of the tool's documented public surface — reading one tool definition file should give the full picture. Don't extract a shared `errors[]` constant; per-tool repetition is the intended cost of locality.
 
-The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and the recovery via `ctx.recoveryFor(reason)`; those bubble through and are auto-classified. Every such entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_with_page`, `sample_with_semantic`, `sample_with_sort`, and `seed_without_sample` on `openalex_search_entities`; `reserved_filter_key` and the seed-lookup `entity_not_found` on `openalex_get_citation_graph`. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely without needing to be declared on a contract.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Two service throws set their own `recovery: { hint }`, which wins over the fill: the PMCID 404, since the generic "verify the ID" recovery would send the caller back to retry an identifier OpenAlex never indexes; and `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone). Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_with_page`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, and `slice_field_not_array` on `openalex_search_entities`; `reserved_filter_key` and the seed-lookup `entity_not_found` on `openalex_get_citation_graph`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
 
@@ -221,6 +221,7 @@ src/
       analyze-trends.tool.ts            # openalex_analyze_trends
       resolve-name.tool.ts              # openalex_resolve_name
       citation-graph.tool.ts            # openalex_get_citation_graph
+      describe-fields.tool.ts           # openalex_describe_fields
     prompts/definitions/
       literature-review.prompt.ts       # openalex_literature_review
       research-landscape.prompt.ts      # openalex_research_landscape
@@ -241,9 +242,9 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it.
+Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `framework-skills/` paths manually. After framework updates, run the `maintenance` skill — it re-syncs the agent directory automatically (Phase B).
+**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
 Available skills:
 
@@ -259,29 +260,29 @@ Available skills:
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
 | `tool-defs-analysis` | Read-only audit of MCP definition language across the surface — voice, leaks, defaults, recovery hints, output descriptions |
-| `security-pass` | Audit the server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
+| `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
-| `techniques` | Reusable response/data-shaping patterns — overflow handling, payload shaping, retrieval |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
-| `git-wrapup` | Prepare the version, changelog, verification, and commit stack. |
-| `release-pr-review` | Review an open release PR when the project opts into release PR mode. |
-| `release-and-publish` | Tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup`. |
+| `git-wrapup` | Land working-tree changes as a commit stack — version bump, changelog, verify, commit by concern, release commit on top. No tag, no push to main; opens the release PR when the project declares release PR mode |
+| `release-pr-review` | Review pass on an open release PR — simplifier + correctness review, fixes as ordinary commits on top of the stack, PR body kept in sync. Release PR mode only |
+| `release-and-publish` | Fast-forward merge (release PR mode) + tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
-| `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` |
-| `report-issue-local` | File a bug or feature request against this server's own repo |
+| `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
+| `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
+| `techniques` | Catalog of response/data-shaping techniques — overflow handling, payload shaping, retrieval patterns |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
-| `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper — Tier 3 opt-in |
+| `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper for big result sets — Tier 3 opt-in |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, RequestContext, logger, state, multi-round-trip input |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
 | `api-linter` | Definition linter rule catalog — invoked by `bun run lint:mcp` and `devcheck` |
+| `api-mirror` | MirrorService: persistent self-refreshing local mirror (embedded SQLite + FTS5) of a bulk upstream dataset — Tier 3 opt-in |
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
 | `api-telemetry` | OTel catalog: spans, metrics, completion logs, env config, cardinality rules |
 | `api-workers` | Cloudflare Workers runtime |
-| `api-mirror` | MirrorService: persistent local SQLite mirror of a bulk upstream dataset — Tier 3 opt-in |
 
 **Chaining skills into pipelines.** When the user wants a multi-phase effort — build this server out, QA-and-fix the surface, update-and-ship — *and you can spawn sub-agents*, `framework-skills/orchestrations/SKILL.md` sequences the task skills above into a gated pipeline with verification at each step. Read it to drive the run. Optional: skip it if you can't orchestrate sub-agents, and ignore it entirely if you were *spawned* as one — you've already been scoped to a single phase.
 
@@ -297,21 +298,21 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run rebuild` | Clean + build |
 | `bun run clean` | Remove build artifacts |
 | `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
-| `bun run audit:fix` | Run `bun audit fix` to upgrade vulnerable packages within existing ranges. |
-| `bun run audit:refresh` | Delete `bun.lock` and reinstall; last resort after `audit:fix`, targeted updates, and `bun dedupe`. |
+| `bun run audit:fix` | `bun audit fix` — upgrade vulnerable packages to the lowest safe version within existing ranges (`--dry-run` previews, `--latest` rewrites ranges). First response when `devcheck` flags a transitive advisory; then `bun update <name>`, then `bun dedupe` |
+| `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run lint:mcp` | Validate MCP tool/prompt definitions (rule catalog: `api-linter` skill) |
 | `bun run lint:packaging` | Packaging surface checks — env-var parity, plugin metadata, README version badge (run by devcheck) |
 | `bun run list-skills` | List available skills |
-| `bun run test` | Run tests |
+| `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
 | `bun run start:stdio` | Production mode (stdio, after `rebuild`) |
 | `bun run start:http` | Production mode (HTTP, after `rebuild`) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run release:github` | Create GitHub Release from the latest annotated tag (title `v<VERSION>: <subject>`, optional `.mcpb` attach) |
-| `bun run bundle` | Build and pack as `.mcpb` for one-click Claude Desktop install |
+| `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 
 **CI is one file.** `.github/workflows/codeql.yml` is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
@@ -379,7 +380,7 @@ import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
 - [ ] OpenAlex wrapping: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
-- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name; `interface.shortDescription` from `package.json` description
-- [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; user-supplied variables are listed in `env_vars`
-- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name; user-supplied variables are declared under `userConfig` and referenced as `${user_config.<option>}`
+- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
+- [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
+- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`
 - [ ] `bun run devcheck` passes

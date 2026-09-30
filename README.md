@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.16-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.16-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -58,6 +58,8 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 - `select` returns a curated per-entity-type default unless overridden, or `["*"]` for the full record; invalid field names error with the valid set
 - Cursor pagination for keyword and exact search, up to 100 results per page (default 25); semantic search walks its candidates with `page` (1-based) instead, and mixing either knob with the wrong `search_mode` is rejected before the upstream call
 - `sample` (up to 100, single page only — neither `cursor` nor `page` applies) plus a deterministic `seed` for reproducible random sampling; keyword and exact modes only, and never alongside `sort` — OpenAlex does not sample a semantic search and refuses a sorted sample, so both combinations are rejected before the upstream call
+- Each response holds to 64,000 bytes per surface (`structuredContent`, and `content[]` with its trailer) unless the least it can return is larger, which it flags as `over_budget`: a page that would run over keeps its leading records whole and names the rest in `omitted` with the one call that returns them (as a set, in OpenAlex's order), without disturbing `next_cursor`; a record too large on its own comes back with its largest arrays windowed, filled in turn so each shows what fits and labeled with how much of the array it holds, and `slice: {field, offset}` on an `id` lookup pages any array to the end
+- A list record carrying exactly 100 `authorships` — the most OpenAlex returns in a list response — is flagged as possibly capped, with the unbilled `id` + `slice` call that fetches the rest
 - `display_name` is nullable for untitled records; every call reports OpenAlex daily-budget cost and remaining balance
 
 ---
@@ -68,6 +70,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 - Up to 200 groups per page (default). `order: "count"` (default) returns the top-N by count with no further pages; `order: "key"` enumerates all distinct values key-ascending with cursor pagination
 - `include_unknown` (default `false`) adds a group for entities with no value for the grouped field, flagged `is_unknown: true` and labeled as unknown in the text output. OpenAlex keys it `-111`/`-111.0` (numeric fields), `unknown` (text fields and `order: "key"`), or an ID ending in `/unknown`; the key is a sentinel, not a filter value. Boolean fields have no such group — a missing value counts as `false`
 - Not every field is groupable — raw date fields, `.search` operators, `from_*`/`to_*` range modifiers, decimal scores such as `fwci`, `display_name`, and external-ID fields such as `doi` are rejected; `openalex_describe_fields(entity_type, "group_by")` lists the fields that group
+- A works group_by on `authorships.countries` says in its notice that OpenAlex counts only each work's first 100 authorships for that field, and names `authorships.institutions.country_code` as the field that counts all of them
 - Reports OpenAlex daily-budget cost and remaining balance — aggregation is priced far below paging the same entities
 
 ---
@@ -88,6 +91,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 - `seed_id` accepts an OpenAlex ID, DOI, or PMID (PMCID recognized but resolves nothing); validated against a live lookup first, so a non-existent seed fails as `NotFound` rather than returning an empty graph
 - Stacks with `filters`/`sort`/`select` to narrow the graph; `filters` cannot set `cites`/`cited_by`/`related_to`, nor an alias of one such as `cited_works` — those keys are reserved for `direction`
 - Cursor pagination, up to 100 results per page (default 25)
+- The same 64,000-byte response budget and 100-authorship cap disclosure as `openalex_search_entities`; works cut from a page are named in `omitted` with the `openalex_search_entities` call that returns them, in OpenAlex's order
 - Reports OpenAlex daily-budget cost, covering both the seed-validation lookup and the graph page, plus remaining balance
 
 ---
@@ -132,7 +136,7 @@ Agent-friendly output:
 - Effective-query echo — search, trends, and citation-graph responses echo the criteria that actually ran, so an empty result is diagnosable without re-reading the request
 - Discriminated output contracts — typed error reasons (`entity_not_found`, `upstream_budget_exhausted`, `semantic_per_page_cap`, `reserved_filter_key`, and more) each carrying an explicit recovery hint
 - Response shaping — abstracts are reconstructed from OpenAlex's inverted-index encoding into plaintext, and `display_name` stays `null` for untitled or paratext records instead of being backfilled
-- Clean provider text — OpenAlex passes titles, abstracts, and names through unsanitized; HTML entities are decoded against the full WHATWG table, comments and HTML/JATS/MathML formatting tags are removed, and literal text such as `A < B` is kept. The text output escapes that text for Markdown, so a stray `*`, `<tag>`, or `[x](y)` renders as written; IDs, and URLs that render as links, stay byte-identical
+- Clean provider text — OpenAlex passes titles, abstracts, and names through unsanitized; HTML entities are decoded against the full WHATWG table, comments and HTML/JATS/MathML formatting tags are removed, CDATA wrappers and IOP's `<?CDATA …?>` math markers are unwrapped with their TeX kept, and a double-escaped line break (a literal `\n`) becomes a space; literal text such as `A < B` and TeX such as `\nu` is kept. Identifier and URL fields (`id`, `doi`, `ids`, `orcid`, `ror`, `issn`, `*_url`, lineages) are returned exactly as OpenAlex stores them, so each one resolves when passed back. The text output escapes that text for Markdown, so a stray `*`, `<tag>`, or `[x](y)` renders as written; IDs, and URLs that render as links, stay byte-identical
 
 ## Getting started
 
