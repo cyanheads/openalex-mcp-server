@@ -347,6 +347,7 @@ Run the `release-and-publish` skill — it runs the verification gate (`devcheck
 bun publish --access public
 
 docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg APP_VERSION=<version> \
   -t ghcr.io/cyanheads/openalex-mcp-server:<version> \
   -t ghcr.io/cyanheads/openalex-mcp-server:latest \
   --push .
