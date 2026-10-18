@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-10-18 · ⚠️ Breaking
+
+Filter values reach OpenAlex as it reads them (AND with +, country and language codes, quoted names), mixed OR/AND values are rejected up front, identifiers route to the record they name, and provider-text cleanup converges in one pass.
+
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-09-30
 
 Search and citation-graph responses hold to a 64,000-byte budget, with continuations for cut records and a new slice input for windowed arrays, alongside provider-text and identifier fixes.

@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-09-30 17:59:53
+Generated on: 2026-10-18 12:54:32
 
 ```text
 openalex-mcp-server/
@@ -32,6 +32,7 @@ openalex-mcp-server/
 │   ├── 0.6.x/
 │   ├── 0.7.x/
 │   ├── 0.8.x/
+│   ├── 0.9.x/
 │   └── template.md
 ├── claude-plans/
 ├── docs/
@@ -134,10 +135,12 @@ openalex-mcp-server/
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── generate-field-catalog.ts
+│   ├── generate-iso-codes.ts
 │   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
@@ -165,7 +168,9 @@ openalex-mcp-server/
 │   │       ├── budget.ts
 │   │       ├── field-catalog.json
 │   │       ├── field-ranker.ts
+│   │       ├── filter-values.ts
 │   │       ├── html-entities.json
+│   │       ├── iso-codes.json
 │   │       ├── openalex-service.ts
 │   │       ├── provider-text.ts
 │   │       ├── types.ts
