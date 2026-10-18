@@ -133,7 +133,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'mixed_and_or_in_filter_value',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A filter value puts "|" (OR) beside an AND operator — a "+", or a space on a field where words mean AND (a space inside a country or language name is part of the name). OpenAlex splits the value on "|" first and drops every alternative that ANDs more than one value, so no single value can carry both.',
+      when: 'A filter value puts "|" (OR) beside an AND operator — a "+", or a space on a field where words mean AND (on a country field a space is always part of a country name, and inside a language name it is part of the name). OpenAlex splits the value on "|" first and drops every alternative that ANDs more than one value, so no single value can carry both.',
       recovery:
         'Keep "|" and the AND operator in separate filter keys: OR the alternatives in this key and put the AND in a second key that reaches the same values — {"authorships.institutions.country_code": "DE|FR", "institutions.country_code": "US"} matches works with (DE or FR) and US. The filters object holds each key once, so where no second key fits, run one call per alternative instead.',
       thrownBy: 'service',
@@ -141,7 +141,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'quote_in_filter_value',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A filter value sent to OpenAlex as a quoted phrase — a free-text search filter, or a field matched as whole text — carries a double quote of its own, beyond an outer pair the caller wrapped the value in.',
+      when: 'A filter value sent to OpenAlex double-quoted holds a double quote inside its outer pair — a value the server quotes (a multi-word value on a field matched as whole text, or a value holding a comma on such a field or on a free-text search filter), or one the caller wrapped in double quotes on any filter but a free-text search.',
       recovery:
         'Remove the double quote from the value; a phrase is matched without quoting its own text.',
       thrownBy: 'service',
