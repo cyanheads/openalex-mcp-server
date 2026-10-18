@@ -67,13 +67,20 @@ describe('literatureReviewPrompt', () => {
   });
 
   /**
-   * The detail lookup selects `authorships`, which the 64,000-byte response budget windows on a
-   * large collaboration; the step has to name the `slice` call that pages the rest. (gh #72)
+   * The detail lookup selects `author_list`, which the 64,000-byte response budget windows on a
+   * large collaboration; the step has to name the `slice` call that pages the rest, on the same
+   * compact field. (gh #72, #102)
    */
-  it('names slice for paging a windowed authorships array', async () => {
+  it('names slice for paging a windowed author_list array', async () => {
     const detail = step(await generatedText(), '**Identify key papers**');
-    expect(detail).toContain('slice: {"field": "authorships"');
+    expect(detail).toContain('["abstract", "author_list", "primary_location"]');
+    expect(detail).toContain('slice: {"field": "author_list"');
     expect(detail).toContain('windows');
+  });
+
+  it('keeps authorships as the choice for affiliations (gh #102)', async () => {
+    const detail = step(await generatedText(), '**Identify key papers**');
+    expect(detail).toMatch(/select authorships instead when you need affiliations/);
   });
 
   /**

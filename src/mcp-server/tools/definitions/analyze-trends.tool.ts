@@ -41,6 +41,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       thrownBy: 'service',
     },
     {
+      reason: 'upstream_plan_required',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'A filter is one OpenAlex serves only on a paid plan — created_date, updated_date, or a from_/to_ form of either (HTTP 429 "Plan upgrade required").',
+      retryable: false,
+      recovery:
+        'Drop the plan-gated filter and rerun; retrying it unchanged will not succeed. To bound works by date, filter on publication_date, from_publication_date, or to_publication_date, which need no paid plan.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       when: 'OpenAlex did not respond within the request deadline.',
@@ -77,9 +86,33 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     {
       reason: 'comma_in_filter_value',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator, on a field that takes no phrase. Free-text search filters (any `.search` key, such as title.search or abstract.search.exact) and fields matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, parsed_longest_name, biblio fields) are exempt: a comma there is sent quoted, as part of the phrase.',
       recovery:
-        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a phrase that contains commas into a free-text search filter such as title.search or raw_affiliation_strings.search.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_country_code',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A country filter (a key ending in country_code, country_codes, or countries) holds a segment that cannot be a country code, such as a misspelled name, an unassigned number, "unknown", or two codes joined by a space ("DE US").',
+      recovery:
+        'Pass the country as an ISO 3166-1 alpha-2 code such as DE, US, or GB (an alpha-3 code, numeric code, or English name is converted), or null for records with no country.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'mixed_and_or_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value puts "|" (OR) beside an AND operator — a "+", or a space on a field where words mean AND (a space inside a country or language name is part of the name). OpenAlex splits the value on "|" first and drops every alternative that ANDs more than one value, so no single value can carry both.',
+      recovery:
+        'Keep "|" and the AND operator in separate filter keys: OR the alternatives in this key and put the AND in a second key that reaches the same values — on works, {"authorships.institutions.country_code": "DE|FR", "institutions.country_code": "US"} matches (DE or FR) and US. The filters object holds each key once, so where no second key fits, run one call per alternative instead.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent to OpenAlex as a quoted phrase — a free-text search filter, or a field matched as whole text — carries a double quote of its own, beyond an outer pair the caller wrapped the value in.',
+      recovery:
+        'Remove the double quote from the value; a phrase is matched without quoting its own text.',
       thrownBy: 'service',
     },
     {
@@ -145,7 +178,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        "Filter criteria (same syntax as openalex_search_entities filters). Narrows the population before aggregation. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare 'search' filter key. Example: group works by year filtered to a specific topic.",
+        'Filter criteria (same syntax as openalex_search_entities filters). Narrows the population before aggregation. Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare \'search\' filter key. Example: group works by year filtered to a specific topic.',
       ),
     include_unknown: z
       .boolean()
@@ -405,6 +438,7 @@ function renderGroupLabel(g: Group): string {
   return g.key === g.key_display_name ? display : `${display} (${key})`;
 }
 
+/** The request as one line: caller text is JSON-encoded, so a line break in it stays escaped. */
 function buildAnalyzeEcho(input: {
   entity_type: string;
   group_by: string;
@@ -412,7 +446,7 @@ function buildAnalyzeEcho(input: {
   include_unknown?: boolean | undefined;
   order?: 'count' | 'key' | undefined;
 }): string {
-  const parts = [`entity_type=${input.entity_type}`, `group_by=${input.group_by}`];
+  const parts = [`entity_type=${input.entity_type}`, `group_by=${JSON.stringify(input.group_by)}`];
   if (input.filters && Object.keys(input.filters).length > 0) {
     parts.push(`filters=${JSON.stringify(input.filters)}`);
   }

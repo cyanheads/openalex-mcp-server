@@ -10,12 +10,61 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AutocompleteResult } from '@/services/openalex/types.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AutocompleteResult, EntityType } from '@/services/openalex/types.js';
 import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
 
 const mockAutocomplete = vi.fn<() => Promise<AutocompleteResult>>();
 const mockResolveIdentifier = vi.fn<() => Promise<AutocompleteResult>>();
+
+/** A keyless server, for the cases that run the real service against a routed `fetch`. */
+vi.mock('@/config/server-config.js', () => ({
+  getServerConfig: () => ({ apiKey: '', baseUrl: 'https://api.openalex.org', mailto: '' }),
+}));
+
+const jsonResponse = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status });
+
+/**
+ * Route both service methods to the real service over a stubbed `fetch`. Only an
+ * `api.openalex.org` request `answer` returns a response for is answered; every other call
+ * rejects. `requests()` lists each request as `<path>?<params>`, in order, with the credential
+ * and `select` params dropped. Pair with `vi.unstubAllGlobals()` in an `afterEach`.
+ */
+async function routeToRealService(answer: (url: URL) => Response | undefined) {
+  const fetchMock = vi.fn((input: unknown) => {
+    const url = new URL(String(input));
+    const response = url.hostname === 'api.openalex.org' ? answer(url) : undefined;
+    return response
+      ? Promise.resolve(response)
+      : Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const actual = await vi.importActual<typeof import('@/services/openalex/openalex-service.js')>(
+    '@/services/openalex/openalex-service.js',
+  );
+  actual.initOpenAlexService();
+  const service = actual.getOpenAlexService();
+  mockResolveIdentifier.mockImplementation((...args: unknown[]) =>
+    service.resolveIdentifier(...(args as Parameters<typeof service.resolveIdentifier>)),
+  );
+  mockAutocomplete.mockImplementation((...args: unknown[]) =>
+    service.autocomplete(...(args as Parameters<typeof service.autocomplete>)),
+  );
+  const requests = () =>
+    fetchMock.mock.calls.map(([input]) => {
+      const url = new URL(String(input));
+      for (const param of ['api_key', 'mailto', 'select']) url.searchParams.delete(param);
+      return `${url.pathname}${url.search}`;
+    });
+  return { fetchMock, requests };
+}
+
+/** The `content[]` text blocks of a tool result, joined. */
+const contentText = (result: { content?: { type: string; text?: string }[] }) =>
+  (result.content ?? [])
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
 
 /**
  * Only the service accessor is faked. `inferIdentifier` stays real so these cases exercise
@@ -82,6 +131,7 @@ describe('resolveNameTool', () => {
 
       const result = await runToolContract(resolveNameTool, {
         query: 'climate',
+        entity_type: 'works',
         filters: { 'authorships.author.id': 'Einstein' },
       });
 
@@ -190,15 +240,122 @@ describe('resolveNameTool', () => {
     const ctx = createMockContext();
     const input = resolveNameTool.input.parse({
       query: 'MIT',
+      entity_type: 'institutions',
       filters: { country_code: 'us' },
     });
 
     await resolveNameTool.handler(input, ctx);
 
     expect(mockAutocomplete).toHaveBeenCalledWith(
-      { entityType: undefined, query: 'MIT', filters: { country_code: 'us' } },
+      { entityType: 'institutions', query: 'MIT', filters: { country_code: 'us' } },
       ctx,
     );
+  });
+
+  /**
+   * Cross-entity autocomplete rejects `filter` outright (HTTP 400 "filter is not a valid parameter
+   * for the full autocomplete endpoint"), so a name search with `filters` and no `entity_type`
+   * can only fail upstream — and fail with a recovery about field names, which were never the
+   * problem. It is refused before any request. (gh #105)
+   */
+  describe('filters without entity_type (gh #105)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('fails a name search before any request, with its own reason and recovery', async () => {
+      const result = await runToolContract(resolveNameTool, {
+        query: 'University of Cambridge',
+        filters: { country_code: 'US' },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(mockAutocomplete).not.toHaveBeenCalled();
+      expect(mockResolveIdentifier).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'filters_without_entity_type',
+            recovery: { hint: expect.stringMatching(/entity_type/) },
+          },
+        },
+      });
+      const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
+      expect(text).toMatch(/Recovery: .*entity_type/);
+      expect(text).toContain('(reason filters_without_entity_type');
+    });
+
+    it('declares the reason as a handler-local ValidationError', () => {
+      const entry = resolveNameTool.errors?.find((e) => e.reason === 'filters_without_entity_type');
+      expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(entry).not.toHaveProperty('thrownBy');
+      expect(entry?.recovery).toMatch(/entity_type/);
+      expect(entry?.recovery).toMatch(/drop `filters`/);
+    });
+
+    it.each([
+      [
+        'filters with entity_type',
+        { entity_type: 'institutions', filters: { country_code: 'US' } },
+        '/autocomplete/institutions?q=Cambridge&filter=country_code%3AUS',
+      ],
+      ['neither', {}, '/autocomplete?q=Cambridge'],
+      ['an empty filters object', { filters: {} }, '/autocomplete?q=Cambridge'],
+    ] as const)('runs the name search for %s, as before', async (_label, extra, request) => {
+      const { requests } = await routeToRealService((url) =>
+        url.pathname === request.split('?')[0]
+          ? jsonResponse({ results: sampleResults.results })
+          : undefined,
+      );
+
+      const result = await runToolContract(resolveNameTool, { query: 'Cambridge', ...extra });
+
+      expect(result.isError).toBeFalsy();
+      expect(requests()).toEqual([request]);
+      expect((result.structuredContent as AutocompleteResult).results).toEqual(
+        sampleResults.results,
+      );
+      expect(contentText(result)).toContain('**Harvard University** (institution)');
+      expect(contentText(result)).toContain('**Harvard Medical School** (institution)');
+    });
+
+    it('leaves an identifier query with filters to the identifier lookup', async () => {
+      const ror = 'https://ror.org/02jbv0t02';
+      const lookups = ['institutions', 'funders', 'publishers'].map(
+        (type) => `/${type}/ror:${ror}`,
+      );
+      const { requests } = await routeToRealService((url) => {
+        if (url.pathname === lookups[0]) {
+          return jsonResponse({ id: harvard.id, display_name: harvard.display_name, ror });
+        }
+        return lookups.includes(url.pathname)
+          ? new Response('<!doctype html><title>404</title>', { status: 404 })
+          : undefined;
+      });
+
+      const result = await runToolContract(resolveNameTool, {
+        query: ror,
+        filters: { country_code: 'US' },
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(requests()).toEqual(lookups);
+      const { results, notice } = result.structuredContent as AutocompleteResult & {
+        notice?: string;
+      };
+      expect(results.map((r) => r.id)).toEqual([harvard.id]);
+      expect(notice).toBe(
+        `Resolved "${ror}" by ROR — it identifies an institution, a funder, or a publisher directly, so filters did not apply.`,
+      );
+      expect(contentText(result)).toContain(notice);
+      expect(contentText(result)).toContain(harvard.id);
+    });
+
+    it('states the requirement in the filters description', () => {
+      const filters = resolveNameTool.input.shape.filters.description ?? '';
+      expect(filters).toMatch(/requires entity_type/i);
+    });
   });
 
   it('omits entity_type for cross-entity search', async () => {
@@ -249,6 +406,91 @@ describe('resolveNameTool', () => {
       expect(getEnrichment(ctx).notice).toContain('works');
     });
 
+    /**
+     * A filter can exclude the match the name was meant to find, so the notice for a miss under
+     * `filters` echoes them and points at them first — and never suggests omitting entity_type,
+     * which with `filters` kept fails pre-flight. Echoes are JSON-encoded, so a quote or line
+     * break in a value cannot leave the notice's one line. (gh #103)
+     */
+    describe('a miss under filters (gh #103)', () => {
+      async function miss(args: Record<string, unknown>) {
+        mockAutocomplete.mockResolvedValue({ results: [] });
+        const result = await runToolContract(resolveNameTool, args as { query: string });
+        expect(result.isError).toBeFalsy();
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
+        return { notice, text };
+      }
+
+      it('echoes the filters and suggests loosening them, not omitting entity_type', async () => {
+        const { notice, text } = await miss({
+          query: 'University of Cambridge',
+          entity_type: 'institutions',
+          filters: { country_code: 'US' },
+        });
+
+        for (const surface of [notice, text]) {
+          expect(surface).toContain(
+            'No matches for "University of Cambridge" among institutions with filters={"country_code":"US"}.',
+          );
+          expect(surface).toMatch(/Loosen or drop filters/);
+          expect(surface).not.toMatch(/omit entity_type/);
+        }
+      });
+
+      it('keeps the notice on one line when a filter value or the query holds a quote or line break', async () => {
+        const { notice, text } = await miss({
+          query: 'Cambridge\n# Injected query',
+          entity_type: 'institutions',
+          filters: { 'display_name.search': 'a "b"\n# Injected filter' },
+        });
+
+        expect(notice).not.toMatch(/[\r\n]/);
+        expect(notice).toContain('"Cambridge\\n# Injected query"');
+        expect(notice).toContain('filters={"display_name.search":"a \\"b\\"\\n# Injected filter"}');
+        expect(text.split('\n').some((line) => line.trimStart().startsWith('# Injected'))).toBe(
+          false,
+        );
+      });
+
+      it('keeps the notice for a miss without filters unchanged', async () => {
+        const { notice, text } = await miss({
+          query: 'qwxzqxzpwoiuasdhfkj',
+          entity_type: 'institutions',
+        });
+        expect(notice).toBe(
+          'No matches for "qwxzqxzpwoiuasdhfkj" among institutions. Try a shorter name, alternate spelling, or omit entity_type to search across all types.',
+        );
+        expect(text).toContain(notice);
+      });
+
+      it('suggests passing entity_type, not omitting it, when none was given', async () => {
+        const { notice, text } = await miss({ query: 'qwxzqxzpwoiuasdhfkj' });
+        expect(notice).toContain('No matches for "qwxzqxzpwoiuasdhfkj" across all entity types.');
+        expect(notice).toMatch(/pass entity_type to search one type/);
+        expect(notice).not.toMatch(/omit entity_type/);
+        expect(text).toContain(notice);
+      });
+
+      it('keeps the identifier-miss notice, filters included, on an identifier query', async () => {
+        mockResolveIdentifier.mockResolvedValue({ results: [] });
+        const result = await runToolContract(resolveNameTool, {
+          query: '10.1038/thisdoesnotexist999999',
+          filters: { publication_year: '2020' },
+        });
+
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        expect(notice).toContain('filters did not apply');
+        expect(notice).toMatch(/check it for a typo/);
+        expect(notice).not.toContain('filters={');
+        expect(contentText(result)).toContain(notice);
+      });
+
+      it('describes the filters echo in the notice description', () => {
+        expect(resolveNameTool.enrichment?.notice?.description).toMatch(/filters/);
+      });
+    });
+
     it('carries the budget reading the service writes through to structuredContent', () => {
       // The service populates `budget` from the OpenAlex rate-limit headers via ctx.enrich.
       // structuredContent is built as output.extend(enrichment), which silently strips any
@@ -276,36 +518,97 @@ describe('resolveNameTool', () => {
       hint: 'Leibniz University Hannover',
     } as const;
 
-    /** Shapes that resolve today only by accident, or not at all, through autocomplete. */
-    const identifiers: [label: string, query: string, entityType: string][] = [
-      ['bare ORCID', '0000-0001-9487-6983', 'authors'],
-      ['ORCID URL', 'https://orcid.org/0000-0001-9487-6983', 'authors'],
-      ['bare DOI', '10.1038/nature12373', 'works'],
-      ['DOI URL', 'https://doi.org/10.1038/nature12373', 'works'],
-      ['ROR URL', 'https://ror.org/013meh722', 'institutions'],
-      ['bare ROR', '013meh722', 'institutions'],
-      ['bare PMID', '23903748', 'works'],
-      ['PMCID', 'PMC1234567', 'works'],
-      ['ISSN', '1234-5678', 'sources'],
-      ['OpenAlex work ID', 'W2159974629', 'works'],
-      ['OpenAlex funder ID', 'F4320332161', 'funders'],
-      ['OpenAlex ID URL', 'https://openalex.org/I241749', 'institutions'],
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /**
+     * Shapes that resolve today only by accident, or not at all, through autocomplete. Every
+     * lookup here misses, so the requests show both readings: each shape goes to its by-ID
+     * path(s), and only a bare OpenAlex ID — whose shape short names share — searches the query
+     * as a name next. (gh #106) The last column opens the miss notice on both surfaces.
+     */
+    const ror = (id: string) =>
+      ['institutions', 'funders', 'publishers'].map((type) => `/${type}/ror:${id}`);
+    const rorMiss = 'No institution, funder, or publisher in OpenAlex for ROR';
+    const identifiers: [label: string, query: string, requests: string[], missed: string][] = [
+      [
+        'bare ORCID',
+        '0000-0001-9487-6983',
+        ['/authors/orcid:0000-0001-9487-6983'],
+        'No author in OpenAlex for ORCID',
+      ],
+      [
+        'ORCID URL',
+        'https://orcid.org/0000-0001-9487-6983',
+        ['/authors/orcid:https://orcid.org/0000-0001-9487-6983'],
+        'No author in OpenAlex for ORCID',
+      ],
+      [
+        'bare DOI',
+        '10.1038/nature12373',
+        ['/works/doi:10.1038/nature12373'],
+        'No work in OpenAlex for DOI',
+      ],
+      [
+        'DOI URL',
+        'https://doi.org/10.1038/nature12373',
+        ['/works/doi:10.1038/nature12373'],
+        'No work in OpenAlex for DOI',
+      ],
+      ['ROR URL', 'https://ror.org/013meh722', ror('https://ror.org/013meh722'), rorMiss],
+      ['bare ROR', '013meh722', ror('013meh722'), rorMiss],
+      [
+        'funder DOI',
+        '10.13039/100000001',
+        ['/funders?filter=ids.doi%3A10.13039%2F100000001&per_page=1'],
+        'No funder in OpenAlex for DOI',
+      ],
+      ['bare PMID', '23903748', ['/works/pmid:23903748'], 'No work in OpenAlex for PMID'],
+      ['PMCID', 'PMC1234567', ['/works/pmcid:PMC1234567'], 'No work in OpenAlex for PMCID'],
+      ['ISSN', '1234-5678', ['/sources/issn:1234-5678'], 'No source in OpenAlex for ISSN'],
+      [
+        'OpenAlex work ID',
+        'W2159974629',
+        ['/works/W2159974629', '/autocomplete?q=W2159974629'],
+        'No work in OpenAlex for OpenAlex ID',
+      ],
+      [
+        'OpenAlex funder ID',
+        'F4320332161',
+        ['/funders/F4320332161', '/autocomplete?q=F4320332161'],
+        'No funder in OpenAlex for OpenAlex ID',
+      ],
+      [
+        'OpenAlex ID URL',
+        'https://openalex.org/I241749',
+        ['/institutions/I241749'],
+        'No institution in OpenAlex for OpenAlex ID',
+      ],
     ];
 
     it.each(identifiers)(
-      'routes a %s to the deterministic lookup, not autocomplete',
-      async (_label, query, entityType) => {
-        mockResolveIdentifier.mockResolvedValue({ results: [schutz] });
-        const ctx = createMockContext();
-        const input = resolveNameTool.input.parse({ query });
+      'looks a %s up by ID, searching it as a name only when it may be one',
+      async (_label, query, expected, missed) => {
+        const paths = new Set(expected.map((request) => request.split('?')[0]));
+        const { requests } = await routeToRealService((url) => {
+          if (!paths.has(url.pathname)) return;
+          if (url.pathname === '/funders') return jsonResponse({ meta: { count: 0 }, results: [] });
+          if (url.pathname === '/autocomplete') return jsonResponse({ results: [] });
+          return new Response('<!doctype html><title>404</title>', { status: 404 });
+        });
 
-        await resolveNameTool.handler(input, ctx);
+        const result = await runToolContract(resolveNameTool, { query });
 
-        expect(mockAutocomplete).not.toHaveBeenCalled();
-        expect(mockResolveIdentifier).toHaveBeenCalledWith(
-          expect.objectContaining({ entityType }),
-          ctx,
-        );
+        expect(result.isError).toBeFalsy();
+        expect(requests()).toEqual(expected);
+        const { results, notice } = result.structuredContent as AutocompleteResult & {
+          notice?: string;
+        };
+        expect(results).toEqual([]);
+        for (const surface of [notice ?? '', contentText(result)]) {
+          expect(surface).toContain(`${missed} ${JSON.stringify(query)}`);
+        }
       },
     );
 
@@ -335,8 +638,10 @@ describe('resolveNameTool', () => {
 
         expect(mockAutocomplete).not.toHaveBeenCalled();
         expect(mockResolveIdentifier).toHaveBeenCalledWith(
-          expect.objectContaining({ entityType, id }),
+          expect.objectContaining({ entityTypes: [entityType], id }),
           ctx,
+          undefined,
+          query,
         );
       },
     );
@@ -369,10 +674,95 @@ describe('resolveNameTool', () => {
 
       expect(mockAutocomplete).not.toHaveBeenCalled();
       expect(mockResolveIdentifier).toHaveBeenCalledWith(
-        { entityType: 'keywords', id: 'groundwater', scheme: 'openalex' },
+        { entityTypes: ['keywords'], id: 'groundwater', scheme: 'openalex' },
         ctx,
+        undefined,
+        'https://openalex.org/keywords/groundwater',
       );
       expect(result.results[0]?.id).toBe('https://openalex.org/keywords/groundwater');
+    });
+
+    /**
+     * OpenAlex record-page and API URLs carry the entity type in the path; each names one ID,
+     * so each goes to the by-ID lookup as that bare ID instead of a name search — one request to
+     * `/<type>/<id>`, whatever else the URL carried. (gh #99)
+     */
+    const urlRecords: Record<string, { id: string; display_name: string; entity: string }> = {
+      '/works/W2741809807': {
+        id: 'https://openalex.org/W2741809807',
+        display_name: 'The state of OA',
+        entity: 'work',
+      },
+      '/authors/A5023888391': {
+        id: 'https://openalex.org/A5023888391',
+        display_name: 'Jason Priem',
+        entity: 'author',
+      },
+      '/keywords/groundwater': {
+        id: 'https://openalex.org/keywords/groundwater',
+        display_name: 'Groundwater',
+        entity: 'keyword',
+      },
+    };
+
+    it.each([
+      ['https://openalex.org/works/W2741809807', '/works/W2741809807'],
+      ['https://api.openalex.org/works/W2741809807', '/works/W2741809807'],
+      ['https://api.openalex.org/W2741809807', '/works/W2741809807'],
+      ['http://openalex.org/W2741809807', '/works/W2741809807'],
+      ['openalex.org/works/W2741809807', '/works/W2741809807'],
+      ['https://openalex.org/W2741809807/', '/works/W2741809807'],
+      ['https://api.openalex.org/works/W2741809807?select=id', '/works/W2741809807'],
+      ['https://openalex.org/authors/A5023888391', '/authors/A5023888391'],
+      ['http://openalex.org/keywords/groundwater', '/keywords/groundwater'],
+      ['https://api.openalex.org/keywords/groundwater', '/keywords/groundwater'],
+    ])('looks the OpenAlex URL %s up at %s alone (gh #99)', async (query, path) => {
+      const record = urlRecords[path];
+      if (!record) throw new Error(`no record for ${path}`);
+      const { requests } = await routeToRealService((url) =>
+        url.pathname === path
+          ? jsonResponse({ id: record.id, display_name: record.display_name })
+          : undefined,
+      );
+
+      const result = await runToolContract(resolveNameTool, { query });
+
+      expect(result.isError).toBeFalsy();
+      expect(requests()).toEqual([path]);
+      const { results, notice } = result.structuredContent as AutocompleteResult & {
+        notice?: string;
+      };
+      expect(results).toMatchObject([
+        { id: record.id, display_name: record.display_name, entity_type: record.entity },
+      ]);
+      expect(notice).toBeUndefined();
+      expect(contentText(result)).toContain(`**${record.display_name}** (${record.entity})`);
+      expect(contentText(result)).toContain(record.id);
+    });
+
+    it.each(['p53', 'w2741809807'])(
+      'keeps the bare lowercase token %s a name query (gh #99)',
+      async (query) => {
+        const { requests } = await routeToRealService((url) =>
+          url.pathname === '/autocomplete'
+            ? jsonResponse({ results: sampleResults.results })
+            : undefined,
+        );
+
+        const result = await runToolContract(resolveNameTool, { query });
+
+        expect(result.isError).toBeFalsy();
+        expect(requests()).toEqual([`/autocomplete?q=${query}`]);
+        expect((result.structuredContent as AutocompleteResult).results).toEqual(
+          sampleResults.results,
+        );
+        expect(contentText(result)).toContain('**Harvard University** (institution)');
+      },
+    );
+
+    it('documents the OpenAlex URL forms query accepts (gh #99)', () => {
+      const description = resolveNameTool.input.shape.query.description ?? '';
+      expect(description).toContain('https://openalex.org/works/W2741809807');
     });
 
     it('sends a bare keyword slug to autocomplete (gh #68)', async () => {
@@ -514,6 +904,622 @@ describe('resolveNameTool', () => {
   });
 
   /**
+   * One ROR can name an institution, a funder, and a publisher record at once, and funders are
+   * keyed by Crossref Funder Registry DOIs. These run the real `resolveIdentifier` against a
+   * routed `fetch`: only the listed `api.openalex.org` paths answer, the `missing` ones 404, and
+   * anything else rejects. Upstream values are the ones OpenAlex returned on 2026-10-17. (gh #98)
+   */
+  describe('RORs and funder DOIs (gh #98)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const nsfFunder = {
+      id: 'https://openalex.org/F4320306076',
+      display_name: 'National Science Foundation',
+      works_count: 543210,
+      cited_by_count: 9876543,
+      country_code: 'US',
+    };
+    const records: Record<string, unknown> = {
+      '/institutions/ror:021nxhr62': {
+        id: 'https://openalex.org/I1311060795',
+        display_name: 'U.S. National Science Foundation',
+        ror: 'https://ror.org/021nxhr62',
+        country_code: 'US',
+        works_count: 12204,
+        cited_by_count: 412345,
+      },
+      '/funders/ror:021nxhr62': nsfFunder,
+      '/funders/ror:https://ror.org/021nxhr62': nsfFunder,
+      '/publishers/ror:021nxhr62': {
+        id: 'https://openalex.org/P4365365866',
+        display_name: 'National Science Foundation',
+        works_count: 120,
+        cited_by_count: 3456,
+      },
+      '/publishers/ror:https://ror.org/02scfj030': {
+        id: 'https://openalex.org/P4310320990',
+        display_name: 'Elsevier BV',
+        works_count: 23456789,
+        cited_by_count: 345678901,
+      },
+      '/institutions/ror:04dzdm737': {
+        id: 'https://openalex.org/I1327191685',
+        display_name: 'deCODE Genetics (Iceland)',
+        ror: 'https://ror.org/04dzdm737',
+        country_code: 'IS',
+        works_count: 2345,
+        cited_by_count: 456789,
+      },
+      '/works/doi:10.13039/100000001': {
+        id: 'https://openalex.org/W775343536',
+        display_name: 'Myxomycetes collected in the first phase of a North-South transect of Chile',
+        doi: 'https://doi.org/10.13039/100000001',
+        cited_by_count: 3,
+        publication_year: 2008,
+      },
+    };
+    const missing = new Set([
+      '/funders/ror:04dzdm737',
+      '/publishers/ror:04dzdm737',
+      '/institutions/ror:0zzzzzz99',
+      '/funders/ror:0zzzzzz99',
+      '/publishers/ror:0zzzzzz99',
+      // The line break and `#` stay in the ID, percent-encoded, rather than ending the path. (gh #109)
+      ...['institutions', 'funders', 'publishers'].map(
+        (type) => `/${type}/ror:https://ror.org/0zzzzzz99%0A%23%20Injected`,
+      ),
+    ]);
+
+    /** Route `mockResolveIdentifier` to the real service over the routed `fetch`. */
+    async function useRealService(failing: Record<string, number> = {}) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const path = url.pathname;
+        if (url.hostname !== 'api.openalex.org') {
+          return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+        }
+        const json = (body: unknown, status = 200) =>
+          Promise.resolve(new Response(JSON.stringify(body), { status }));
+        if (failing[path] !== undefined) return json({ error: 'Forbidden' }, failing[path]);
+        if (path in records) return json(records[path]);
+        if (missing.has(path)) {
+          return Promise.resolve(
+            new Response('<!doctype html><title>404</title>', { status: 404 }),
+          );
+        }
+        if (path === '/funders') {
+          const hit = url.searchParams.get('filter') === 'ids.doi:10.13039/100000001';
+          return json({
+            meta: { count: hit ? 1 : 0, per_page: 1, next_cursor: null },
+            results: hit ? [nsfFunder] : [],
+          });
+        }
+        return Promise.reject(new Error(`unmocked fetch: ${path}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockResolveIdentifier.mockImplementation((...args: unknown[]) =>
+        service.resolveIdentifier(...(args as Parameters<typeof service.resolveIdentifier>)),
+      );
+      return fetchMock;
+    }
+
+    async function call(args: { query: string; entity_type?: EntityType }) {
+      const result = await runToolContract(resolveNameTool, args);
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as AutocompleteResult & { notice?: string };
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      return { ids: structured.results.map((r) => r.id), notice: structured.notice, text };
+    }
+
+    it('returns the institution, funder, and publisher a ROR names, in that order', async () => {
+      const fetchMock = await useRealService();
+
+      const { ids, notice, text } = await call({ query: '021nxhr62' });
+
+      expect(ids).toEqual([
+        'https://openalex.org/I1311060795',
+        'https://openalex.org/F4320306076',
+        'https://openalex.org/P4365365866',
+      ]);
+      expect(notice).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      for (const id of ids) expect(text).toContain(id);
+      expect(text.indexOf('(institution)')).toBeLessThan(text.indexOf('(funder)'));
+      expect(text.indexOf('(funder)')).toBeLessThan(text.indexOf('(publisher)'));
+    });
+
+    it.each([
+      ['funders', 'https://ror.org/021nxhr62', 'https://openalex.org/F4320306076'],
+      ['publishers', 'https://ror.org/02scfj030', 'https://openalex.org/P4310320990'],
+      ['institutions', '021nxhr62', 'https://openalex.org/I1311060795'],
+    ])(
+      'returns only the %s record a ROR names under that entity_type',
+      async (entityType, query, id) => {
+        const fetchMock = await useRealService();
+
+        const { ids, notice } = await call({ query, entity_type: entityType as EntityType });
+
+        expect(ids).toEqual([id]);
+        expect(notice).toBeUndefined();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('returns the one record a ROR holds when the other types have none', async () => {
+      await useRealService();
+      const { ids, notice } = await call({ query: '04dzdm737' });
+      expect(ids).toEqual(['https://openalex.org/I1327191685']);
+      expect(notice).toBeUndefined();
+    });
+
+    it('names funders and suggests omitting entity_type when that ROR type is missing', async () => {
+      await useRealService();
+
+      const { ids, notice, text } = await call({ query: '04dzdm737', entity_type: 'funders' });
+
+      expect(ids).toEqual([]);
+      expect(notice).toBe(
+        'No funder in OpenAlex for ROR "04dzdm737" under entity_type="funders". One ROR can name an institution, a funder, and a publisher — omit entity_type to look up all three.',
+      );
+      expect(text).toContain(notice);
+    });
+
+    it('gives a ROR no type has a record for the identifier-miss notice', async () => {
+      await useRealService();
+
+      const { ids, notice, text } = await call({ query: '0zzzzzz99' });
+
+      expect(ids).toEqual([]);
+      expect(notice).toBe(
+        'No institution, funder, or publisher in OpenAlex for ROR "0zzzzzz99". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.',
+      );
+      expect(text).toContain(notice);
+    });
+
+    it('looks a ROR up as all three types under another entity_type, and says so', async () => {
+      await useRealService();
+
+      const { ids, notice, text } = await call({ query: '021nxhr62', entity_type: 'works' });
+
+      expect(ids).toEqual([
+        'https://openalex.org/I1311060795',
+        'https://openalex.org/F4320306076',
+        'https://openalex.org/P4365365866',
+      ]);
+      expect(notice).toBe(
+        'Resolved "021nxhr62" by ROR — it identifies an institution, a funder, or a publisher directly, so entity_type="works" did not apply.',
+      );
+      expect(text).toContain(notice);
+    });
+
+    it('keeps the records that resolved when one type fails, and names the failed type', async () => {
+      await useRealService({ '/funders/ror:021nxhr62': 403 });
+
+      const { ids, notice, text } = await call({ query: '021nxhr62' });
+
+      expect(ids).toEqual(['https://openalex.org/I1311060795', 'https://openalex.org/P4365365866']);
+      expect(notice).toMatch(/funder lookup failed/);
+      expect(text).toMatch(/funder lookup failed/);
+    });
+
+    it.each([
+      ['10.13039/100000001', undefined],
+      ['doi:10.13039/100000001', 'funders'],
+      ['https://doi.org/10.13039/100000001', 'funders'],
+      ['10.13039/100000001', 'institutions'],
+    ])('resolves the funder DOI %s (entity_type %s) to the funder', async (query, entityType) => {
+      const fetchMock = await useRealService();
+
+      const { ids } = await call({
+        query,
+        ...(entityType ? { entity_type: entityType as EntityType } : {}),
+      });
+
+      expect(ids).toEqual(['https://openalex.org/F4320306076']);
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.pathname).toBe('/funders');
+      expect(url.searchParams.get('filter')).toBe('ids.doi:10.13039/100000001');
+    });
+
+    it('notices an entity_type a funder DOI does not apply to', async () => {
+      await useRealService();
+      const { ids, notice, text } = await call({
+        query: '10.13039/100000001',
+        entity_type: 'authors',
+      });
+      expect(ids).toEqual(['https://openalex.org/F4320306076']);
+      expect(notice).toBe(
+        'Resolved "10.13039/100000001" by DOI — it identifies one funder directly, so entity_type="authors" did not apply.',
+      );
+      expect(text).toContain(notice);
+    });
+
+    it('points a funder DOI no funder carries at entity_type works, on both surfaces', async () => {
+      await useRealService();
+
+      const { ids, notice, text } = await call({ query: '10.13039/999999999' });
+
+      expect(ids).toEqual([]);
+      expect(notice).toContain('No funder in OpenAlex for DOI "10.13039/999999999"');
+      expect(notice).toContain('entity_type="works"');
+      expect(text).toContain('entity_type="works"');
+    });
+
+    it('keeps a funder DOI reachable as a work under entity_type works', async () => {
+      await useRealService();
+      const { ids, notice } = await call({ query: '10.13039/100000001', entity_type: 'works' });
+      expect(ids).toEqual(['https://openalex.org/W775343536']);
+      expect(notice).toBeUndefined();
+    });
+
+    it('JSON-encodes the echoed query so a line break cannot start a heading', async () => {
+      await useRealService();
+
+      const { notice, text } = await call({ query: 'https://ror.org/0zzzzzz99\n# Injected' });
+
+      expect(notice).toContain('"https://ror.org/0zzzzzz99\\n# Injected"');
+      expect(text.split('\n').some((line) => line.trimStart().startsWith('# Injected'))).toBe(
+        false,
+      );
+    });
+
+    it('fails an identifier with a .. segment as id_dot_segment before any request (gh #109)', async () => {
+      const fetchMock = await useRealService();
+
+      const result = await runToolContract(resolveNameTool, {
+        query: 'doi:10.1000/../../authors/A5023888391',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'id_dot_segment',
+            recovery: { hint: expect.stringContaining('relative path segments') },
+          },
+        },
+      });
+    });
+
+    it('quotes a refused identifier as the caller wrote it, on both surfaces', async () => {
+      const fetchMock = await useRealService();
+      const query = 'https://doi.org/10.1000/../../authors/A5023888391';
+
+      const result = await runToolContract(resolveNameTool, { query });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const quoted = `id ${JSON.stringify(query)} holds`;
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          message: expect.stringContaining(quoted),
+          data: { reason: 'id_dot_segment', id: query },
+        },
+      });
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain(quoted);
+      expect(text).not.toContain('doi:10.1000');
+    });
+
+    it('describes when entity_type applies to an identifier', () => {
+      expect(resolveNameTool.description).not.toMatch(/needs no entity_type/);
+      expect(resolveNameTool.description).toMatch(/ROR/);
+      const entityType = resolveNameTool.input.shape.entity_type.description ?? '';
+      expect(entityType).not.toMatch(/an identifier determines its own entity type/);
+      expect(entityType).toMatch(/ROR/);
+      expect(entityType).toMatch(/10\.13039/);
+    });
+  });
+
+  /**
+   * A bare native OpenAlex ID shape (`^[AFIPSTW]\d+$`) is also the shape of short names — keyword
+   * `p53`, `F1`, `S1`. These run the real service against a routed `fetch`: only the listed
+   * `api.openalex.org` paths answer (a `/<type>/<ID>` path not listed 404s), and any other host
+   * rejects. Autocomplete bodies are the ones OpenAlex returned on 2026-10-17. (gh #106)
+   */
+  describe('short names shaped like OpenAlex IDs (gh #106)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const p53Keyword = {
+      id: 'https://openalex.org/keywords/p53',
+      short_id: 'keywords/p53',
+      display_name: 'p53',
+      hint: 'A tumor-suppressor protein that regulates cellular responses to DNA damage and is studied in cancer biology and molecular genetics.',
+      cited_by_count: 3606453,
+      works_count: 116388,
+      entity_type: 'keyword',
+      external_id: null,
+      filter_key: 'keywords.id',
+    };
+    const tp53Keyword = {
+      id: 'https://openalex.org/keywords/tp53',
+      short_id: 'keywords/tp53',
+      display_name: 'TP53',
+      hint: 'P53',
+      cited_by_count: 520285,
+      works_count: 24860,
+      entity_type: 'keyword',
+      external_id: null,
+      filter_key: 'keywords.id',
+    };
+    const p53Work = {
+      id: 'https://openalex.org/W1990130549',
+      display_name: 'p53, the cellular gatekeeper for growth and division',
+      entity_type: 'work',
+      external_id: 'https://doi.org/10.1016/s0092-8674(00)81871-1',
+      cited_by_count: 7000,
+      works_count: null,
+      hint: 'Arnold J. Levine',
+    };
+    const byId: Record<string, unknown> = {
+      '/works/W2741809807': {
+        id: 'https://openalex.org/W2741809807',
+        display_name: 'The state of OA',
+        doi: 'https://doi.org/10.7717/peerj.4375',
+        cited_by_count: 1200,
+        publication_year: 2018,
+      },
+      '/institutions/I241749': {
+        id: 'https://openalex.org/I241749',
+        display_name: 'University of Cambridge',
+        ror: 'https://ror.org/013meh722',
+        country_code: 'GB',
+        works_count: 508356,
+        cited_by_count: 62040570,
+      },
+      '/topics/T10159': {
+        id: 'https://openalex.org/T10159',
+        display_name: 'Groundwater flow and contamination studies',
+        works_count: 98765,
+        cited_by_count: 1234567,
+      },
+      '/works/doi:10.7717/peerj.4375': {
+        id: 'https://openalex.org/W2741809807',
+        display_name: 'The state of OA',
+        doi: 'https://doi.org/10.7717/peerj.4375',
+        cited_by_count: 1200,
+        publication_year: 2018,
+      },
+    };
+    /** `/autocomplete…` path → q → results; a query not listed answers with no results. */
+    const autocomplete: Record<string, Record<string, unknown[]>> = {
+      '/autocomplete': {},
+      '/autocomplete/keywords': { P53: [p53Keyword, tp53Keyword] },
+      '/autocomplete/works': { P53: [p53Work] },
+      '/autocomplete/publishers': {},
+    };
+
+    /** Route both service methods to the real service over a routed `fetch`. */
+    async function useRealService(failing: Record<string, number> = {}) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const path = url.pathname;
+        if (url.hostname !== 'api.openalex.org') {
+          return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+        }
+        const json = (body: unknown, status = 200) =>
+          Promise.resolve(new Response(JSON.stringify(body), { status }));
+        if (failing[path] !== undefined) {
+          return json({ error: 'Upstream failure', message: 'Upstream failure' }, failing[path]);
+        }
+        if (path in byId) return json(byId[path]);
+        const matches = autocomplete[path];
+        if (matches) {
+          const results = matches[url.searchParams.get('q') ?? ''] ?? [];
+          return json({ meta: { count: results.length, per_page: 10 }, results });
+        }
+        if (
+          /^\/(?:works|authors|sources|institutions|topics|publishers|funders)\/[^/]+$/.test(path)
+        ) {
+          return Promise.resolve(
+            new Response('<!doctype html><title>404</title>', { status: 404 }),
+          );
+        }
+        return Promise.reject(new Error(`unmocked fetch: ${path}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockResolveIdentifier.mockImplementation((...args: unknown[]) =>
+        service.resolveIdentifier(...(args as Parameters<typeof service.resolveIdentifier>)),
+      );
+      mockAutocomplete.mockImplementation((...args: unknown[]) =>
+        service.autocomplete(...(args as Parameters<typeof service.autocomplete>)),
+      );
+      /** Each request as `<path>?<params>`, in order — the credential and `select` params dropped. */
+      const requests = () =>
+        fetchMock.mock.calls.map(([input]) => {
+          const url = new URL(String(input));
+          for (const param of ['api_key', 'mailto', 'select']) url.searchParams.delete(param);
+          return `${url.pathname}${url.search}`;
+        });
+      return { fetchMock, requests };
+    }
+
+    async function call(args: {
+      query: string;
+      entity_type?: EntityType;
+      filters?: Record<string, string>;
+    }) {
+      const result = await runToolContract(resolveNameTool, args);
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as AutocompleteResult & { notice?: string };
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      return { ids: structured.results.map((r) => r.id), notice: structured.notice, text };
+    }
+
+    it('searches a native-ID-shaped query as a keyword name under entity_type keywords', async () => {
+      const { requests } = await useRealService();
+
+      const { ids, notice, text } = await call({ query: 'P53', entity_type: 'keywords' });
+
+      expect(ids).toEqual([
+        'https://openalex.org/keywords/p53',
+        'https://openalex.org/keywords/tp53',
+      ]);
+      expect(requests()).toEqual(['/autocomplete/keywords?q=P53']);
+      expect(notice).toBeUndefined();
+      expect(text).toContain('**p53** (keyword)');
+    });
+
+    it('runs the name search after the ID misses, and names both outcomes', async () => {
+      const { requests } = await useRealService();
+
+      const { ids, notice, text } = await call({ query: 'P53' });
+
+      expect(ids).toEqual([]);
+      expect(requests()).toEqual(['/publishers/P53', '/autocomplete?q=P53']);
+      for (const surface of [notice ?? '', text]) {
+        expect(surface).toContain('No publisher in OpenAlex for OpenAlex ID "P53"');
+        expect(surface).toMatch(/as a name it matched nothing across all entity types/);
+        expect(surface).toMatch(/pass entity_type to search one type/);
+        expect(surface).not.toMatch(/check it for a typo/);
+      }
+    });
+
+    it('returns the name matches the fallback finds under the caller entity_type', async () => {
+      const { requests } = await useRealService();
+
+      const { ids, notice, text } = await call({ query: 'P53', entity_type: 'works' });
+
+      expect(ids).toEqual(['https://openalex.org/W1990130549']);
+      expect(requests()).toEqual(['/publishers/P53', '/autocomplete/works?q=P53']);
+      expect(notice).toBe(
+        'No publisher in OpenAlex for OpenAlex ID "P53", so it was searched as a name among works instead.',
+      );
+      expect(text).toContain('**p53, the cellular gatekeeper for growth and division** (work)');
+      expect(text).not.toMatch(/did not apply/);
+    });
+
+    it('applies filters to the fallback name search when entity_type is set', async () => {
+      const { requests } = await useRealService();
+
+      const { notice, text } = await call({
+        query: 'P53',
+        entity_type: 'publishers',
+        filters: { country_codes: 'US' },
+      });
+
+      expect(requests()).toEqual([
+        '/publishers/P53',
+        '/autocomplete/publishers?q=P53&filter=country_codes%3AUS',
+      ]);
+      expect(notice).toContain(
+        'as a name it matched nothing among publishers with filters={"country_codes":"US"}',
+      );
+      expect(notice).toMatch(/Loosen or drop filters/);
+      expect(notice).not.toMatch(/omit entity_type/);
+      expect(text).toContain(notice);
+    });
+
+    it('runs no name search when filters come without entity_type, and says how to run one', async () => {
+      const { requests } = await useRealService();
+
+      const { ids, notice, text } = await call({ query: 'P53', filters: { country_codes: 'US' } });
+
+      expect(ids).toEqual([]);
+      expect(requests()).toEqual(['/publishers/P53']);
+      for (const surface of [notice ?? '', text]) {
+        expect(surface).toContain('No publisher in OpenAlex for OpenAlex ID "P53"');
+        expect(surface).toMatch(
+          /pass entity_type to search one type by name with these filters, or drop filters/,
+        );
+      }
+    });
+
+    it('discloses a name search that failed upstream instead of hiding it', async () => {
+      vi.useFakeTimers();
+      try {
+        const { requests } = await useRealService({ '/autocomplete/works': 503 });
+
+        const pending = call({ query: 'P53', entity_type: 'works' });
+        await vi.runAllTimersAsync();
+        const { ids, notice, text } = await pending;
+
+        expect(ids).toEqual([]);
+        // One by-ID miss, then three attempts at the name search before it gives up.
+        expect(requests()).toHaveLength(4);
+        for (const surface of [notice ?? '', text]) {
+          expect(surface).toContain('No publisher in OpenAlex for OpenAlex ID "P53"');
+          expect(surface).toMatch(
+            /name search it fell back to failed upstream \(reason upstream_unavailable\)/,
+          );
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('fails the call when the fallback name search is rejected as a caller error', async () => {
+      const { requests } = await useRealService({ '/autocomplete/works': 400 });
+
+      const result = await runToolContract(resolveNameTool, {
+        query: 'P53',
+        entity_type: 'works',
+        filters: { bogus_field: 'x' },
+      });
+
+      expect(result.isError).toBe(true);
+      // The 400 is the caller's to fix, so it is neither retried nor folded into a notice.
+      expect(requests()).toEqual([
+        '/publishers/P53',
+        '/autocomplete/works?q=P53&filter=bogus_field%3Ax',
+      ]);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_params_other' },
+        },
+      });
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(contentText(result)).toContain('(reason upstream_invalid_params_other');
+    });
+
+    it.each([
+      ['W2741809807', '/works/W2741809807', 'https://openalex.org/W2741809807'],
+      ['I241749', '/institutions/I241749', 'https://openalex.org/I241749'],
+      ['T10159', '/topics/T10159', 'https://openalex.org/T10159'],
+      ['10.7717/peerj.4375', '/works/doi:10.7717/peerj.4375', 'https://openalex.org/W2741809807'],
+    ])('resolves %s by ID with one request and no name search', async (query, path, id) => {
+      const { requests } = await useRealService();
+
+      const { ids, notice } = await call({ query });
+
+      expect(ids).toEqual([id]);
+      expect(notice).toBeUndefined();
+      expect(requests()).toEqual([path]);
+    });
+
+    it('documents that a bare ID shape which resolves nothing is searched as a name', () => {
+      const query = resolveNameTool.input.shape.query.description ?? '';
+      expect(query).toMatch(/P53/);
+      expect(query).toMatch(/searched as a name/);
+      const entityType = resolveNameTool.input.shape.entity_type.description ?? '';
+      expect(entityType).toMatch(/keywords/);
+      expect(resolveNameTool.description).toMatch(/searched as a name/);
+    });
+  });
+
+  /**
    * A PMCID is still recognized and still forwarded, but OpenAlex indexes none, so it can only
    * come back empty. The generic identifier-miss notice ("check it for a typo") is the wrong
    * advice there — nothing about the identifier is wrong — so the PMCID case carries the
@@ -538,11 +1544,13 @@ describe('resolveNameTool', () => {
         expect(mockAutocomplete).not.toHaveBeenCalled();
         expect(mockResolveIdentifier).toHaveBeenCalledWith(
           expect.objectContaining({
-            entityType: 'works',
+            entityTypes: ['works'],
             id: 'pmcid:PMC3084216',
             scheme: 'pmcid',
           }),
           ctx,
+          undefined,
+          query,
         );
       },
     );
@@ -590,6 +1598,166 @@ describe('resolveNameTool', () => {
     });
   });
 
+  /**
+   * The filter path is shared by every filter-taking tool; this proves the tool reaches it with
+   * the caller's filters and that the autocomplete request carries what the service built, as
+   * sent. The value table itself lives in the service suite.
+   */
+  describe('filters on the wire through the real service (gh #107, #101)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    async function run(filters: Record<string, string>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        return url.hostname === 'api.openalex.org' && url.pathname === '/autocomplete/works'
+          ? Promise.resolve(new Response(JSON.stringify({ results: [] })))
+          : Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockAutocomplete.mockImplementation((...args: unknown[]) =>
+        service.autocomplete(...(args as Parameters<typeof service.autocomplete>)),
+      );
+
+      const result = await runToolContract(resolveNameTool, {
+        entity_type: 'works',
+        query: 'groundwater recharge',
+        filters,
+      });
+      const sentFilter = () =>
+        new URL(String(fetchMock.mock.calls.at(-1)?.[0])).search
+          .slice(1)
+          .split('&')
+          .find((pair) => pair.startsWith('filter='));
+      return { fetchMock, result, sentFilter };
+    }
+
+    it('sends a "+" AND as a raw "+"', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'DE+US',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=authorships.institutions.country_code%3ADE+US');
+    });
+
+    it('sends a comma in a .search.exact value quoted rather than refusing it (gh #113)', async () => {
+      const { result, sentFilter } = await run({ 'title.search.exact': 'cats, dogs' });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=title.search.exact%3A%22cats%2C+dogs%22');
+    });
+
+    it('sends a comma in a raw_affiliation_strings value quoted rather than refusing it (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        raw_affiliation_strings: 'University of California, Berkeley',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22',
+      );
+    });
+
+    it('sends a multi-word name on an exact-match key as one quoted phrase (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        'awards.funder_display_name': 'National Science Foundation',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      );
+    });
+
+    it('sends converted country and language values, echoing the caller spelling', async () => {
+      const filters = { 'authorships.institutions.country_code': 'DEU+FRA', language: 'English' };
+      const { result, sentFilter } = await run(filters);
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3ADE+FR%2Clanguage%3Aen',
+      );
+      const { notice } = result.structuredContent as { notice: string };
+      expect(notice).toContain(JSON.stringify(filters));
+      expect(textOf(result)).toContain(JSON.stringify(filters));
+    });
+
+    it('sends an OR of multi-word country and language names as codes', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'South Korea|Japan',
+        language: 'Scottish Gaelic|English',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3AKR%7CJP%2Clanguage%3Agd%7Cen',
+      );
+    });
+
+    it('fails a country that cannot be a code as invalid_country_code before any request', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'Narnia',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            recovery: { hint: expect.stringContaining('ISO 3166-1 alpha-2') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('"Narnia" is not a country code');
+      expect(textOf(result)).toContain('invalid_country_code');
+    });
+
+    it('declares invalid_country_code as a service-thrown ValidationError', () => {
+      const entry = resolveNameTool.errors?.find((e) => e.reason === 'invalid_country_code');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('fails a value mixing "|" with an AND "+" before any request (gh #107)', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'DE|FR+US',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'mixed_and_or_in_filter_value',
+            recovery: { hint: expect.stringContaining('"institutions.country_code": "US"') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('mixes "|" (OR) with an AND operator');
+      expect(textOf(result)).toContain('mixed_and_or_in_filter_value');
+    });
+
+    it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = resolveNameTool.errors?.find(
+        (e) => e.reason === 'mixed_and_or_in_filter_value',
+      );
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = resolveNameTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+  });
+
   describe('format', () => {
     const text = (result: AutocompleteResult) => {
       const blocks = resolveNameTool.format?.(result) ?? [];
@@ -610,6 +1778,26 @@ describe('resolveNameTool', () => {
 
     it('returns "No matches" for empty results', () => {
       expect(text({ results: [] })).toBe('No matches found.');
+    });
+
+    it('prints no works count for a work, which carries none', () => {
+      const output = text({
+        results: [
+          {
+            id: 'https://openalex.org/W2741809807',
+            display_name: 'The state of OA',
+            entity_type: 'work',
+            external_id: 'https://doi.org/10.7717/peerj.4375',
+            cited_by_count: 1234,
+            works_count: null,
+            hint: 'Heather Piwowar, Jason Priem',
+          },
+        ],
+      });
+      expect(output).toContain(
+        'https://openalex.org/W2741809807 | https://doi.org/10.7717/peerj.4375 | 1234 citations | Heather Piwowar, Jason Priem',
+      );
+      expect(output).not.toMatch(/works\b/);
     });
 
     it('labels an untitled record rather than printing null (gh #50)', () => {

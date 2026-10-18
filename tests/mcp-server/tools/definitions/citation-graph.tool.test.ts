@@ -10,7 +10,7 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
 import {
@@ -288,7 +288,7 @@ describe('getCitationGraphTool', () => {
 
       const enrichment = getEnrichment(ctx);
       expect(enrichment.totalCount).toBe(3);
-      expect(enrichment.echo).toContain('seed_id=W2741809807');
+      expect(enrichment.echo).toContain('seed_id="W2741809807"');
       expect(enrichment.echo).toContain('direction=cites');
       expect(enrichment.notice).toBeUndefined();
     });
@@ -475,6 +475,69 @@ describe('getCitationGraphTool', () => {
           },
         },
       });
+    });
+
+    /**
+     * `select` reaches OpenAlex as written, so a misspelled field is a rejected field name too.
+     * The real service reads OpenAlex's own 400 body, so the reason the recovery is keyed on is
+     * the one a real rejection classifies to.
+     */
+    it('points a rejected select field at the select field list', async () => {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        if (url.hostname !== 'api.openalex.org') {
+          return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+        }
+        if (url.pathname === '/works/W2741809807') {
+          return Promise.resolve(
+            Response.json({ id: 'https://openalex.org/W2741809807', display_name: 'Seed' }),
+          );
+        }
+        return Promise.resolve(
+          Response.json(
+            {
+              error: 'Invalid query parameters error.',
+              message:
+                'totally_made_up_field is not a valid select field. Valid fields for select are: id, doi, title, display_name.',
+            },
+            { status: 400, statusText: 'Bad Request' },
+          ),
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        select: ['totally_made_up_field'],
+      }).finally(() => vi.unstubAllGlobals());
+
+      const graphUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+      expect(graphUrl.pathname).toBe('/works');
+      expect(graphUrl.searchParams.get('select')).toBe('id,display_name,totally_made_up_field');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_invalid_params',
+            recovery: {
+              hint: expect.stringContaining('openalex_describe_fields("works", "select")'),
+            },
+          },
+        },
+      });
+      const entry = getCitationGraphTool.errors?.find(
+        (e) => e.reason === 'upstream_invalid_params',
+      );
+      expect(entry?.when).toMatch(/\bselect\b/);
     });
 
     it('points an invalid-ID-value 400 at openalex_resolve_name (gh #49)', async () => {
@@ -683,6 +746,418 @@ describe('getCitationGraphTool', () => {
   });
 
   /**
+   * These run the real service against a routed `fetch`, so the URL parse, the type check, and
+   * the `id` filter rewrite are the ones that ship; only `api.openalex.org` paths a case lists
+   * answer. (gh #99)
+   */
+  describe('OpenAlex URL seeds and cross-type seeds (gh #99)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const seedRecord = { id: 'https://openalex.org/W3002222772', display_name: 'Seed' };
+    const edgePage = {
+      meta: { count: 1, per_page: 25, next_cursor: null },
+      results: [{ id: 'https://openalex.org/W1', display_name: 'An Edge' }],
+    };
+
+    /** Route `mockSearch` to the real service; `fetch` answers only the listed paths. */
+    async function useRealService(routes: Record<string, unknown>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const body = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+        return body === undefined
+          ? Promise.reject(new Error(`unmocked fetch: ${url.pathname}`))
+          : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+
+    const graphFilter = (fetchMock: { mock: { calls: unknown[][] } }) =>
+      new URL(String(fetchMock.mock.calls.at(-1)?.[0])).searchParams.get('filter');
+
+    it('walks from a record-page seed URL as its bare work ID', async () => {
+      const fetchMock = await useRealService({
+        '/works/W3002222772': seedRecord,
+        '/works': edgePage,
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'https://openalex.org/works/W3002222772',
+        direction: 'cited_by',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(graphFilter(fetchMock)).toBe('cited_by:W3002222772');
+      expect(result.structuredContent).toMatchObject({
+        results: [{ id: 'https://openalex.org/W1', display_name: 'An Edge' }],
+      });
+    });
+
+    it('rewrites an id filter of mixed ID spellings to openalex, value unchanged', async () => {
+      const fetchMock = await useRealService({
+        '/works/W3002222772': seedRecord,
+        '/works': edgePage,
+      });
+      const ids = 'W2741809807|https://api.openalex.org/works/W3002222772';
+
+      await runToolContract(getCitationGraphTool, {
+        seed_id: 'W3002222772',
+        direction: 'cites',
+        filters: { id: ids },
+      });
+
+      expect(graphFilter(fetchMock)).toBe(`openalex:${ids},cites:W3002222772`);
+    });
+
+    it('fails an author URL seed as id_type_mismatch before any request', async () => {
+      const fetchMock = await useRealService({});
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'https://openalex.org/authors/A5023888391',
+        direction: 'cited_by',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'id_type_mismatch',
+            recovery: { hint: expect.stringContaining('seed_id') },
+          },
+        },
+      });
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('author ID');
+      expect(text).toContain('id_type_mismatch');
+    });
+
+    it('fails a seed with a .. segment as id_dot_segment before any request (gh #109)', async () => {
+      const fetchMock = await useRealService({});
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: '../authors/A5023888391',
+        direction: 'cited_by',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'id_dot_segment',
+            recovery: { hint: expect.stringContaining('relative path segments') },
+          },
+        },
+      });
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('id_dot_segment');
+    });
+
+    it('declares id_type_mismatch as a service-thrown ValidationError', () => {
+      const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'id_type_mismatch');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('documents the OpenAlex URL forms seed_id accepts', () => {
+      const description = getCitationGraphTool.input.shape.seed_id.description ?? '';
+      expect(description).toContain('https://openalex.org/works/W2741809807');
+    });
+
+    /**
+     * `author_list` is derived in the service the graph page shares with the search tool, so the
+     * graph returns it the same way: in place of `authorships`, with a 100-entry list flagged as
+     * possibly capped and continued by a slice on `author_list`. (gh #102)
+     */
+    it('returns author_list in place of authorships on both surfaces (gh #102)', async () => {
+      const capped = workWithAuthorships(1, 100, slimAuthorship);
+      const fetchMock = await useRealService({
+        '/works/W3002222772': seedRecord,
+        '/works': {
+          meta: { count: 2, per_page: 25, next_cursor: null },
+          results: [capped, workWithAuthorships(2, 2, slimAuthorship)],
+        },
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W3002222772',
+        direction: 'cites',
+        select: ['author_list'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const graphUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+      expect(graphUrl.searchParams.get('select')).toBe('id,display_name,authorships');
+      const structured = result.structuredContent as {
+        results: EntityRecord[];
+        windows?: { field: string; possibly_capped: boolean; next: unknown }[];
+      };
+      expect(structured.results.map((r) => Object.keys(r))).toEqual([
+        ['id', 'display_name', 'author_list'],
+        ['id', 'display_name', 'author_list'],
+      ]);
+      expect(structured.results[1]?.author_list).toEqual([
+        { id: 'https://openalex.org/A9000000', display_name: 'Author 0', orcid: null },
+        { id: 'https://openalex.org/A9000001', display_name: 'Author 1', orcid: null },
+      ]);
+      expect(structured.windows).toEqual([
+        expect.objectContaining({
+          field: 'author_list',
+          possibly_capped: true,
+          next: {
+            tool: 'openalex_search_entities',
+            arguments: {
+              entity_type: 'works',
+              id: 'W3000000001',
+              slice: { field: 'author_list', offset: 100 },
+            },
+          },
+        }),
+      ]);
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      expect(text).toContain('**Author List:**');
+      expect(text).toContain(
+        '- [1] id: https://openalex.org/A9000001, display_name: Author 1, orcid: —',
+      );
+      expect(text).toContain('**Window:** W3000000001 `author_list`');
+      expect(text).not.toContain('Authorships');
+      expect(getCitationGraphTool.input.shape.select.description).toContain(
+        '`author_list` returns each author',
+      );
+    });
+  });
+
+  /**
+   * The filter path is shared by every filter-taking tool; this proves the tool reaches it with
+   * the caller's filters and that the graph request carries what the service built, as sent. The
+   * value table itself lives in the service suite.
+   */
+  describe('filters on the wire through the real service (gh #107, #101)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    async function run(filters: Record<string, string>) {
+      const routes: Record<string, unknown> = {
+        '/works/W3002222772': { id: 'https://openalex.org/W3002222772', display_name: 'Seed' },
+        '/works': { meta: { count: 0, per_page: 25, next_cursor: null }, results: [] },
+      };
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const body = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+        return body === undefined
+          ? Promise.reject(new Error(`unmocked fetch: ${url.href}`))
+          : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W3002222772',
+        direction: 'cites',
+        filters,
+      });
+      const sentFilter = () =>
+        new URL(String(fetchMock.mock.calls.at(-1)?.[0])).search
+          .slice(1)
+          .split('&')
+          .find((pair) => pair.startsWith('filter='));
+      return { fetchMock, result, sentFilter };
+    }
+
+    it('sends a "+" AND as a raw "+"', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'DE+US',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3ADE+US%2Ccites%3AW3002222772',
+      );
+    });
+
+    it('sends a comma in a .search.exact value quoted rather than refusing it (gh #113)', async () => {
+      const { result, sentFilter } = await run({ 'title.search.exact': 'cats, dogs' });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=title.search.exact%3A%22cats%2C+dogs%22%2Ccites%3AW3002222772',
+      );
+    });
+
+    it('sends a comma in a raw_affiliation_strings value quoted rather than refusing it (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        raw_affiliation_strings: 'University of California, Berkeley',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22%2Ccites%3AW3002222772',
+      );
+    });
+
+    it('sends a multi-word name on an exact-match key as one quoted phrase (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        'awards.funder_display_name': 'National Science Foundation',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22%2Ccites%3AW3002222772',
+      );
+    });
+
+    it('sends converted country and language values, echoing the caller spelling', async () => {
+      const filters = { 'authorships.institutions.country_code': 'DEU+FRA', language: 'English' };
+      const { result, sentFilter } = await run(filters);
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3ADE+FR%2Clanguage%3Aen%2Ccites%3AW3002222772',
+      );
+      const { echo } = result.structuredContent as { echo: string };
+      expect(echo).toContain(JSON.stringify(filters));
+      expect(textOf(result)).toContain(JSON.stringify(filters));
+    });
+
+    it('sends an OR of multi-word country and language names as codes', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'South Korea|Japan',
+        language: 'Scottish Gaelic|English',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3AKR%7CJP%2Clanguage%3Agd%7Cen%2Ccites%3AW3002222772',
+      );
+    });
+
+    /** Before the seed lookup too: the graph search would refuse the value, so nothing is spent. */
+    it('fails a country that cannot be a code as invalid_country_code before any request', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'Narnia',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            recovery: { hint: expect.stringContaining('ISO 3166-1 alpha-2') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('"Narnia" is not a country code');
+      expect(textOf(result)).toContain('invalid_country_code');
+    });
+
+    it('fails a comma in a filter value before the seed lookup as well', async () => {
+      const { fetchMock, result } = await run({ publication_year: '2020,2021' });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'comma_in_filter_value',
+            recovery: {
+              hint: expect.stringContaining('move a phrase that contains commas into a free-text'),
+            },
+          },
+        },
+      });
+    });
+
+    it('declares invalid_country_code as a service-thrown ValidationError', () => {
+      const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'invalid_country_code');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /** Before the seed lookup too, as the country check is. (gh #107) */
+    it('fails a value mixing "|" with an AND "+" before any request (gh #107)', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'DE|FR+US',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'mixed_and_or_in_filter_value',
+            recovery: { hint: expect.stringContaining('"institutions.country_code": "US"') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('mixes "|" (OR) with an AND operator');
+      expect(textOf(result)).toContain('mixed_and_or_in_filter_value');
+    });
+
+    it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = getCitationGraphTool.errors?.find(
+        (e) => e.reason === 'mixed_and_or_in_filter_value',
+      );
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /**
+     * `direction` owns `cites`/`cited_by`/`related_to`, and the reserved-key guard reads the
+     * filters object's keys. A filter whose value is sent as a quoted phrase and carries a double
+     * quote of its own would otherwise reach the wire quoted, where OpenAlex ends the phrase at the
+     * inner quote and reads the text after it as further clauses — a key the guard never saw. The
+     * value is refused before any request, so no such clause reaches OpenAlex.
+     */
+    it('refuses a quoted-phrase filter value carrying a stray double quote before any request', async () => {
+      const { fetchMock, result } = await run({
+        'title.search.exact': 'cats", cites:W1, title.search:"dogs',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'quote_in_filter_value' },
+        },
+      });
+      expect(textOf(result)).toContain('quote_in_filter_value');
+    });
+
+    it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+  });
+
+  /**
    * A zero-edge page on a cursor continuation is a finished traversal, not a seed with no
    * neighbours — the verify-the-seed advice there points at a walk that already returned
    * every edge it had. (gh #74)
@@ -735,7 +1210,7 @@ describe('getCitationGraphTool', () => {
       expect(output.meta.count).toBe(3);
       const enrichment = getEnrichment(ctx);
       expect(enrichment.totalCount).toBe(3);
-      expect(enrichment.echo).toContain('seed_id=W2741809807');
+      expect(enrichment.echo).toContain('seed_id="W2741809807"');
     });
 
     it('keeps the broadening advice on a first call with no cursor', async () => {
@@ -909,7 +1384,7 @@ describe('getCitationGraphTool', () => {
 
       const structured = result.structuredContent as Record<string, unknown>;
       expect(structured.notice).toBe(
-        'No edges for seed_id=W1858542512 | direction=related_to. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.',
+        'No edges for seed_id="W1858542512" | direction=related_to. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.',
       );
       expect(result.content[0]).toEqual({ type: 'text', text: '**0 edge(s) — 25 per page**' });
     });

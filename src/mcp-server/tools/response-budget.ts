@@ -4,7 +4,8 @@
  * `structuredContent` and the summed `content[]` text, enrichment trailer included — to
  * 64,000 bytes: a list page loses whole records from its end, a record too large on its own has
  * its biggest arrays windowed, and every cut is disclosed with the call that continues it. The
- * same pass flags list records carrying exactly 100 authorships, OpenAlex's list-response cap.
+ * same pass flags list records carrying exactly 100 authorships (or the 100 `author_list` entries
+ * derived from them), OpenAlex's list-response cap.
  * @module mcp-server/tools/response-budget
  */
 
@@ -23,6 +24,9 @@ export const RESPONSE_BUDGET_BYTES = 64_000;
  * lookup returns them all. Exactly this many on a list record may or may not be the whole list.
  */
 const LIST_AUTHORSHIPS_CAP = 100;
+
+/** Record arrays the cap applies to: `authorships`, and the `author_list` derived from it. */
+const CAPPED_AUTHOR_FIELDS = ['authorships', 'author_list'] as const;
 
 /**
  * Bytes reserved on each surface for the `budget` enrichment field. The service writes it from
@@ -58,7 +62,7 @@ const arrayWindowSchema = z
     possibly_capped: z
       .boolean()
       .describe(
-        "True for exactly 100 authorships on a list record (OpenAlex's cap): the list may be longer.",
+        "True for exactly 100 `authorships` or `author_list` entries on a list record (OpenAlex's cap): the list may be longer.",
       ),
     next: continuationCallSchema
       .nullable()
@@ -86,7 +90,7 @@ export const windowsOutputSchema = z
   .array(arrayWindowSchema)
   .optional()
   .describe(
-    'Arrays returned in part — windowed to fit the budget, paged by `slice`, or 100 possibly capped authorships — each with its continuation. A `slice` call always carries its window, even for a whole array; otherwise absent when every array is whole.',
+    'Arrays returned in part — windowed to fit the budget, paged by `slice`, or a possibly capped 100-entry `authorships` or `author_list` — each with its continuation. A `slice` call always carries its window, even for a whole array; otherwise absent when every array is whole.',
   );
 
 /** Output field: the least this call can return does not fit the budget on its own. */
@@ -349,16 +353,17 @@ function arrayWindow(
   };
 }
 
-function isCappedListRecord(record: EntityRecord, capCheck: boolean): boolean {
-  return (
-    capCheck &&
-    Array.isArray(record.authorships) &&
-    record.authorships.length === LIST_AUTHORSHIPS_CAP
-  );
+/** The author arrays of a list record holding exactly the cap; none when `capCheck` is off. */
+function cappedListFields(record: EntityRecord, capCheck: boolean): string[] {
+  if (!capCheck) return [];
+  return CAPPED_AUTHOR_FIELDS.filter((field) => {
+    const items = record[field];
+    return Array.isArray(items) && items.length === LIST_AUTHORSHIPS_CAP;
+  });
 }
 
-function capWindow(entityType: EntityType, record: EntityRecord): ArrayWindow {
-  return arrayWindow(entityType, record, 'authorships', {
+function capWindow(entityType: EntityType, record: EntityRecord, field: string): ArrayWindow {
+  return arrayWindow(entityType, record, field, {
     offset: 0,
     shown: LIST_AUTHORSHIPS_CAP,
     total: LIST_AUTHORSHIPS_CAP,
@@ -388,7 +393,7 @@ function budgetNotice(parts: PageParts): string | undefined {
       ? "The first record's non-array fields alone exceed the budget, so this response runs over it."
       : undefined,
     cappedCount > 0
-      ? `${cappedCount} record(s) carry exactly ${LIST_AUTHORSHIPS_CAP} authorships, the most OpenAlex returns on a list record, so the author list may be longer; the \`windows\` entry gives the \`id\` + \`slice\` call for the rest.`
+      ? `${cappedCount} record(s) carry exactly ${LIST_AUTHORSHIPS_CAP} authorships or author_list entries, the most OpenAlex returns on a list record, so the author list may be longer; each such array's \`windows\` entry gives the \`id\` + \`slice\` call for the rest.`
       : undefined,
   ]);
 }
@@ -453,12 +458,16 @@ export function fitRecordsToBudget(request: FitRecordsRequest): BudgetedPage {
 
   for (let kept = records.length; kept >= 1; kept--) {
     const keptRecords = records.slice(0, kept);
-    const capped = keptRecords.filter((record) => isCappedListRecord(record, capCheck));
+    const capped = keptRecords
+      .map((record) => ({ record, fields: cappedListFields(record, capCheck) }))
+      .filter(({ fields }) => fields.length > 0);
     const page = assemblePage(
       {
         kept: keptRecords,
         omitted: records.slice(kept),
-        windows: capped.map((record) => capWindow(entityType, record)),
+        windows: capped.flatMap(({ record, fields }) =>
+          fields.map((field) => capWindow(entityType, record, field)),
+        ),
         windowedCount: 0,
         cappedCount: capped.length,
         overBudget: false,
@@ -477,7 +486,7 @@ export function fitRecordsToBudget(request: FitRecordsRequest): BudgetedPage {
 
   const [first, ...rest] = records;
   if (!first) return { results: [], disclosure: {}, notice: undefined };
-  return windowRecord(first, rest, isCappedListRecord(first, capCheck), request);
+  return windowRecord(first, rest, cappedListFields(first, capCheck), request);
 }
 
 interface WindowableArray {
@@ -538,7 +547,7 @@ function fillRoundRobin(
 function windowRecord(
   record: EntityRecord,
   rest: readonly EntityRecord[],
-  capped: boolean,
+  capped: readonly string[],
   request: FitRecordsRequest,
 ): BudgetedPage {
   const { entityType, measureFrame, select } = request;
@@ -547,13 +556,13 @@ function windowRecord(
     .map(([field, items]) => ({ field, items, bytes: utf8Bytes(JSON.stringify(items)) }))
     .sort((a, b) => b.bytes - a.bytes);
 
-  /** Window entries for `shown` counts per windowed field, plus the cap entry when it applies. */
+  /** Window entries for `shown` counts per windowed field, plus the cap entries that apply. */
   const windowsFor = (shown: ReadonlyMap<string, number>): ArrayWindow[] => {
     const entries: ArrayWindow[] = [];
     for (const [field, items] of Object.entries(record)) {
       if (!Array.isArray(items)) continue;
       const count = shown.get(field);
-      const cappedField = capped && field === 'authorships';
+      const cappedField = capped.includes(field);
       if (count !== undefined && count < items.length) {
         entries.push(
           arrayWindow(entityType, record, field, {
@@ -564,7 +573,7 @@ function windowRecord(
           }),
         );
       } else if (cappedField) {
-        entries.push(capWindow(entityType, record));
+        entries.push(capWindow(entityType, record, field));
       }
     }
     return entries;
@@ -579,7 +588,7 @@ function windowRecord(
     omitted: rest,
     windows,
     windowedCount: windows.filter((w) => w.shown < w.total).length,
-    cappedCount: capped ? 1 : 0,
+    cappedCount: capped.length > 0 ? 1 : 0,
     overBudget,
   });
 
@@ -591,14 +600,14 @@ function windowRecord(
         offset: 0,
         shown: array.items.length,
         total: array.items.length + 1,
-        possiblyCapped: capped && array.field === 'authorships',
+        possiblyCapped: capped.includes(array.field),
       }),
     );
     const boundWindows = [
       ...bound,
-      ...(capped && !windowed.some((a) => a.field === 'authorships')
-        ? [capWindow(entityType, record)]
-        : []),
+      ...capped
+        .filter((field) => !windowed.some((array) => array.field === field))
+        .map((field) => capWindow(entityType, record, field)),
     ];
     const boundPage = assemblePage(partsFor(record, boundWindows, false), entityType, select);
     const available =

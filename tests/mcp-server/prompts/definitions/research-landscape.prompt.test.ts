@@ -33,4 +33,19 @@ describe('researchLandscapePrompt', () => {
     expect(text).not.toMatch(/first 100|undercount/);
     expect(text).not.toContain('authors_count:>100');
   });
+
+  /**
+   * `funders.id` counts every work that lists a funder and labels each group with its name;
+   * `awards.funder_id` counts only works whose award records name the funder, under bare-ID labels,
+   * and `awards.funder_display_name` carries the same award-only counts. (gh #100)
+   */
+  it('groups the funding step by funders.id, with no resolve hop or award-based fallback', async () => {
+    const text = await generatedText();
+    const start = text.indexOf('**Funding**');
+    expect(start).toBeGreaterThan(-1);
+    const funding = text.slice(start, text.indexOf('**Impact**'));
+    expect(funding).toMatch(/\bGroup by funders\.id\b/);
+    expect(funding).not.toMatch(/awards\.funder_id|awards\.funder_display_name/);
+    expect(funding).not.toContain('openalex_resolve_name');
+  });
 });

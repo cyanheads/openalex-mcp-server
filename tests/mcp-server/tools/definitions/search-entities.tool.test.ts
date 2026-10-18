@@ -47,9 +47,12 @@ vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({ apiKey: '', baseUrl: 'https://api.openalex.org', mailto: '' }),
 }));
 
-const { BUDGET_EXHAUSTED_KEYLESS_HINT, normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
-  '@/services/openalex/openalex-service.js'
-);
+const {
+  BUDGET_EXHAUSTED_KEYLESS_HINT,
+  normalizeId,
+  PMCID_NOT_INDEXED_HINT,
+  SEMANTIC_UNAVAILABLE_HINT,
+} = await import('@/services/openalex/openalex-service.js');
 
 const { searchEntitiesTool } = await import(
   '@/mcp-server/tools/definitions/search-entities.tool.js'
@@ -400,7 +403,7 @@ describe('searchEntitiesTool', () => {
       await searchEntitiesTool.handler(input, ctx);
       const enrichment = getEnrichment(ctx);
       expect(enrichment.echo).toContain('sample=10');
-      expect(enrichment.echo).toContain('seed=xyz');
+      expect(enrichment.echo).toContain('seed="xyz"');
     });
   });
 
@@ -638,7 +641,7 @@ describe('searchEntitiesTool', () => {
       expect(enrichment.echo).toContain('entity_type=works');
       expect(enrichment.echo).toContain('query="climate"');
       expect(enrichment.echo).toContain('filters={"is_oa":"true"}');
-      expect(enrichment.echo).toContain('sort=-cited_by_count');
+      expect(enrichment.echo).toContain('sort="-cited_by_count"');
       expect(enrichment.echo).toContain('search_mode=semantic');
       // Semantic responses always disclose that `meta.count` is a candidate count.
       expect(enrichment.notice).toMatch(/candidate set rather than every match/i);
@@ -742,7 +745,7 @@ describe('searchEntitiesTool', () => {
       await searchEntitiesTool.handler(input, ctx);
 
       const { echo } = getEnrichment(ctx);
-      expect(echo).toBe('entity_type=works | id=W2741809807');
+      expect(echo).toBe('entity_type=works | id="W2741809807"');
       for (const dropped of ['query', 'filters', 'sort', 'sample', 'seed', 'search_mode']) {
         expect(echo, `echo still advertises ${dropped}`).not.toContain(dropped);
       }
@@ -816,7 +819,7 @@ describe('searchEntitiesTool', () => {
       const { echo } = getEnrichment(ctx);
       expect(echo).toContain('query="climate"');
       expect(echo).toContain('filters={"is_oa":"true"}');
-      expect(echo).toContain('sort=-cited_by_count');
+      expect(echo).toContain('sort="-cited_by_count"');
     });
   });
 
@@ -1136,6 +1139,145 @@ describe('searchEntitiesTool', () => {
   });
 
   /**
+   * A semantic search whose query embedding failed upstream reaches the caller as an outage with
+   * the retry-or-keyword hint, through the real service against a stubbed OpenAlex error body —
+   * never as a caller error naming the embedding service's host. The classification table lives
+   * in the service suite; these cases prove the wiring to both client surfaces. (gh #96)
+   */
+  describe('semantic embedding failures (gh #96)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    async function failWith(
+      status: number,
+      error: string,
+      message: string,
+      searchMode: 'keyword' | 'semantic',
+    ) {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn((input: unknown) =>
+        new URL(String(input)).hostname === 'api.openalex.org'
+          ? Promise.resolve(new Response(JSON.stringify({ error, message }), { status }))
+          : Promise.reject(new Error(`unmocked fetch: ${String(input)}`)),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const pending = runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'graph neural networks for molecules',
+        search_mode: searchMode,
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      const { error: envelope } = result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: Record<string, unknown> & { recovery?: { hint?: string } };
+        };
+      };
+      const text = (result.content ?? [])
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      return { envelope, text, attempts: fetchMock.mock.calls.length };
+    }
+
+    it.each([
+      [
+        'an embedding-service 429',
+        'Failed to embed query: 429 Client Error: Too Many Requests for url: https://embed.example.com/ai-gateway/mlflow/v1/embeddings',
+      ],
+      [
+        'an embedding-service connection failure',
+        "Failed to embed query: HTTPSConnectionPool(host='embed.example.com', port=443): Max retries exceeded with url: /ai-gateway/mlflow/v1/embeddings (Caused by NewConnectionError('…'))",
+      ],
+    ])('reports %s as upstream_unavailable with the semantic hint', async (_label, message) => {
+      const { envelope, text, attempts } = await failWith(
+        400,
+        'Invalid query parameters error.',
+        message,
+        'semantic',
+      );
+
+      expect(envelope).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'upstream_unavailable',
+          recovery: { hint: SEMANTIC_UNAVAILABLE_HINT },
+          upstreamMessage: message,
+          responseBody: JSON.stringify({ error: 'Invalid query parameters error.', message }),
+        },
+      });
+      expect(envelope.message).not.toContain('embed.example.com');
+      expect(text).not.toContain('embed.example.com');
+      expect(text).toContain(`Recovery: ${SEMANTIC_UNAVAILABLE_HINT}`);
+      expect(text).toContain('(reason upstream_unavailable');
+      expect(attempts).toBe(3);
+    });
+
+    it('adds the semantic hint to a semantic search that OpenAlex answers 503', async () => {
+      const { envelope, text } = await failWith(
+        503,
+        'Semantic search is busy',
+        'Semantic search is busy (the query embedding timed out). Please retry in a minute.',
+        'semantic',
+      );
+
+      expect(envelope).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unavailable', recovery: { hint: SEMANTIC_UNAVAILABLE_HINT } },
+      });
+      expect(text).toContain(`Recovery: ${SEMANTIC_UNAVAILABLE_HINT}`);
+    });
+
+    it('keeps the contract recovery on a keyword search that OpenAlex answers 503', async () => {
+      const { envelope, text, attempts } = await failWith(
+        503,
+        'Service Unavailable',
+        'Service Unavailable',
+        'keyword',
+      );
+      const recovery = searchEntitiesTool.errors?.find(
+        (e) => e.reason === 'upstream_unavailable',
+      )?.recovery;
+      if (!recovery) throw new Error('upstream_unavailable declares no recovery');
+
+      expect(envelope).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unavailable', recovery: { hint: recovery } },
+      });
+      expect(text).toContain(`Recovery: ${recovery}`);
+      expect(text).not.toContain(SEMANTIC_UNAVAILABLE_HINT);
+      expect(attempts).toBe(3);
+    });
+
+    it('says which id lookups OpenAlex bills in the costUsd description', () => {
+      const costUsd =
+        searchEntitiesTool.enrichment?.budget?.unwrap().shape.costUsd.description ?? '';
+      expect(costUsd).not.toMatch(/^USD this call spent\. 0 for an `id` lookup —/);
+      expect(costUsd).toMatch(/keyword looked up by its slug/);
+      expect(costUsd).toContain('W2741809807#x');
+    });
+
+    it('names the failed semantic embedding where upstream_unavailable applies', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'upstream_unavailable');
+      expect(entry?.when).toContain('Failed to embed query:');
+      expect(entry?.when).toMatch(/semantic/);
+    });
+  });
+
+  /**
    * Identifier and URL fields skip provider-text normalization and come back byte-identical to
    * upstream, so the `results` description cannot call every text value decoded. (gh #94)
    */
@@ -1294,6 +1436,871 @@ describe('searchEntitiesTool', () => {
     const description = searchEntitiesTool.input.shape.id.description ?? '';
     expect(description).toMatch(/keywords?/i);
     expect(description).toContain('https://openalex.org/keywords/groundwater');
+  });
+
+  /**
+   * These run the real service against a routed `fetch`, so the URL parse, the type check, and
+   * the funder-DOI lookup are the ones that ship; only `api.openalex.org` paths a case lists
+   * answer. (gh #98, #99)
+   */
+  describe('id lookups through the real service (gh #98, #99)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /** Route `mockSearch` to the real service; `fetch` answers only the listed paths. */
+    async function useRealService(routes: Record<string, unknown>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const body = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+        return body === undefined
+          ? Promise.reject(new Error(`unmocked fetch: ${url.pathname}`))
+          : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+
+    const contentText = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    it('fetches a record-page URL as the bare ID on both surfaces', async () => {
+      const fetchMock = await useRealService({
+        '/works/W2741809807': { id: 'https://openalex.org/W2741809807', display_name: 'A Work' },
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'https://openalex.org/works/W2741809807',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        results: [{ id: 'https://openalex.org/W2741809807', display_name: 'A Work' }],
+      });
+      expect(contentText(result)).toContain('A Work');
+    });
+
+    it.each([
+      ['authors', 'W2741809807', 'work', 'works'],
+      ['works', 'https://openalex.org/authors/A5023888391', 'author', 'authors'],
+    ])(
+      'fails entity_type %s with %s as id_type_mismatch before any request',
+      async (entityType, id, noun, ownType) => {
+        const fetchMock = await useRealService({});
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: entityType as 'works',
+          id,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'id_type_mismatch',
+              recovery: { hint: expect.stringContaining('letter') },
+            },
+          },
+        });
+        const text = contentText(result);
+        expect(text).toContain(`${noun} ID`);
+        expect(text).toContain(`entity_type "${ownType}"`);
+        expect(text).toContain('id_type_mismatch');
+      },
+    );
+
+    it('fails a concept ID under topics as id_type_mismatch, steering to topics by name', async () => {
+      const fetchMock = await useRealService({});
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'topics',
+        id: 'C71924100',
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.ValidationError, data: { reason: 'id_type_mismatch' } },
+      });
+      const text = contentText(result);
+      expect(text).toContain('concept ID');
+      expect(text).toContain('openalex_resolve_name');
+    });
+
+    it('declares id_type_mismatch as a service-thrown ValidationError', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'id_type_mismatch');
+      expect(entry).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        thrownBy: 'service',
+      });
+    });
+
+    it('documents the URL spellings an id accepts', () => {
+      const description = searchEntitiesTool.input.shape.id.description ?? '';
+      expect(description).toContain('https://openalex.org/works/W2741809807');
+      expect(description).toMatch(/api\.openalex\.org/);
+    });
+
+    const nsfFunder = {
+      id: 'https://openalex.org/F4320306076',
+      display_name: 'National Science Foundation',
+    };
+
+    it.each(['10.13039/100000001', 'doi:10.13039/100000001', 'https://doi.org/10.13039/100000001'])(
+      'returns the funder a Funder Registry DOI %s names, on both surfaces (gh #98)',
+      async (id) => {
+        const fetchMock = await useRealService({
+          '/funders': { meta: { count: 1, per_page: 1, next_cursor: null }, results: [nsfFunder] },
+        });
+
+        const result = await runToolContract(searchEntitiesTool, { entity_type: 'funders', id });
+
+        expect(result.isError).toBeFalsy();
+        const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+        expect(url.searchParams.get('filter')).toBe('ids.doi:10.13039/100000001');
+        expect(result.structuredContent).toMatchObject({ results: [nsfFunder] });
+        expect(contentText(result)).toContain('National Science Foundation');
+      },
+    );
+
+    it('fails a DOI no funder carries as entity_not_found (gh #98)', async () => {
+      const fetchMock = await useRealService({
+        '/funders': { meta: { count: 0, per_page: 1, next_cursor: null }, results: [] },
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'funders',
+        id: '10.1038/nature12373',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.pathname).toBe('/funders');
+      expect(url.searchParams.get('filter')).toBe('ids.doi:10.1038/nature12373');
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'entity_not_found' } },
+      });
+      const text = contentText(result);
+      expect(text).toContain('No funder in OpenAlex carries the DOI 10.1038/nature12373.');
+      expect(text).toContain('(reason entity_not_found');
+    });
+
+    it.each(['../authors/A5023888391', '../works?search=graphene'])(
+      'fails id %j as id_dot_segment before any request, on both surfaces (gh #109)',
+      async (id) => {
+        const fetchMock = await useRealService({});
+
+        const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', id });
+
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'id_dot_segment',
+              recovery: { hint: expect.stringContaining('relative path segments') },
+            },
+          },
+        });
+        expect(contentText(result)).toContain('id_dot_segment');
+        expect(contentText(result)).toContain('relative path segments');
+      },
+    );
+
+    it('fetches a DOI ending in # as the record it names, on both surfaces (gh #109)', async () => {
+      const fetchMock = await useRealService({
+        '/works/doi:10.1002/(sici)1097-461x(1997)64:6%3C735::aid-qua10%3E3.0.co;2-%23': {
+          id: 'https://openalex.org/W1538625961',
+          display_name: 'The quantum theory of radiation',
+        },
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '10.1002/(sici)1097-461x(1997)64:6<735::aid-qua10>3.0.co;2-#',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        results: [{ id: 'https://openalex.org/W1538625961' }],
+      });
+      expect(contentText(result)).toContain('The quantum theory of radiation');
+    });
+
+    it('declares id_dot_segment as a service-thrown ValidationError (gh #109)', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'id_dot_segment');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('prices a funder looked up by DOI as the billed exception to free id lookups (gh #98)', () => {
+      const costUsd =
+        searchEntitiesTool.enrichment?.budget.unwrap().shape.costUsd.description ?? '';
+      expect(costUsd).toMatch(/funder/);
+      expect(costUsd).toMatch(/DOI/);
+      expect(searchEntitiesTool.input.shape.id.description ?? '').toMatch(/10\.13039/);
+    });
+  });
+
+  /**
+   * The filter path is shared by every filter-taking tool; this proves the tool reaches it with
+   * the caller's filters and that the request carries what the service built, as sent. The
+   * value table itself lives in the service suite.
+   */
+  describe('filters on the wire through the real service (gh #107, #101)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const contentText = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    async function run(filters: Record<string, string>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        return url.hostname === 'api.openalex.org' && url.pathname === '/works'
+          ? Promise.resolve(
+              new Response(JSON.stringify({ meta: { count: 0, per_page: 25 }, results: [] })),
+            )
+          : Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', filters });
+      const sentFilter = () =>
+        new URL(String(fetchMock.mock.calls.at(-1)?.[0])).search
+          .slice(1)
+          .split('&')
+          .find((pair) => pair.startsWith('filter='));
+      return { fetchMock, result, sentFilter };
+    }
+
+    it('sends a "+" AND as a raw "+"', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'DE+US',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=authorships.institutions.country_code%3ADE+US');
+    });
+
+    it('sends a comma in a .search.exact value quoted rather than refusing it (gh #113)', async () => {
+      const { result, sentFilter } = await run({ 'title.search.exact': 'cats, dogs' });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=title.search.exact%3A%22cats%2C+dogs%22');
+    });
+
+    it('sends a comma in a raw_affiliation_strings value quoted rather than refusing it (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        raw_affiliation_strings: 'University of California, Berkeley',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22',
+      );
+    });
+
+    it('sends a multi-word name on an exact-match key as one quoted phrase (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        'awards.funder_display_name': 'National Science Foundation',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      );
+    });
+
+    it('sends converted country and language values, echoing the caller spelling', async () => {
+      const filters = { 'authorships.institutions.country_code': 'DEU+FRA', language: 'English' };
+      const { result, sentFilter } = await run(filters);
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3ADE+FR%2Clanguage%3Aen',
+      );
+      const { echo } = result.structuredContent as { echo: string };
+      expect(echo).toContain(JSON.stringify(filters));
+      expect(contentText(result)).toContain(JSON.stringify(filters));
+    });
+
+    it('sends an OR of multi-word country and language names as codes', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'South Korea|Japan',
+        language: 'Scottish Gaelic|English',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3AKR%7CJP%2Clanguage%3Agd%7Cen',
+      );
+    });
+
+    it('fails a country that cannot be a code as invalid_country_code before any request', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'Narnia',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            recovery: { hint: expect.stringContaining('ISO 3166-1 alpha-2') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('"Narnia" is not a country code');
+      expect(contentText(result)).toContain('invalid_country_code');
+    });
+
+    it('declares invalid_country_code as a service-thrown ValidationError', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'invalid_country_code');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('fails a value mixing "|" with an AND "+" before any request (gh #107)', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'DE|FR+US',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'mixed_and_or_in_filter_value',
+            recovery: { hint: expect.stringContaining('"institutions.country_code": "US"') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('mixes "|" (OR) with an AND operator');
+      expect(contentText(result)).toContain('mixed_and_or_in_filter_value');
+    });
+
+    it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = searchEntitiesTool.errors?.find(
+        (e) => e.reason === 'mixed_and_or_in_filter_value',
+      );
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('refuses a quoted-phrase value carrying a stray double quote before any request', async () => {
+      const { fetchMock, result } = await run({
+        raw_affiliation_strings: 'Harvard", publication_year:1800, display_name:"x',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'quote_in_filter_value',
+            recovery: { hint: expect.stringContaining('Remove the double quote') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('quote_in_filter_value');
+    });
+
+    it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+  });
+
+  /**
+   * `select` aliases resolve in the service, before the request; the record carries the
+   * upstream key on both surfaces. These run the real service against routed fetches.
+   */
+  describe('select aliases through the real service (gh #97)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const contentText = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    /** Route `mockSearch` to the real service; `fetch` answers only the listed paths. */
+    async function useRealService(routes: Record<string, unknown>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const body = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+        return body === undefined
+          ? Promise.reject(new Error(`unmocked fetch: ${url.pathname}`))
+          : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+
+    const sentSelect = (fetchMock: ReturnType<typeof vi.fn>) =>
+      new URL(String(fetchMock.mock.calls.at(-1)?.[0])).searchParams.get('select');
+
+    const psychMed = {
+      id: 'https://openalex.org/S71144982',
+      display_name: 'Psychological Medicine',
+      host_organization_name: 'Cambridge University Press',
+    };
+
+    it.each([
+      ['list', { query: 'psychological medicine' }, '/sources'],
+      ['id', { id: 'S71144982' }, '/sources/S71144982'],
+    ] as const)(
+      'returns host_organization_name for select ["publisher"] on the %s path, on both surfaces',
+      async (_path, args, route) => {
+        const fetchMock = await useRealService({
+          [route]:
+            route === '/sources'
+              ? { meta: { count: 1, per_page: 25 }, results: [psychMed] }
+              : psychMed,
+        });
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'sources',
+          select: ['publisher'],
+          ...args,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(sentSelect(fetchMock)).toBe('id,display_name,host_organization_name');
+        expect(result.structuredContent).toMatchObject({ results: [psychMed] });
+        expect(contentText(result)).toContain('Cambridge University Press');
+      },
+    );
+
+    it('returns host_organization_name and summary_stats for ["publisher", "h_index"]', async () => {
+      const record = { ...psychMed, summary_stats: { h_index: 220 } };
+      const fetchMock = await useRealService({ '/sources/S71144982': record });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'sources',
+        id: 'S71144982',
+        select: ['publisher', 'h_index'],
+      });
+
+      expect(sentSelect(fetchMock)).toBe('id,display_name,host_organization_name,summary_stats');
+      expect(result.structuredContent).toMatchObject({ results: [record] });
+      expect(contentText(result)).toContain('Cambridge University Press');
+      expect(contentText(result)).toContain('220');
+    });
+
+    it('documents the sources publisher alias on select', () => {
+      const description = searchEntitiesTool.input.shape.select.description ?? '';
+      expect(description).toContain('`publisher` returns `host_organization_name`');
+    });
+  });
+
+  /**
+   * `author_list` is derived in the service from the `authorships` it requests, before the
+   * response budget runs. These run the real service against an upstream fake that projects
+   * each record to the `select` it receives, as OpenAlex does, so the derivation, the budget,
+   * and the slice handler all see what a caller would.
+   */
+  describe('author_list through the real service (gh #102)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+    const bare = (id: string) => id.replace('https://openalex.org/', '');
+
+    type Window = {
+      id: string;
+      field: string;
+      offset: number;
+      shown: number;
+      total: number;
+      possibly_capped: boolean;
+      next: { tool: string; arguments: Record<string, unknown> } | null;
+    };
+    type Structured = {
+      results: EntityRecord[];
+      notice?: string;
+      omitted?: { ids: string[]; next: { tool: string; arguments: Record<string, unknown> } };
+      windows?: Window[];
+      over_budget?: boolean;
+    };
+
+    /** A record as OpenAlex would return it for a comma-joined `select` (all fields without one). */
+    function project(record: EntityRecord, select: string | null): EntityRecord {
+      if (select === null) return record;
+      const fields = select.split(',');
+      return Object.fromEntries(
+        Object.entries(record).filter(([key]) => fields.includes(key)),
+      ) as EntityRecord;
+    }
+
+    /**
+     * Serve `records` as upstream works: `/works/{id}` by bare ID, and `/works` as the
+     * `openalex` filter's ID set (in reverse, as OpenAlex orders an ID set) or the first
+     * `per_page` records. `/authors` answers the 400 OpenAlex gives an unknown select field;
+     * any other request rejects.
+     */
+    function serveUpstream(records: EntityRecord[]) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        if (url.hostname !== 'api.openalex.org') {
+          return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+        }
+        const select = url.searchParams.get('select');
+        const json = (body: unknown, status = 200) =>
+          Promise.resolve(new Response(JSON.stringify(body), { status }));
+        if (url.pathname.startsWith('/works/')) {
+          const record = records.find((r) => bare(r.id) === url.pathname.slice('/works/'.length));
+          return record
+            ? json(project(record, select))
+            : Promise.resolve(new Response('<!doctype html>', { status: 404 }));
+        }
+        if (url.pathname === '/works') {
+          const ids = /^openalex:(.+)$/.exec(url.searchParams.get('filter') ?? '')?.[1];
+          const page = ids
+            ? records.filter((r) => ids.split('|').includes(bare(r.id))).reverse()
+            : records.slice(0, Number(url.searchParams.get('per_page')));
+          return json({
+            meta: { count: page.length, per_page: page.length, next_cursor: null },
+            results: page.map((record) => project(record, select)),
+          });
+        }
+        if (url.pathname === '/authors') {
+          return json(
+            {
+              error: 'Invalid query parameters error.',
+              message: `${select?.split(',').at(-1)} is not a valid select field. Valid fields: id, display_name, orcid.`,
+            },
+            400,
+          );
+        }
+        return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    }
+
+    async function useRealService(records: EntityRecord[]) {
+      const fetchMock = serveUpstream(records);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+
+    const sentSelect = (fetchMock: ReturnType<typeof vi.fn>) =>
+      new URL(String(fetchMock.mock.calls.at(-1)?.[0])).searchParams.get('select');
+
+    /** Upstream works with `count` slim authorships each, ORCIDs on every third author. */
+    const upstreamWork = (n: number, count: number) =>
+      workWithAuthorships(n, count, (i) => ({
+        ...slimAuthorship(i),
+        author: {
+          ...(slimAuthorship(i).author as Record<string, unknown>),
+          ...(i % 3 === 0 && {
+            orcid: `https://orcid.org/0000-0002-0000-${String(i).padStart(4, '0')}`,
+          }),
+        },
+        institutions: [{ id: 'https://openalex.org/I1', display_name: 'Some University' }],
+      }));
+    const expectedList = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `https://openalex.org/A${9_000_000 + i}`,
+        display_name: `Author ${i}`,
+        orcid:
+          i % 3 === 0 ? `https://orcid.org/0000-0002-0000-${String(i).padStart(4, '0')}` : null,
+      }));
+
+    it.each([
+      ['list', { filters: { 'title.search': 'collaboration' } }],
+      ['id', { id: 'W3000000001' }],
+    ] as const)(
+      'returns author_list in place of authorships on the %s path, on both surfaces',
+      async (_path, args) => {
+        const fetchMock = await useRealService([upstreamWork(1, 4)]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          select: ['author_list'],
+          ...args,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(sentSelect(fetchMock)).toBe('id,display_name,authorships');
+        const structured = result.structuredContent as Structured;
+        expect(structured.results).toEqual([
+          {
+            id: 'https://openalex.org/W3000000001',
+            display_name: 'Collaboration paper 1',
+            author_list: expectedList(4),
+          },
+        ]);
+        const text = textOf(result);
+        expect(text).toContain('**Author List:**');
+        expect(text).toContain(
+          '- [0] id: https://openalex.org/A9000000, display_name: Author 0, orcid: https://orcid.org/0000-0002-0000-0000',
+        );
+        expect(text).toContain(
+          '- [1] id: https://openalex.org/A9000001, display_name: Author 1, orcid: —',
+        );
+        expect(text).not.toContain('Authorships');
+        expect(text).not.toContain('Some University');
+      },
+    );
+
+    /** One window entry per author array of exactly 100 on a list record; never on a lookup. */
+    it('windows only the 100-entry author_list on a list page of 99, 100, and 101', async () => {
+      const works = [upstreamWork(1, 99), upstreamWork(2, 100), upstreamWork(3, 101)];
+      await useRealService(works);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        select: ['author_list'],
+      });
+
+      const structured = result.structuredContent as Structured;
+      expect(structured.results.map((r) => (r.author_list as unknown[]).length)).toEqual([
+        99, 100, 101,
+      ]);
+      const continuation = {
+        tool: 'openalex_search_entities',
+        arguments: {
+          entity_type: 'works',
+          id: 'W3000000002',
+          slice: { field: 'author_list', offset: 100 },
+        },
+      };
+      expect(structured.windows).toEqual([
+        {
+          id: 'W3000000002',
+          field: 'author_list',
+          offset: 0,
+          shown: 100,
+          total: 100,
+          possibly_capped: true,
+          next: continuation,
+        },
+      ]);
+      expect(structured.notice).toMatch(
+        /1 record\(s\) carry exactly 100 authorships or author_list/,
+      );
+      const text = textOf(result);
+      expect(text).toContain(
+        `**Window:** W3000000002 \`author_list\` — offset 0, 100 shown of 100 — possibly capped`,
+      );
+      expect(text).toContain(JSON.stringify(continuation.arguments));
+      expect(text).not.toContain('**Window:** W3000000001');
+      expect(text).not.toContain('**Window:** W3000000003');
+    });
+
+    it.each([99, 100, 101])(
+      'never windows a %i-entry author_list on an id lookup',
+      async (count) => {
+        await useRealService([upstreamWork(1, count)]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W3000000001',
+          select: ['author_list'],
+        });
+
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.author_list).toHaveLength(count);
+        expect(structured).not.toHaveProperty('windows');
+        expect(structured.notice).toBeUndefined();
+        expect(textOf(result)).not.toContain('**Window:**');
+      },
+    );
+
+    describe('slice', () => {
+      const record = upstreamWork(1_858_542_512, 2932);
+      const id = bare(record.id);
+
+      it('pages a 2,932-author author_list to the end with no gap or overlap', {
+        timeout: 30_000,
+      }, async () => {
+        const fetchMock = await useRealService([record]);
+        const collected: unknown[] = [];
+        const windows: Window[] = [];
+        let offset: number | undefined = 0;
+        let calls = 0;
+        while (offset !== undefined && calls < 50) {
+          const result = await runToolContract(searchEntitiesTool, {
+            entity_type: 'works',
+            id,
+            slice: { field: 'author_list', offset },
+          });
+          calls++;
+          expect(result.isError).toBeFalsy();
+          expect(sentSelect(fetchMock)).toBe('id,display_name,authorships');
+          const structured = result.structuredContent as Structured;
+          expect(Object.keys(structured.results[0] ?? {})).toEqual([
+            'id',
+            'display_name',
+            'author_list',
+          ]);
+          const items = structured.results[0]?.author_list as unknown[];
+          collected.push(...items);
+          const [window] = structured.windows ?? [];
+          if (!window) throw new Error('slice returned no window');
+          windows.push(window);
+          expect(window).toMatchObject({ field: 'author_list', offset, total: 2932 });
+          expect(textOf(result)).toContain(`**Window:** ${id} \`author_list\` — offset ${offset}`);
+          const next = window.next?.arguments.slice as
+            | { field: string; offset: number }
+            | undefined;
+          if (next) expect(next.field).toBe('author_list');
+          offset = next?.offset;
+        }
+
+        expect(collected).toEqual(expectedList(2932));
+        expect(calls).toBeGreaterThan(1);
+        expect(windows.at(-1)?.next).toBeNull();
+        expect(windows[1]?.offset).toBe(windows[0]?.shown);
+      });
+
+      it('returns an empty final window past the end of author_list', async () => {
+        await useRealService([record]);
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'author_list', offset: 5000 },
+        });
+
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.author_list).toEqual([]);
+        expect(structured.windows).toEqual([
+          expect.objectContaining({ field: 'author_list', offset: 5000, shown: 0, next: null }),
+        ]);
+        expect(structured.notice).toContain('past the end of `author_list`, which holds 2932');
+      });
+
+      it('continues a windowed id lookup with a slice on author_list', async () => {
+        const wide = workWithAuthorships(7, 2932, (i) => ({
+          author: {
+            id: `https://openalex.org/A${i}`,
+            display_name: `Member ${'x'.repeat(60)} ${i}`,
+          },
+        }));
+        await useRealService([wide]);
+
+        const first = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: bare(wide.id),
+          select: ['author_list'],
+        });
+        const [window] = (first.structuredContent as Structured).windows ?? [];
+        expect(window).toMatchObject({ field: 'author_list', offset: 0, total: 2932 });
+        expect(window?.next?.arguments).toEqual({
+          entity_type: 'works',
+          id: bare(wide.id),
+          slice: { field: 'author_list', offset: window?.shown },
+        });
+
+        const second = await runToolContract(
+          searchEntitiesTool,
+          window?.next?.arguments as Parameters<
+            typeof runToolContract<typeof searchEntitiesTool>
+          >[1],
+        );
+        const items = (second.structuredContent as Structured).results[0]?.author_list as {
+          id: string;
+        }[];
+        expect(items[0]?.id).toBe(`https://openalex.org/A${window?.shown}`);
+      });
+    });
+
+    it('repeats select in the omitted call, which returns the same author_list shape', async () => {
+      // 30 works of ~100 authors each run well past the budget on one page.
+      const works = Array.from({ length: 30 }, (_, n) => upstreamWork(n, 98));
+      await useRealService(works);
+
+      const first = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        filters: { 'title.search': 'collaboration' },
+        per_page: 30,
+        select: ['author_list'],
+      });
+      const omitted = (first.structuredContent as Structured).omitted;
+      expect(omitted?.next.arguments).toMatchObject({ select: ['author_list'] });
+
+      const second = await runToolContract(
+        searchEntitiesTool,
+        omitted?.next.arguments as Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1],
+      );
+      const results = (second.structuredContent as Structured).results;
+      expect(results.length).toBeGreaterThan(0);
+      for (const record of results) {
+        expect(Object.keys(record)).toEqual(['id', 'display_name', 'author_list']);
+        expect(record.author_list).toEqual(expectedList(98));
+      }
+    });
+
+    it('documents author_list on select, slice, and results', () => {
+      const { shape } = searchEntitiesTool.input;
+      expect(shape.select.description).toContain('`author_list` returns each author');
+      expect(shape.select.description).toContain('neither the default nor `["*"]` includes it');
+      expect(shape.slice.unwrap().shape.field.description).toContain('"author_list"');
+      expect(searchEntitiesTool.output.shape.results.description).toContain('`author_list`');
+    });
+
+    it('forwards author_list untranslated on authors, where OpenAlex rejects it', async () => {
+      const fetchMock = await useRealService([]);
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'authors',
+        query: 'einstein',
+        select: ['author_list'],
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe('/authors');
+      expect(sentSelect(fetchMock)).toBe('id,display_name,author_list');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'upstream_invalid_params' },
+        },
+      });
+      expect(textOf(result)).toContain('author_list is not a valid select field');
+      expect(textOf(result)).toContain('(reason upstream_invalid_params');
+    });
   });
 
   /**

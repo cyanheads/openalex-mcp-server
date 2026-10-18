@@ -18,13 +18,19 @@ import {
   unauthorized,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, httpStatusToErrorCode, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  defaultIsTransient,
+  fetchWithTimeout,
+  httpStatusToErrorCode,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
 
 import { mergeUpstreamBudget, parseUpstreamBudget, type UpstreamBudget } from './budget.js';
 import fieldCatalog from './field-catalog.json' with { type: 'json' };
 import { rankFields } from './field-ranker.js';
+import { quoteCallerText, quotedCommaValue, upstreamFilterValue } from './filter-values.js';
 import { normalizeProviderText, normalizeProviderValue } from './provider-text.js';
 import {
   type AnalyzeParams,
@@ -72,26 +78,37 @@ type FilterClause = [key: string, value: string];
  * canonical key. A record would hold only the last of them.
  *
  * Comma handling (commas collide with OpenAlex's filter clause separator):
- * - `*.search` keys: wrap the value in double quotes for faithful phrase passthrough
- *   (skip if already quoted).
+ * - Free-text search keys (`title.search`, `abstract.search.exact`, `semantic.search`, …) and
+ *   keys matched as whole text (`raw_affiliation_strings`, `display_name`, `geo.city`, …): the
+ *   value goes out double-quoted as `quotedCommaValue()` writes it, so the comma stays part of the
+ *   phrase. The quoted value is sent as written, `+` included.
  * - All other keys: throw a pre-flight validation error — OpenAlex OR-lists use `|`, not commas.
+ *
+ * Every other value goes out as `upstreamFilterValue()` writes it: country and `language` values
+ * converted to the codes OpenAlex stores (a country segment that cannot be a code throws
+ * `invalid_country_code`), a multi-word value on a key matched as whole text (`geo.city`,
+ * `awards.funder_display_name`, …) double-quoted so OpenAlex reads it as one phrase, and the AND
+ * operator — a `+`, or a space on a key where words mean AND — sent as the AND it spells. A value
+ * that puts that operator beside a `|` throws `mixed_and_or_in_filter_value`, since OpenAlex drops
+ * every `|` alternative that ANDs more than one value; a value sent double-quoted that carries a
+ * `"` of its own throws `quote_in_filter_value`. Every throw runs before any request.
+ * `autocomplete()` sends its filters without `translateFilters()`, so the conversion lives here
+ * rather than there.
+ *
+ * Exported for the timing suite, which runs it on caller-sized keys and values.
  */
-function buildFilterString(filters: FilterClause[]): string {
+export function buildFilterString(filters: FilterClause[]): string {
   return filters
     .map(([key, value]) => {
       if (value.includes(',')) {
-        if (key.endsWith('.search')) {
-          // Phrase passthrough: double-quote wrapping preserves the comma as free-text.
-          const quoted = value.startsWith('"') && value.endsWith('"') ? value : `"${value}"`;
-          return `${key}:${quoted}`;
-        }
-        // Non-search key: comma is a caller error — OpenAlex uses | for OR, not comma.
+        const phrase = quotedCommaValue(key, value);
+        if (phrase !== undefined) return `${key}:${phrase}`;
         throw invalidParams(
-          `Filter \`${key}\` value contains a comma, which OpenAlex reads as a filter separator. Use \`|\` for OR (e.g. \`2020|2021\`), or a \`.search\` filter or the \`query\` parameter for free text.`,
+          `Filter ${quoteCallerText(key)} value contains a comma, which OpenAlex reads as a filter separator. Use \`|\` for OR (e.g. \`2020|2021\`); a free-text search filter (such as \`title.search\` or \`abstract.search.exact\`) or a field matched as whole text (such as \`raw_affiliation_strings\` or \`display_name\`) takes a phrase that holds a comma.`,
           { reason: 'comma_in_filter_value', filterKey: key },
         );
       }
-      return `${key}:${value}`;
+      return `${key}:${upstreamFilterValue(key, value)}`;
     })
     .join(',');
 }
@@ -134,28 +151,95 @@ export const PMCID_NOT_INDEXED_HINT =
   'OpenAlex indexes no PMCIDs, so a PMCID resolves nothing however it is written. Convert it to a PMID or DOI — the NCBI ID Converter (https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/) does this — and retry with that identifier.';
 
 /**
- * A keyword's own OpenAlex URL. Keywords are the only `ENTITY_TYPES` member OpenAlex addresses
- * by slug rather than a native letter-and-number ID, and their URL spells out the `keywords/`
- * path segment the endpoint already supplies — so stripping the host alone builds
- * `/keywords/keywords/<slug>`, which 404s, and the ID a search returns cannot be fed back into
- * its own lookup. The host is anchored on both ends so a look-alike domain is never read as
- * OpenAlex, and the slug group requires at least one character so a slugless path stays unrouted.
+ * The start of an OpenAlex URL — `openalex.org`, `www.openalex.org`, or `api.openalex.org`, with
+ * an `http(s)://` scheme or none — gating the `URL` parse in `parseOpenAlexUrl()`. The lookahead
+ * anchors the host on the right, so a look-alike that only starts with it (`openalex.org.example`,
+ * `openalex.org:8443`) is never parsed, and the scheme anchors it on the left.
  */
-const OPENALEX_KEYWORD_URL_PATTERN = /^https:\/\/openalex\.org\/keywords\/([^/?#]+)\/?$/i;
+const OPENALEX_URL_START = /^(?:https?:\/\/)?(?:www\.|api\.)?openalex\.org(?=[/?#]|$)/i;
+
+/** A native OpenAlex ID — one letter, then digits (`W2741809807`, the legacy venue `V137773608`). */
+const NATIVE_ID_PATTERN = /^[a-z]\d+$/i;
+
+/** What an OpenAlex URL addresses: a native ID, or a keyword by its slug. */
+interface OpenAlexUrlId {
+  id: string;
+  kind: 'native' | 'keyword';
+}
 
 /**
- * Prefix `normalizeId()` emits → the single entity type that identifier scheme addresses.
- * Every external scheme OpenAlex indexes belongs to exactly one entity type, which is what
- * lets an identifier resolve without the caller naming a type.
+ * Read the one ID an OpenAlex URL carries — a record page (`https://openalex.org/works/W…`), an
+ * API URL (`https://api.openalex.org/works/W…`), the short form (`https://openalex.org/W…`), or
+ * a keyword's `…/keywords/<slug>` — over `http://`, `https://`, or no scheme, ignoring a trailing
+ * `/`, the query string, and the fragment. The path must be `/<ID>` or `/<entity type>/<ID>`, a
+ * slug under `/keywords/`; anything else returns undefined and is left as the caller wrote it.
+ *
+ * Keywords are the one entity type OpenAlex addresses by slug, so their URL is the only spelling
+ * that identifies a keyword — and the entity-type segment has to go either way, since the request
+ * path supplies it again. A native ID's letter is upper-cased: OpenAlex IDs are upper-case, and
+ * the URL already says the value is one. A value with whitespace inside is refused before the
+ * parse, which would otherwise drop tabs and line breaks and join the pieces into an ID.
  */
-const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
-  doi: 'works',
-  issn: 'sources',
-  orcid: 'authors',
-  pmcid: 'works',
-  pmid: 'works',
-  ror: 'institutions',
+function parseOpenAlexUrl(value: string): OpenAlexUrlId | undefined {
+  if (!OPENALEX_URL_START.test(value) || /\s/.test(value)) return;
+  const { pathname } = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
+  const path = pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const [first = '', second, ...rest] = path.split('/').slice(1);
+  if (rest.length > 0) return;
+  if (second === undefined) {
+    return NATIVE_ID_PATTERN.test(first) ? nativeId(first) : undefined;
+  }
+  const entityType = first.toLowerCase();
+  if (!isEntityType(entityType)) return;
+  if (entityType === 'keywords') return second ? { id: second, kind: 'keyword' } : undefined;
+  return NATIVE_ID_PATTERN.test(second) ? nativeId(second) : undefined;
+}
+
+function nativeId(id: string): OpenAlexUrlId {
+  return { id: `${id.charAt(0).toUpperCase()}${id.slice(1)}`, kind: 'native' };
+}
+
+function isEntityType(value: string): value is EntityType {
+  return (ENTITY_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * Prefix `normalizeId()` emits → the entity types an identifier of that scheme can address, in
+ * the order `inferIdentifier()` looks them up. Most schemes belong to one type. A ROR names an
+ * organization, and OpenAlex keeps an organization's institution, funder, and publisher records
+ * apart under the same ROR — NSF's `021nxhr62` is all three — so a ROR can address any of them.
+ */
+const ENTITY_TYPES_BY_ID_PREFIX: Record<string, readonly EntityType[]> = {
+  doi: ['works'],
+  issn: ['sources'],
+  orcid: ['authors'],
+  pmcid: ['works'],
+  pmid: ['works'],
+  ror: ['institutions', 'funders', 'publishers'],
 };
+
+/**
+ * The Crossref Funder Registry's DOI prefix. Funders are keyed by these DOIs, which OpenAlex's
+ * `/funders/doi:` path does not resolve — only the `ids.doi` filter matches them, with the bare
+ * DOI. A few thousand works carry one too, by mis-attribution, so a funder DOI still reaches a
+ * work when the caller asks for works.
+ */
+const FUNDER_REGISTRY_DOI_PREFIX = '10.13039/';
+
+/**
+ * A DOI the funder `ids.doi` filter can match as one literal value: a DOI shape with nothing in
+ * it that filter syntax reads as structure — `|` (OR), `+` (AND), `,` (clause separator), or
+ * whitespace. A leading `!`, `<`, or `>` fails the `10.` anchor.
+ */
+const FUNDER_DOI_FILTER_VALUE = /^10\.\d{4,}\/[^\s,|+]+$/;
+
+/**
+ * The filter clause that matches a funder by its bare DOI, or undefined for a value that clause
+ * would read as more than one literal DOI — it could only match some other funder, or every one.
+ */
+export function funderDoiFilter(doi: string): string | undefined {
+  return FUNDER_DOI_FILTER_VALUE.test(doi) ? `ids.doi:${doi}` : undefined;
+}
 
 /**
  * Detect ID format and return the API path segment.
@@ -170,22 +254,17 @@ const ENTITY_TYPE_BY_ID_PREFIX: Record<string, EntityType> = {
  * "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/" → "pmcid:PMC1234567"
  * "https://pubmed.ncbi.nlm.nih.gov/21491125" → "pmid:21491125"
  * "PMID:21491125" → "pmid:21491125"
- * "https://openalex.org/keywords/groundwater" → "groundwater"
+ * "https://openalex.org/works/W2741809807" → "W2741809807"
+ * "https://api.openalex.org/keywords/groundwater" → "groundwater"
  * "W2741809807" → "W2741809807"
  */
 export function normalizeId(id: string): string {
   const trimmed = id.trim();
 
-  // Keyword URL → its bare slug. Runs ahead of the generic OpenAlex strip, which would leave
-  // the `keywords/` segment in place and double it against the endpoint path.
-  const keywordSlug = OPENALEX_KEYWORD_URL_PATTERN.exec(trimmed)?.[1];
-  if (keywordSlug) {
-    return keywordSlug;
-  }
-
-  // Full OpenAlex URL
-  if (trimmed.startsWith('https://openalex.org/')) {
-    return trimmed.replace('https://openalex.org/', '');
+  // OpenAlex URL → the bare ID or keyword slug it carries (see parseOpenAlexUrl)
+  const openAlexId = parseOpenAlexUrl(trimmed);
+  if (openAlexId) {
+    return openAlexId.id;
   }
 
   // DOI URL
@@ -253,7 +332,7 @@ export function normalizeId(id: string): string {
   const colon = trimmed.indexOf(':');
   if (colon > 0) {
     const scheme = trimmed.slice(0, colon).toLowerCase();
-    if (Object.hasOwn(ENTITY_TYPE_BY_ID_PREFIX, scheme)) {
+    if (Object.hasOwn(ENTITY_TYPES_BY_ID_PREFIX, scheme)) {
       return `${scheme}${trimmed.slice(colon)}`;
     }
   }
@@ -278,18 +357,109 @@ const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
  * as *filter values* are deliberately absent here. `C` (the deprecated Concepts entity) and `G`
  * are not in `ENTITY_TYPES`, so there is no endpoint to fetch one from. `K` is in `ENTITY_TYPES`,
  * but OpenAlex identifies keywords by slug and emits no numeric K-prefixed IDs, so routing that
- * shape addressed nothing — `OPENALEX_KEYWORD_URL_PATTERN` is the keyword identifier. All three
- * fall through to autocomplete rather than being routed to a path that would 404.
+ * shape addressed nothing — a keyword URL is the keyword identifier. All three fall through to
+ * autocomplete rather than being routed to a path that would 404.
  */
 const ROUTABLE_OPENALEX_ID = /^([AFIPSTW])\d+$/;
 
+/**
+ * A native ID whose letter names the entity type that holds it — every routable letter plus `C`,
+ * a concept ID, which names a type this server does not serve. Read case-insensitively: OpenAlex
+ * answers a lower-case ID as it does the upper-case one. `V` (a legacy venue ID that still
+ * resolves under `/sources/`), `K`, and `G` are absent, so `search()` checks none of them.
+ */
+const LETTERED_OPENALEX_ID = /^([ACFIPSTW])\d+$/i;
+
+/**
+ * Refuse a native ID whose letter names a different entity type than the lookup's. No record of
+ * one type carries another type's letter and every cross-letter lookup 404s upstream, so the
+ * request could only fail as a generic not-found; this names the type the ID belongs to instead.
+ *
+ * Keywords are exempt: their IDs are slugs, and real ones are shaped like native IDs (`P53`,
+ * `F1`, `S1`, `A1`), so on a keyword lookup a letter names nothing.
+ */
+function assertIdMatchesEntityType(id: string, entityType: EntityType): void {
+  const letter = entityType === 'keywords' ? undefined : LETTERED_OPENALEX_ID.exec(id)?.[1];
+  if (letter === undefined) return;
+  const idType = ENTITY_TYPE_BY_ID_LETTER[letter.toUpperCase()];
+  if (idType === entityType) return;
+  const requested = `it identifies no record among ${entityType}`;
+  const shown = capIdEcho(id);
+  throw validationError(
+    idType
+      ? `${shown} is an OpenAlex ${idType.replace(/s$/, '')} ID, which entity_type "${idType}" looks up — ${requested}.`
+      : `${shown} is an OpenAlex concept ID — concepts are a deprecated OpenAlex entity type this server does not serve, so ${requested}.`,
+    { reason: 'id_type_mismatch', id, entityType, ...(idType ? { idEntityType: idType } : {}) },
+  );
+}
+
+/**
+ * Characters a URL parse reads as structure rather than as part of a by-ID path's ID: `?` and
+ * `#` end the path, `\` separates segments on an `https:` URL, and tab, line feed, and carriage
+ * return are dropped outright, joining what they separated.
+ */
+const ID_PATH_STRUCTURE = /[?#\\\t\n\r]/g;
+
+/** A `.` or `..` path segment in any spelling a URL parse resolves — `%2e` is a dot. */
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+
+/** The most of a refused `id` an error message quotes; `data.id` keeps it whole. */
+const ID_ECHO_MAX_CHARS = 200;
+
+/** A refused `id` cut to `ID_ECHO_MAX_CHARS`, so a caller-sized one cannot bloat the message. */
+function capIdEcho(id: string): string {
+  return id.length > ID_ECHO_MAX_CHARS ? `${id.slice(0, ID_ECHO_MAX_CHARS)}…` : id;
+}
+
+/**
+ * The by-ID request path for `id`: `/<entityType>/<id>`, with every character a URL parse would
+ * read as structure percent-encoded so it stays part of the ID. OpenAlex decodes them back, so a
+ * DOI that holds a `#` or `?` reaches the record it names instead of a truncated one.
+ *
+ * A `.` or `..` segment, plain or percent-encoded, is refused before any request, since encoding
+ * cannot keep it inside the path. `/` is left as written, since DOIs carry it, and an encoded
+ * `%2F` is one segment to both the parse and OpenAlex. The refusal quotes `callerId`, the
+ * identifier as the caller wrote it, rather than the normalized `id` (`doi:…` for a DOI URL).
+ */
+export function byIdPath(entityType: EntityType, id: string, callerId = id): string {
+  const encoded = id.replace(ID_PATH_STRUCTURE, encodeURIComponent);
+  const dots = encoded.split('/').find((segment) => DOT_SEGMENT.test(segment));
+  if (dots !== undefined) {
+    throw validationError(
+      `id ${JSON.stringify(capIdEcho(callerId))} holds a "${dots}" path segment, which a ${entityType} lookup by ID does not accept.`,
+      { reason: 'id_dot_segment', id: callerId, entityType },
+    );
+  }
+  return `/${entityType}/${encoded}`;
+}
+
 /** An identifier the deterministic by-ID path can resolve, with the scheme it was read as. */
 export interface ResolvedIdentifier {
-  entityType: EntityType;
+  /** The entity types to look the identifier up as, in the order their records are returned. */
+  entityTypes: readonly EntityType[];
   /** The value in the form the OpenAlex path segment expects (`doi:10.1038/…`, `W2741809807`). */
   id: string;
+  /**
+   * Set on a bare native-ID shape, which short names share — keyword `p53` reads as publisher
+   * `P53`, and `F1`, `S1`, and `A1` are keywords too — so a lookup that finds no record is no
+   * sign the caller meant an ID, and the query is worth searching as a name next. A URL form
+   * names its record outright and never carries it.
+   */
+  mayBeName?: true;
   /** Identifier scheme, for caller-facing messages: `doi`, `orcid`, `openalex`, … */
   scheme: string;
+}
+
+/** What `resolveIdentifier()` found. */
+export interface IdentifierResolution extends AutocompleteResult {
+  /** Entity types whose lookup failed upstream while another type returned a record. */
+  failedEntityTypes?: EntityType[];
+  /**
+   * Set when every lookup found nothing and the query ran as a name search instead: `results`
+   * then hold that search's matches. `failedReason` names the upstream failure that stopped the
+   * search, with `results` empty.
+   */
+  nameFallback?: { failedReason?: string };
 }
 
 /**
@@ -300,29 +470,51 @@ export interface ResolvedIdentifier {
  * it produced. Names never survive that: a name with a colon in it yields a prefix that is in no
  * scheme table, and anything else fails the native-ID pattern.
  *
- * Keywords are the exception, and are read from the raw query instead: their IDs are slugs, so
- * `normalizeId()` reduces the URL to a bare word that no longer names an entity type. The URL
- * form is the only keyword spelling that identifies itself — a bare slug is indistinguishable
- * from any other name, and autocomplete is the right answer for it.
+ * Keywords are the exception, and are read from the URL before it is reduced: their IDs are
+ * slugs, so `normalizeId()` turns the URL into a bare word that no longer names an entity type.
+ * The URL form is the only keyword spelling that identifies itself — a bare slug is
+ * indistinguishable from any other name, and autocomplete is the right answer for it.
+ *
+ * `requested` (the caller's `entity_type`) narrows an identifier only among the types it can
+ * address: a ROR to one of institutions, funders, and publishers, and a Funder Registry DOI to
+ * works. Any other type leaves the identifier's own types in place — except `keywords`, under
+ * which a bare native-ID shape is a name: keyword IDs are slugs, and `P53` is a keyword.
  */
-export function inferIdentifier(query: string): ResolvedIdentifier | undefined {
-  const keywordSlug = OPENALEX_KEYWORD_URL_PATTERN.exec(query.trim())?.[1];
-  if (keywordSlug) {
-    return { entityType: 'keywords', id: keywordSlug, scheme: 'openalex' };
+export function inferIdentifier(
+  query: string,
+  requested?: EntityType,
+): ResolvedIdentifier | undefined {
+  const trimmed = query.trim();
+  const fromUrl = parseOpenAlexUrl(trimmed);
+  if (fromUrl?.kind === 'keyword') {
+    return { entityTypes: ['keywords'], id: fromUrl.id, scheme: 'openalex' };
   }
+  if (fromUrl) return nativeIdentifier(fromUrl.id);
 
-  const normalized = normalizeId(query);
+  const normalized = normalizeId(trimmed);
 
   const colon = normalized.indexOf(':');
   if (colon > 0) {
     const scheme = normalized.slice(0, colon).toLowerCase();
-    const entityType = ownEntry(ENTITY_TYPE_BY_ID_PREFIX, scheme);
-    return entityType ? { entityType, id: normalized, scheme } : undefined;
+    const types = ownEntry(ENTITY_TYPES_BY_ID_PREFIX, scheme);
+    if (!types) return;
+    if (scheme === 'doi' && normalized.startsWith(FUNDER_REGISTRY_DOI_PREFIX, colon + 1)) {
+      return { entityTypes: [requested === 'works' ? 'works' : 'funders'], id: normalized, scheme };
+    }
+    const entityTypes = requested !== undefined && types.includes(requested) ? [requested] : types;
+    return { entityTypes, id: normalized, scheme };
   }
 
-  const letter = ROUTABLE_OPENALEX_ID.exec(normalized)?.[1];
+  if (requested === 'keywords') return;
+  const native = nativeIdentifier(normalized);
+  return native && { ...native, mayBeName: true };
+}
+
+/** A routable native OpenAlex ID as the identifier it is, or undefined for any other value. */
+function nativeIdentifier(id: string): ResolvedIdentifier | undefined {
+  const letter = ROUTABLE_OPENALEX_ID.exec(id)?.[1];
   const entityType = letter ? ENTITY_TYPE_BY_ID_LETTER[letter] : undefined;
-  return entityType ? { entityType, id: normalized, scheme: 'openalex' } : undefined;
+  return entityType ? { entityTypes: [entityType], id, scheme: 'openalex' } : undefined;
 }
 
 /**
@@ -369,8 +561,67 @@ function normalizeEntityRecord(record: EntityRecord): EntityRecord {
   };
 }
 
-function normalizeEntityRecords(results: EntityRecord[]): EntityRecord[] {
-  return results.map(normalizeEntityRecord);
+/** A string field of `value`, or null when it is absent or not a string. */
+function stringOrNull(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === 'string' ? field : null;
+}
+
+/** One `author_list` entry: the authorship's author as `{id, display_name, orcid}`. */
+function authorListEntry(authorship: unknown): Record<string, string | null> {
+  const author = isRecord(authorship) && isRecord(authorship.author) ? authorship.author : {};
+  return {
+    id: stringOrNull(author, 'id'),
+    display_name: stringOrNull(author, 'display_name'),
+    orcid: stringOrNull(author, 'orcid'),
+  };
+}
+
+/**
+ * What a works request's `select` asks the server to derive from `authorships`: `author_list`,
+ * and whether `authorships` itself was asked for too (by name, by its `authors` alias, or by
+ * `*`) and so stays on the record.
+ */
+interface AuthorListShape {
+  keepAuthorships: boolean;
+}
+
+function authorListShape(
+  entityType: SearchParams['entityType'],
+  select: string[] | undefined,
+): AuthorListShape | undefined {
+  if (entityType !== 'works' || !select?.includes(AUTHOR_LIST_FIELD)) return;
+  return {
+    keepAuthorships: select.some(
+      (field) =>
+        field === '*' ||
+        (field !== AUTHOR_LIST_FIELD && translateSelectField('works', field) === 'authorships'),
+    ),
+  };
+}
+
+/**
+ * Add `author_list` to a normalized works record, derived from its `authorships`, and drop
+ * `authorships` unless the caller selected it too. A record OpenAlex returned without
+ * `authorships` gets no `author_list` — there is nothing to derive it from.
+ */
+function withAuthorList(record: EntityRecord, shape: AuthorListShape): EntityRecord {
+  const { authorships, ...rest } = record;
+  if (!Array.isArray(authorships)) return record;
+  return {
+    ...(shape.keepAuthorships ? record : rest),
+    [AUTHOR_LIST_FIELD]: authorships.map(authorListEntry),
+  };
+}
+
+function normalizeEntityRecords(
+  results: EntityRecord[],
+  authorList?: AuthorListShape,
+): EntityRecord[] {
+  return results.map((record) => {
+    const normalized = normalizeEntityRecord(record);
+    return authorList ? withAuthorList(normalized, authorList) : normalized;
+  });
 }
 
 function normalizeAutocompleteRecords(
@@ -476,12 +727,22 @@ export function toAutocompleteRecord(
 const REQUIRED_SEARCH_FIELDS = ['id', 'display_name'] as const;
 
 /**
+ * The works `select` field the server derives rather than projects: each authorship's author as
+ * `{id, display_name, orcid}`, from the `authorships` it requests in its place. Not an upstream
+ * field, so it is never forwarded, and neither the default projection nor `*` includes it.
+ */
+export const AUTHOR_LIST_FIELD = 'author_list';
+
+/**
  * Works-only `select` field aliases. LLM callers reach for intuitive names that don't match
  * OpenAlex's vocabulary; renaming on the way out keeps tool ergonomics aligned with caller
- * priors. Pure key renames — no value transformation. Canonical names pass through unchanged.
+ * priors. Canonical names pass through unchanged. Two names arrive under another key:
+ * `abstract`, reconstructed from `abstract_inverted_index`, and `author_list`, reduced from
+ * `authorships` — every other alias is a pure key rename.
  */
 const SELECT_ALIASES_WORKS: Record<string, string> = {
   abstract: 'abstract_inverted_index',
+  [AUTHOR_LIST_FIELD]: 'authorships',
   authors: 'authorships',
   year: 'publication_year',
 };
@@ -500,16 +761,27 @@ const SELECT_ALIASES_SUMMARY_STATS: Record<string, string> = {
 };
 
 /**
- * Entity types that expose `summary_stats`, verified against `api.openalex.org`. `works`,
- * `topics`, and `keywords` carry no such field and reject it in `select`, so they get no
- * alias map — the upstream 400 is the correct answer there.
+ * Sources-only `select` aliases: the `summary_stats` leaves, plus `publisher`. OpenAlex names a
+ * journal's publisher `host_organization_name` — for a repository it names the hosting
+ * institution — and token-overlap suggestions cannot reach it from `publisher`. Select only: the
+ * filter, sort, and group_by sides have no single target (`host_organization` and
+ * `host_organization_lineage` both read as "publisher"), so `publisher` there keeps its 400.
+ */
+const SELECT_ALIASES_SOURCES: Record<string, string> = {
+  ...SELECT_ALIASES_SUMMARY_STATS,
+  publisher: 'host_organization_name',
+};
+
+/**
+ * Entity types besides sources that expose `summary_stats`, verified against
+ * `api.openalex.org`. `works`, `topics`, and `keywords` carry no such field and reject it in
+ * `select`, so they get no alias map — the upstream 400 is the correct answer there.
  */
 const SUMMARY_STATS_ENTITY_TYPES: ReadonlySet<string> = new Set([
   'authors',
   'funders',
   'institutions',
   'publishers',
-  'sources',
 ]);
 
 /**
@@ -531,8 +803,8 @@ const FILTER_ALIASES_WORKS: Record<string, string> = {
  * name. Keeps tool ergonomics symmetric with the response shape.
  *
  * Renames are fail-open: an unmapped name passes through and surfaces upstream's 400 with
- * its valid-field list. Several leaves can share one parent, so the list is deduped after
- * aliasing rather than before.
+ * its valid-field list. Several names can share one upstream field (summary_stats leaves;
+ * `author_list` beside `authorships`), so the list is deduped after aliasing rather than before.
  */
 function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
   const upstream = [...REQUIRED_SEARCH_FIELDS, ...fields].map((field) =>
@@ -542,21 +814,31 @@ function translateSelect(entityType: SearchParams['entityType'], fields: string[
 }
 
 /**
- * The upstream field one caller-supplied `select` name projects to — `authors` → `authorships`
- * on works, `h_index` → `summary_stats` where that object exists; any other name unchanged.
- * Exported so a tool can find the record key a one-field projection lands under.
+ * The upstream field one caller-supplied `select` name projects to — `authors` and
+ * `author_list` → `authorships` on works, `publisher` → `host_organization_name` on sources,
+ * `h_index` → `summary_stats` where that object exists; any other name unchanged.
  */
-export function translateSelectField(
-  entityType: SearchParams['entityType'],
-  field: string,
-): string {
+function translateSelectField(entityType: SearchParams['entityType'], field: string): string {
   const aliases =
     entityType === 'works'
       ? SELECT_ALIASES_WORKS
-      : SUMMARY_STATS_ENTITY_TYPES.has(entityType)
-        ? SELECT_ALIASES_SUMMARY_STATS
-        : undefined;
+      : entityType === 'sources'
+        ? SELECT_ALIASES_SOURCES
+        : SUMMARY_STATS_ENTITY_TYPES.has(entityType)
+          ? SELECT_ALIASES_SUMMARY_STATS
+          : undefined;
   return ownEntry(aliases, field) ?? field;
+}
+
+/**
+ * The record key one caller-supplied `select` name lands under: `author_list` keeps its own
+ * name; any other name lands under the upstream field it projects (`authors` → `authorships`).
+ * Exported so a tool can find the array a one-field projection returns.
+ */
+export function selectRecordKey(entityType: SearchParams['entityType'], field: string): string {
+  return entityType === 'works' && field === AUTHOR_LIST_FIELD
+    ? field
+    : translateSelectField(entityType, field);
 }
 
 /**
@@ -588,20 +870,27 @@ function resolveSelect(
 }
 
 /**
- * Match a single bare or URL-form OpenAlex ID. Combined with pipe-splitting in
- * `isOpenAlexFilterValue` to detect OR-joined ID lists.
+ * A bare OpenAlex ID the `openalex` filter accepts as a value, in either case. Combined with
+ * `parseOpenAlexUrl()` for the URL spellings and with pipe-splitting in `isOpenAlexFilterValue`
+ * to detect OR-joined ID lists.
  */
-const OPENALEX_ID_VALUE_PATTERN = /^(?:https:\/\/openalex\.org\/)?[WAISTKPFCG]\d+$/;
+const OPENALEX_ID_VALUE_PATTERN = /^[WAISTKPFCG]\d+$/i;
 
 /**
- * Detect a value the `id:` filter would carry — a bare or URL-form OpenAlex ID, optionally
- * pipe-joined for OR semantics. When matched, we rewrite `id` → `openalex` (the canonical
- * filter key); the URL form passes through unchanged because upstream accepts both.
- * Stricter than a single regex so a future generic upstream `id:` filter wouldn't be shadowed
- * by our rewrite — only values that look like OpenAlex IDs get redirected.
+ * Detect a value the `id:` filter would carry — OpenAlex IDs, bare or in any URL spelling
+ * `parseOpenAlexUrl()` reads, optionally pipe-joined for OR semantics. When matched, `id` is
+ * rewritten to `openalex` (the canonical filter key) and the value is forwarded as written:
+ * upstream accepts every one of those spellings, and the space around a `|`. Stricter than any
+ * value so a future generic upstream `id:` filter wouldn't be shadowed — only values that read
+ * as OpenAlex IDs get redirected. Exported for the timing suite, which runs it on caller-sized
+ * values.
  */
-function isOpenAlexFilterValue(value: string): boolean {
-  return value.split('|').every((seg) => OPENALEX_ID_VALUE_PATTERN.test(seg));
+export function isOpenAlexFilterValue(value: string): boolean {
+  return value.split('|').every((segment) => {
+    const trimmed = segment.trim();
+    const fromUrl = parseOpenAlexUrl(trimmed);
+    return OPENALEX_ID_VALUE_PATTERN.test(fromUrl?.kind === 'native' ? fromUrl.id : trimmed);
+  });
 }
 
 /**
@@ -643,9 +932,33 @@ function translateFilters(
   return out;
 }
 
+/**
+ * The `filter` parameter a search or group_by over `filters` sends: keys translated, then each
+ * clause built by `buildFilterString()`, whose pre-flight throws (`comma_in_filter_value`,
+ * `invalid_country_code`, `mixed_and_or_in_filter_value`, `quote_in_filter_value`) it shares.
+ * Exported so a tool that spends a request before its search — the citation graph's seed lookup —
+ * can run those checks first and fail without one.
+ */
+export function buildSearchFilter(
+  entityType: SearchParams['entityType'],
+  filters: Record<string, string>,
+): string {
+  return buildFilterString(translateFilters(entityType, filters));
+}
+
 const MAX_ATTEMPTS = 3;
 const BASE_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * How long an identifier lookup and the name search it falls back to may take together, counted
+ * from the start of the lookup. One request's own worst case — three 10 s attempts and up to
+ * ~3.75 s of jittered backoff — is ~34 s, so a lookup that misses inside its retry budget still
+ * leaves the name search one full attempt, and the call settles by 45 s, inside the 60 s an MCP
+ * client waits. A lookup that ran past it (a long upstream `Retry-After`) leaves no time, and
+ * the name search reports a timeout without being sent.
+ */
+const NAME_FALLBACK_DEADLINE_MS = 45_000;
 const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace(/s$/, '')));
 
 type ErrorFactory = (
@@ -905,6 +1218,54 @@ function overLongAutocompleteQuery(
   return codePoints > AUTOCOMPLETE_QUERY_MAX_CODE_POINTS ? codePoints : undefined;
 }
 
+/**
+ * The start of the HTTP 400 `message` OpenAlex sends when a semantic search's query-embedding
+ * call fails for any reason but a timeout — `APIQueryParamsError(f"Failed to embed query: {e}")`
+ * in ourresearch/openalex-elastic-api `core/semantic_search.py` (`embed_query`). The rest is the
+ * embedding client's exception text: an HTTP error from the embedding service (its own 429 among
+ * them, which is not this caller's rate), a connection failure, or a parse error — every one an
+ * upstream fault, and one that names the embedding service's host.
+ */
+const SEMANTIC_EMBED_FAILURE_PREFIX = 'Failed to embed query:';
+
+/**
+ * The HTTP 400 `message` OpenAlex sends when its embedding service is not configured (same module,
+ * `get_embedding_client`) — an upstream fault worded as a parameter error.
+ */
+const SEMANTIC_NOT_CONFIGURED_MESSAGE = 'Semantic search is not configured';
+
+/**
+ * Recovery for every `upstream_unavailable` failure of a semantic search — a relabelled embedding
+ * failure, the 503 OpenAlex sends when the embedding timed out, or any other outage — since a
+ * keyword search does not depend on the embedding service and can answer while it is down.
+ */
+export const SEMANTIC_UNAVAILABLE_HINT =
+  'OpenAlex semantic search is failing upstream. Retry in a minute, or rerun with search_mode "keyword", which does not depend on it.';
+
+/** Is this request a semantic search? `search.semantic` is the parameter only that mode sends. */
+function isSemanticSearch(params: Record<string, string>): boolean {
+  return params['search.semantic'] !== undefined;
+}
+
+/**
+ * Did OpenAlex fail a semantic search's query embedding? Matched on the request mode and on the
+ * whole `message` shape — anchored at its start — so no caller-error 400 (an unsupported semantic
+ * filter, a missing query, two search methods at once) and no keyword-mode 400 ever matches.
+ */
+function isSemanticEmbedFailure(
+  statusCode: number | undefined,
+  rawMessage: string | undefined,
+  params: Record<string, string>,
+): boolean {
+  return (
+    statusCode === 400 &&
+    isSemanticSearch(params) &&
+    rawMessage !== undefined &&
+    (rawMessage.startsWith(SEMANTIC_EMBED_FAILURE_PREFIX) ||
+      rawMessage === SEMANTIC_NOT_CONFIGURED_MESSAGE)
+  );
+}
+
 /** Reason for a 429 caused by daily-budget exhaustion rather than burst throttling. */
 const BUDGET_EXHAUSTED_REASON = 'upstream_budget_exhausted';
 
@@ -918,9 +1279,35 @@ export const BUDGET_EXHAUSTED_KEYLESS_HINT =
   "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed. The server sends no OpenAlex API key, so it runs on the smaller anonymous budget; setting OPENALEX_API_KEY to a free key (https://openalex.org/settings/api) raises it.";
 
 /**
- * OpenAlex returns 429 for two unrelated conditions: bursting past its per-second ceiling,
- * and spending the daily usage budget. The recoveries are opposites — one clears in seconds,
- * the other not until the midnight-UTC reset — so they need separate reasons.
+ * The `error` field of the HTTP 429 OpenAlex answers a filter its paid plans gate with, observed
+ * live (2026-10-18) for `created_date`, `updated_date`, and their `from_`/`to_` forms on works and
+ * authors lists, a works group_by, and works autocomplete. Its `message` names the refused clause:
+ * `The "from_created_date:2026-10-01" filter is part of daily sync, which comes with the Member+
+ * and Partner plans. See https://help.openalex.org/access/sync/ for details.` It is a plan gate,
+ * not a rate: no wait clears it.
+ */
+const PLAN_UPGRADE_REQUIRED_ERROR = 'Plan upgrade required';
+
+/** The filter name opening a plan-gated 429's `message`: `The "<filter>:<value>" filter …`. */
+const PLAN_GATED_FILTER_RE = /^The "([\w.]+):/;
+
+/**
+ * The server's own message for a plan-gated filter, naming the filter when the upstream message
+ * opens with it. The name is read as a field-name run only, so caller text the upstream clause
+ * echoes cannot carry markdown or a line break into the message.
+ */
+export function planGatedFilterMessage(upstreamMessage: string | undefined): string {
+  const filter =
+    upstreamMessage === undefined ? undefined : PLAN_GATED_FILTER_RE.exec(upstreamMessage)?.[1];
+  const subject = filter === undefined ? 'A filter in this request' : `The \`${filter}\` filter`;
+  return `${subject} needs a paid OpenAlex plan, which this server's OpenAlex access does not include.`;
+}
+
+/**
+ * Besides a filter its paid plans gate (classified before this, on its body's `error`), OpenAlex
+ * returns 429 for two unrelated conditions: bursting past its per-second ceiling, and spending
+ * the daily usage budget. The recoveries are opposites — one clears in seconds, the other not
+ * until the midnight-UTC reset — so they need separate reasons.
  *
  * The literal budget-exhaustion body is not published in OpenAlex's docs, so the match is
  * deliberately loose: several independent signals, none of them load-bearing on an exact
@@ -1013,13 +1400,7 @@ function appendFieldSuggestions(message: string, path: string): string {
   const entityType = entityTypeFromPath(path);
   if (!entityType) return message;
 
-  const context = inferContext(message);
-  const catalogEntry = (fieldCatalog as Record<string, { filter: string[]; select: string[] }>)[
-    entityType
-  ];
-  if (!catalogEntry) return message;
-
-  const pool = catalogEntry[context];
+  const pool = getFieldCatalog()[entityType][inferContext(message)];
   const suggestions = rankFields(rejectedField, pool, 3);
   if (suggestions.length === 0) return message;
 
@@ -1077,8 +1458,17 @@ class OpenAlexService {
     this.mailto = config.mailto;
   }
 
-  /** Execute an HTTP request against the OpenAlex API with retry on transient failures. */
-  private request(path: string, params: Record<string, string>, ctx: Context): Promise<unknown> {
+  /**
+   * Execute an HTTP request against the OpenAlex API with retry on transient failures. With
+   * `deadlineMs`, every attempt and backoff settles within that many milliseconds, after which
+   * the request fails as a `Timeout`.
+   */
+  private request(
+    path: string,
+    params: Record<string, string>,
+    ctx: Context,
+    deadlineMs?: number,
+  ): Promise<unknown> {
     const operation = `OpenAlex ${path}`;
     const url = new URL(`${this.baseUrl}${path}`);
     // OpenAlex usage-based pricing (Feb 2026): the account credential authenticates as
@@ -1122,6 +1512,7 @@ class OpenAlexService {
         baseDelayMs: BASE_BACKOFF_MS,
         maxRetries: MAX_ATTEMPTS - 1,
         signal: ctx.signal,
+        ...(deadlineMs !== undefined && { deadlineMs }),
       },
     );
   }
@@ -1137,6 +1528,12 @@ class OpenAlexService {
 
     const statusCode =
       typeof error.data?.statusCode === 'number' ? error.data.statusCode : undefined;
+    const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
+    const rawMessage = upstream?.message ?? upstream?.error;
+    const upstreamFields = {
+      ...(upstream?.error ? { upstreamError: upstream.error } : {}),
+      ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
+    };
 
     // A typed autocomplete `q` past the bound 500s on every attempt, with an HTML body that
     // names nothing — read as ServiceUnavailable it would be retried and reported as an outage.
@@ -1146,6 +1543,41 @@ class OpenAlexService {
       throw invalidParams(
         `OpenAlex autocomplete failed on a ${overLongQuery.toLocaleString('en-US')}-character query — ${path} accepts at most ${AUTOCOMPLETE_QUERY_MAX_CODE_POINTS.toLocaleString('en-US')} characters.`,
         { ...error.data, path, reason: 'query_too_long', retryable: false },
+        { cause: error },
+      );
+    }
+    // A semantic search whose query embedding failed upstream comes back as a 400, but the request
+    // was valid and the fault is transient. Thrown as the outage it is, it is retried like one, and
+    // its message is the server's own: the upstream one names the embedding service's host. The
+    // body stays verbatim on `data`, as on every upstream error.
+    if (isSemanticEmbedFailure(statusCode, rawMessage, params)) {
+      throw serviceUnavailable(
+        'OpenAlex could not embed the query for semantic search. The failure is upstream; the request itself is valid.',
+        {
+          ...error.data,
+          path,
+          reason: 'upstream_unavailable',
+          recovery: { hint: SEMANTIC_UNAVAILABLE_HINT },
+          ...upstreamFields,
+        },
+        { cause: error },
+      );
+    }
+    // A filter OpenAlex serves only on a paid plan comes back as a 429, which reads as a throttle:
+    // it would be retried and reported with wait-and-retry advice, yet no wait clears a plan gate.
+    // `Forbidden` sits outside `withRetry`'s transient set, so the first request is the only one,
+    // and `retryable: false` tells the caller the same over the 429 status left on `data`. The
+    // message is the server's own; the body stays verbatim on `data`, as on every upstream error.
+    if (statusCode === 429 && upstream?.error === PLAN_UPGRADE_REQUIRED_ERROR) {
+      throw forbidden(
+        planGatedFilterMessage(upstream.message),
+        {
+          ...error.data,
+          path,
+          reason: 'upstream_plan_required',
+          retryable: false,
+          ...upstreamFields,
+        },
         { cause: error },
       );
     }
@@ -1169,8 +1601,6 @@ class OpenAlexService {
     }
 
     const { factory } = normalized;
-    const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
-    const rawMessage = upstream?.message ?? upstream?.error;
     const reason = resolveThrowReason(code, normalized.reason, rawMessage, params);
     // A truncated body's appended valid-fields list is misleading. For an invalid-field
     // 400, replace it with catalog-backed ranked suggestions; otherwise strip it. The two
@@ -1215,8 +1645,12 @@ class OpenAlexService {
       ...(reason === BUDGET_EXHAUSTED_REASON && !this.apiKey
         ? { recovery: { hint: BUDGET_EXHAUSTED_KEYLESS_HINT } }
         : {}),
-      ...(upstream?.error ? { upstreamError: upstream.error } : {}),
-      ...(upstream?.message ? { upstreamMessage: upstream.message } : {}),
+      // A keyword search can answer while semantic search is down, which the contract's generic
+      // outage recovery cannot say; an explicit hint wins over it.
+      ...(reason === 'upstream_unavailable' && isSemanticSearch(params)
+        ? { recovery: { hint: SEMANTIC_UNAVAILABLE_HINT } }
+        : {}),
+      ...upstreamFields,
     };
 
     throw factory(message, data, { cause: error });
@@ -1264,17 +1698,22 @@ class OpenAlexService {
     // Singleton lookup by ID
     if (params.id) {
       const normalizedId = normalizeId(params.id);
+      assertIdMatchesEntityType(normalizedId, params.entityType);
       const select = resolveSelect(params.entityType, params.select);
 
+      if (params.entityType === 'funders' && normalizedId.startsWith('doi:')) {
+        return this.funderByDoi(normalizedId.slice('doi:'.length), select, ctx);
+      }
+
       const data = (await this.request(
-        `/${params.entityType}/${normalizedId}`,
+        byIdPath(params.entityType, normalizedId, params.id),
         select ? { select: select.join(',') } : {},
         ctx,
       )) as EntityRecord;
 
       return {
         meta: { count: 1, per_page: 1, next_cursor: null },
-        results: normalizeEntityRecords([data]),
+        results: normalizeEntityRecords([data], authorListShape(params.entityType, params.select)),
       };
     }
 
@@ -1286,7 +1725,7 @@ class OpenAlexService {
     }
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
+      queryParams.filter = buildSearchFilter(params.entityType, params.filters);
     }
 
     const sort = normalizeSort(params.sort);
@@ -1351,7 +1790,43 @@ class OpenAlexService {
         ...(populationData !== undefined && { count: populationData.meta.count }),
         next_cursor: data.meta.next_cursor ?? null,
       },
-      results: normalizeEntityRecords(data.results),
+      results: normalizeEntityRecords(
+        data.results,
+        authorListShape(params.entityType, params.select),
+      ),
+    };
+  }
+
+  /**
+   * Look a funder up by its Crossref Funder Registry DOI. OpenAlex's `/funders/doi:` path
+   * resolves nothing, so this is a one-result list request on the `ids.doi` filter, which OpenAlex
+   * bills like any list request. A value the filter would read as more than one literal DOI fails
+   * as not found without a request (see `funderDoiFilter`).
+   */
+  private async funderByDoi(
+    doi: string,
+    select: string[] | undefined,
+    ctx: Context,
+  ): Promise<SearchResult> {
+    const missing = () =>
+      notFound(`No funder in OpenAlex carries the DOI ${doi}.`, {
+        reason: 'entity_not_found',
+        path: '/funders',
+      });
+    const filter = funderDoiFilter(doi);
+    if (!filter) throw missing();
+
+    const data = (await this.request(
+      '/funders',
+      { filter, per_page: '1', ...(select ? { select: select.join(',') } : {}) },
+      ctx,
+    )) as { results: EntityRecord[] };
+    const [record] = data.results;
+    if (!record) throw missing();
+
+    return {
+      meta: { count: 1, per_page: 1, next_cursor: null },
+      results: normalizeEntityRecords([record]),
     };
   }
 
@@ -1364,7 +1839,7 @@ class OpenAlexService {
       : params.groupBy;
 
     if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(translateFilters(params.entityType, params.filters));
+      queryParams.filter = buildSearchFilter(params.entityType, params.filters);
     }
 
     if (params.perPage !== undefined) {
@@ -1418,7 +1893,9 @@ class OpenAlexService {
   }
 
   /**
-   * Resolve an identifier to the single entity it addresses, shaped as an autocomplete match.
+   * Resolve an identifier to the entities it addresses, shaped as autocomplete matches — one
+   * lookup per entity type in `identifier.entityTypes`, run in parallel, with the records found
+   * returned in that order.
    *
    * Autocomplete matches on `display_name` and the external-ID URL, so whether an identifier
    * resolves through it depends on scheme, bare-vs-URL form, and entity type — a bare ORCID or
@@ -1429,32 +1906,110 @@ class OpenAlexService {
    * A miss returns no results rather than throwing. Autocomplete answers an unmatched query with
    * an empty list, and routing identifiers through here is meant to make them behave *more* like
    * the front door, not to hand one class of query a hard failure the rest never sees.
+   *
+   * A lookup that fails for any other reason drops only its own type, named in
+   * `failedEntityTypes`, while another type returned a record. With no record to return, or once
+   * the caller has cancelled, the failure is thrown instead — an empty or partial answer there
+   * would claim records do not exist when the lookup for them never finished.
+   *
+   * `nameSearch` is the autocomplete to run when every lookup finds nothing — for a query that
+   * may be a name rather than an ID (`ResolvedIdentifier.mayBeName`). It runs only on that miss,
+   * so an ID that resolves still costs its one request, and only within what is left of
+   * `NAME_FALLBACK_DEADLINE_MS` from the start of this call (see `nameSearchAfterMiss`).
+   *
+   * `query` is the text `identifier` was read from, as the caller wrote it. The lookups are sent
+   * that spelling, which `search()` normalizes back to `identifier.id`, so a lookup that refuses
+   * the identifier quotes what the caller sent.
    */
   async resolveIdentifier(
     identifier: ResolvedIdentifier,
     ctx: Context,
-  ): Promise<AutocompleteResult> {
-    try {
-      const { results } = await this.search(
-        { entityType: identifier.entityType, id: identifier.id },
-        ctx,
-      );
-      const record = results[0];
-      return { results: record ? [toAutocompleteRecord(identifier.entityType, record)] : [] };
-    } catch (error) {
-      if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) {
+    nameSearch?: AutocompleteParams,
+    query: string = identifier.id,
+  ): Promise<IdentifierResolution> {
+    const startedAt = Date.now();
+    const settled = await Promise.allSettled(
+      identifier.entityTypes.map((entityType) => this.search({ entityType, id: query }, ctx)),
+    );
+
+    const results: AutocompleteRecord[] = [];
+    const failed: { entityType: EntityType; error: unknown }[] = [];
+    settled.forEach((outcome, index) => {
+      const entityType = identifier.entityTypes[index] as EntityType;
+      if (outcome.status === 'fulfilled') {
+        const [record] = outcome.value.results;
+        if (record) results.push(toAutocompleteRecord(entityType, record));
+      } else if (
+        outcome.reason instanceof McpError &&
+        outcome.reason.code === JsonRpcErrorCode.NotFound
+      ) {
         ctx.log.debug('Identifier resolved to no entity', {
           identifier: identifier.id,
-          entityType: identifier.entityType,
+          entityType,
         });
-        return { results: [] };
+      } else {
+        failed.push({ entityType, error: outcome.reason });
       }
-      throw error;
+    });
+
+    const [firstFailure] = failed;
+    if (firstFailure && (results.length === 0 || ctx.signal.aborted)) throw firstFailure.error;
+    if (results.length === 0 && nameSearch) {
+      return this.nameSearchAfterMiss(
+        nameSearch,
+        NAME_FALLBACK_DEADLINE_MS - (Date.now() - startedAt),
+        ctx,
+      );
+    }
+    return {
+      results,
+      ...(failed.length > 0 ? { failedEntityTypes: failed.map((f) => f.entityType) } : {}),
+    };
+  }
+
+  /**
+   * The name search an identifier lookup falls back to after finding nothing, bounded by the
+   * `remainingMs` the lookup left of the call's deadline. It is a best-effort second reading of
+   * the query, so a transient upstream failure — a timeout, the deadline running out, an outage,
+   * a burst throttle — comes back as `nameFallback.failedReason` for the caller to see, beside
+   * the lookup's own true miss. A caller cancellation, a request upstream rejected, a spent
+   * budget, and anything unclassified are thrown: none of them is cured by calling again, and an
+   * answer in their place would hide the error the caller needs to act on.
+   */
+  private async nameSearchAfterMiss(
+    params: AutocompleteParams,
+    remainingMs: number,
+    ctx: Context,
+  ): Promise<IdentifierResolution> {
+    if (remainingMs <= 0) {
+      return { results: [], nameFallback: { failedReason: 'upstream_timeout' } };
+    }
+    try {
+      const { results } = await this.autocomplete(params, ctx, remainingMs);
+      return { results, nameFallback: {} };
+    } catch (error) {
+      const reason =
+        error instanceof McpError && defaultIsTransient(error)
+          ? NORMALIZED_THROW_BY_CODE[error.code]?.reason
+          : undefined;
+      if (ctx.signal.aborted || reason === undefined) throw error;
+      ctx.log.notice('Name search after an identifier miss failed upstream', {
+        query: params.query,
+        reason,
+      });
+      return { results: [], nameFallback: { failedReason: reason } };
     }
   }
 
-  /** Autocomplete name resolution. */
-  async autocomplete(params: AutocompleteParams, ctx: Context): Promise<AutocompleteResult> {
+  /**
+   * Autocomplete name resolution. `deadlineMs` bounds the whole request, retries included (see
+   * `request`).
+   */
+  async autocomplete(
+    params: AutocompleteParams,
+    ctx: Context,
+    deadlineMs?: number,
+  ): Promise<AutocompleteResult> {
     const path = params.entityType ? `/autocomplete/${params.entityType}` : '/autocomplete';
 
     const queryParams: Record<string, string> = {
@@ -1465,7 +2020,7 @@ class OpenAlexService {
       queryParams.filter = buildFilterString(Object.entries(params.filters));
     }
 
-    const data = (await this.request(path, queryParams, ctx)) as {
+    const data = (await this.request(path, queryParams, ctx, deadlineMs)) as {
       results: AutocompleteResult['results'];
     };
 
@@ -1491,12 +2046,24 @@ export function getOpenAlexService(): OpenAlexService {
   return _service;
 }
 
+type FieldCatalog = Record<EntityType, { filter: string[]; select: string[] }>;
+
+/**
+ * The field catalog: OpenAlex's valid-field lists as `scripts/generate-field-catalog.ts` writes
+ * them to `field-catalog.json`, plus the select fields this server derives itself
+ * (`author_list` on works), which no upstream list names and the generator would drop.
+ */
+const FIELD_CATALOG: FieldCatalog = {
+  ...(fieldCatalog as FieldCatalog),
+  works: { ...fieldCatalog.works, select: [...fieldCatalog.works.select, AUTHOR_LIST_FIELD] },
+};
+
 /**
  * Return the typed field catalog keyed by entity type → context → field list.
  * Only `filter` and `select` arrays are stored. `group_by` resolves to the `filter` key here;
  * the describe-fields handler then prunes the fields group_by cannot target (raw dates,
  * `*.search` operators, `from_*`/`to_*` range modifiers, and a per-type set from a live sweep).
  */
-export function getFieldCatalog(): Record<EntityType, { filter: string[]; select: string[] }> {
-  return fieldCatalog as Record<EntityType, { filter: string[]; select: string[] }>;
+export function getFieldCatalog(): FieldCatalog {
+  return FIELD_CATALOG;
 }

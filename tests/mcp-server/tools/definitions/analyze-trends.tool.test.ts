@@ -9,7 +9,7 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
 import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
 
@@ -269,7 +269,7 @@ describe('analyzeTrendsTool', () => {
       const enrichment = getEnrichment(ctx);
       expect(enrichment.totalCount).toBe(50000);
       expect(enrichment.echo).toContain('entity_type=works');
-      expect(enrichment.echo).toContain('group_by=oa_status');
+      expect(enrichment.echo).toContain('group_by="oa_status"');
       expect(enrichment.echo).toContain('filters={"authorships.institutions.country_code":"us"}');
       expect(enrichment.echo).toContain('include_unknown=true');
       expect(enrichment.notice).toBeUndefined();
@@ -534,7 +534,7 @@ describe('analyzeTrendsTool', () => {
       expect(output.meta.groups_count).toBe(0);
       const enrichment = getEnrichment(ctx);
       expect(enrichment.totalCount).toBe(4782);
-      expect(enrichment.echo).toContain('group_by=publication_year');
+      expect(enrichment.echo).toContain('group_by="publication_year"');
     });
 
     it('keeps the broadening advice for an all-values-unknown first page', async () => {
@@ -992,6 +992,189 @@ describe('analyzeTrendsTool', () => {
         expect(description).not.toContain('authorships.*');
         expect(description).not.toContain('authors_count:>100');
       }
+    });
+  });
+
+  /**
+   * The filter path is shared by every filter-taking tool; this proves the tool reaches it with
+   * the caller's filters and that the request carries what the service built, as sent. The
+   * value table itself lives in the service suite.
+   */
+  describe('filters on the wire through the real service (gh #107, #101)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    async function run(filters: Record<string, string>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        return url.hostname === 'api.openalex.org' && url.pathname === '/works'
+          ? Promise.resolve(new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] })))
+          : Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockAnalyze.mockImplementation((...args: unknown[]) =>
+        service.analyze(...(args as Parameters<typeof service.analyze>)),
+      );
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'is_oa',
+        filters,
+      });
+      const sentFilter = () =>
+        new URL(String(fetchMock.mock.calls.at(-1)?.[0])).search
+          .slice(1)
+          .split('&')
+          .find((pair) => pair.startsWith('filter='));
+      return { fetchMock, result, sentFilter };
+    }
+
+    it('sends a "+" AND as a raw "+"', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'DE+US',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=authorships.institutions.country_code%3ADE+US');
+    });
+
+    it('sends a comma in a .search.exact value quoted rather than refusing it (gh #113)', async () => {
+      const { result, sentFilter } = await run({ 'title.search.exact': 'cats, dogs' });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe('filter=title.search.exact%3A%22cats%2C+dogs%22');
+    });
+
+    it('sends a comma in a raw_affiliation_strings value quoted rather than refusing it (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        raw_affiliation_strings: 'University of California, Berkeley',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22',
+      );
+    });
+
+    it('sends a multi-word name on an exact-match key as one quoted phrase (gh #115)', async () => {
+      const { result, sentFilter } = await run({
+        'awards.funder_display_name': 'National Science Foundation',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      );
+    });
+
+    it('sends converted country and language values, echoing the caller spelling', async () => {
+      const filters = { 'authorships.institutions.country_code': 'DEU+FRA', language: 'English' };
+      const { result, sentFilter } = await run(filters);
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3ADE+FR%2Clanguage%3Aen',
+      );
+      const { echo } = result.structuredContent as { echo: string };
+      expect(echo).toContain(JSON.stringify(filters));
+      expect(textOf(result)).toContain(JSON.stringify(filters));
+    });
+
+    it('sends an OR of multi-word country and language names as codes', async () => {
+      const { result, sentFilter } = await run({
+        'authorships.institutions.country_code': 'South Korea|Japan',
+        language: 'Scottish Gaelic|English',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sentFilter()).toBe(
+        'filter=authorships.institutions.country_code%3AKR%7CJP%2Clanguage%3Agd%7Cen',
+      );
+    });
+
+    it('fails a country that cannot be a code as invalid_country_code before any request', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'Narnia',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            recovery: { hint: expect.stringContaining('ISO 3166-1 alpha-2') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('"Narnia" is not a country code');
+      expect(textOf(result)).toContain('invalid_country_code');
+    });
+
+    it('declares invalid_country_code as a service-thrown ValidationError', () => {
+      const entry = analyzeTrendsTool.errors?.find((e) => e.reason === 'invalid_country_code');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    it('fails a value mixing "|" with an AND "+" before any request (gh #107)', async () => {
+      const { fetchMock, result } = await run({
+        'authorships.institutions.country_code': 'DE|FR+US',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'mixed_and_or_in_filter_value',
+            recovery: { hint: expect.stringContaining('"institutions.country_code": "US"') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('mixes "|" (OR) with an AND operator');
+      expect(textOf(result)).toContain('mixed_and_or_in_filter_value');
+    });
+
+    it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {
+      const entry = analyzeTrendsTool.errors?.find(
+        (e) => e.reason === 'mixed_and_or_in_filter_value',
+      );
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /**
+     * A double quote inside a value sent as a quoted phrase would end the phrase early, and
+     * OpenAlex would read the text after it as further clauses. The value is refused before the
+     * request, under the recovery this tool's contract declares.
+     */
+    it('refuses a quoted-phrase filter value carrying a stray double quote before any request', async () => {
+      const { fetchMock, result } = await run({
+        'title.search.exact': 'cats", is_oa:false, title.search:"dogs',
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'quote_in_filter_value',
+            recovery: {
+              hint: expect.stringContaining('a phrase is matched without quoting its own text'),
+            },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('quote_in_filter_value');
+      const entry = analyzeTrendsTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
+      expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
     });
   });
 });

@@ -8,7 +8,7 @@ import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_SELECT } from '@/services/openalex/types.js';
+import { DEFAULT_SELECT, type EntityType } from '@/services/openalex/types.js';
 
 /** The `structuredContent.error` a failed tool call returns. */
 interface ErrorEnvelope {
@@ -88,6 +88,37 @@ function findFetchUrl(predicate: (url: URL) => boolean): URL {
     if (predicate(url)) return url;
   }
   throw new Error('no fetch call matched predicate');
+}
+
+/** A JSON response for a routed fetch. */
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/** The HTML page OpenAlex serves for a by-ID path that addresses nothing. */
+function html404(): Response {
+  return new Response('<!doctype html><title>404 Not Found</title>', {
+    status: 404,
+    headers: { 'Content-Type': 'text/html' },
+  });
+}
+
+/**
+ * Answer each `api.openalex.org` request from `routes`, keyed by path. Any other host, and any
+ * path the case did not list, rejects — so a request the code under test should never make
+ * fails the case instead of reading a default body.
+ */
+function routeFetch(routes: Record<string, (url: URL) => Response>): void {
+  vi.mocked(globalThis.fetch).mockImplementation((input) => {
+    const url = new URL(String(input));
+    const route = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+    return route
+      ? Promise.resolve(route(url))
+      : Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+  });
 }
 
 describe('OpenAlexService', () => {
@@ -185,6 +216,65 @@ describe('OpenAlexService', () => {
       expect(catalog.authors.filter).toContain('last_known_authorships.institutions.lineage');
       expect(catalog.sources.filter).toContain('is_preprint_repository');
       expect(catalog.sources.select).toContain('is_preprint_repository');
+    });
+
+    it('carries the fields the 2026-10-18 regeneration recovered (gh #104)', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const catalog = getFieldCatalog();
+      expect(catalog.works.filter).toEqual(
+        expect.arrayContaining([
+          'funders.country_code',
+          'primary_location.source.listed_in',
+          'study_designs.id',
+          'title_abstract_keywords.search',
+          'volume.id',
+        ]),
+      );
+      expect(catalog.works.select).toEqual(
+        expect.arrayContaining(['rerank_score', 'study_designs', 'volume']),
+      );
+      expect(catalog.sources.filter).toEqual(
+        expect.arrayContaining(['host_organization.country_code', 'listed_in']),
+      );
+      expect(catalog.sources.select).toEqual(expect.arrayContaining(['apc_usd_by_year']));
+      expect(catalog.institutions.filter).toEqual(expect.arrayContaining(['geo.city']));
+      expect(catalog.keywords.filter).toEqual(expect.arrayContaining(['topics.id']));
+    });
+
+    it('suggests a recovered field for a near-miss upstream rejects (gh #104)', async () => {
+      const message = `study_design is not a valid select field. Valid fields: ${'apc_list, '.repeat(60)}id`;
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ error: 'Invalid query parameters error.', message }), {
+          status: 400,
+        }),
+      );
+      const { initOpenAlexService, getOpenAlexService } = await import(
+        '@/services/openalex/openalex-service.js'
+      );
+      initOpenAlexService();
+
+      const err = (await getOpenAlexService()
+        .search({ entityType: 'works', select: ['study_design'] }, createMockContext())
+        .catch((e) => e)) as { message: string };
+
+      expect(err.message).toMatch(/Did you mean: study_designs\b/);
+    });
+
+    /**
+     * `author_list` is derived by this server, so no upstream valid-field list names it and the
+     * generator's JSON never will; the catalog adds it in code. (gh #102)
+     */
+    it('lists the derived author_list in works select only, beside the generated fields (gh #102)', async () => {
+      const { default: generated } = await import('@/services/openalex/field-catalog.json');
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const catalog = getFieldCatalog();
+
+      expect(generated.works.select).not.toContain('author_list');
+      expect(catalog.works.select).toEqual([...generated.works.select, 'author_list']);
+      expect(catalog.works.filter).toEqual(generated.works.filter);
+      for (const entityType of ENTITY_TYPES_UNDER_TEST.filter((t) => t !== 'works')) {
+        expect(catalog[entityType]).toEqual(generated[entityType]);
+      }
     });
   });
 
@@ -346,6 +436,59 @@ describe('OpenAlexService', () => {
       const url = await searchById('https://pmc.ncbi.nlm.nih.gov/about/copyright/');
       expect(url.pathname).toBe('/works/https://pmc.ncbi.nlm.nih.gov/about/copyright/');
     });
+
+    /**
+     * OpenAlex's record pages put the entity type in the path (`/works/W…`), and its API URLs,
+     * `http://` links, and scheme-less copies carry a different host or scheme. Each names
+     * exactly one ID, so each reaches the by-ID path as that bare ID. (gh #99)
+     */
+    it.each([
+      'https://openalex.org/works/W2741809807',
+      'https://api.openalex.org/works/W2741809807',
+      'https://api.openalex.org/W2741809807',
+      'http://openalex.org/W2741809807',
+      'http://api.openalex.org/works/W2741809807',
+      'https://www.openalex.org/works/W2741809807',
+      'openalex.org/works/W2741809807',
+      'api.openalex.org/W2741809807',
+      'https://openalex.org/W2741809807/',
+      'https://openalex.org/works/W2741809807/',
+      'https://api.openalex.org/works/W2741809807?select=id',
+      'https://openalex.org/works/W2741809807#cited-by',
+      'HTTPS://OPENALEX.ORG/WORKS/W2741809807',
+      'https://openalex.org/works/w2741809807',
+      '  https://openalex.org/works/W2741809807\n',
+    ])('resolves the OpenAlex URL %j to the bare ID (gh #99)', async (id) => {
+      expect((await searchById(id)).pathname).toBe('/works/W2741809807');
+    });
+
+    it.each([
+      ['a look-alike host', 'https://notopenalex.org/works/W2741809807'],
+      ['a host that only starts with openalex.org', 'https://openalex.org.example/W2741809807'],
+      ['a scheme-less look-alike host', 'openalex.org.example/W2741809807'],
+      ['a path segment that is not an entity type', 'https://openalex.org/fields/17'],
+      ['an extra path segment', 'https://openalex.org/works/W2741809807/cites'],
+      ['an entity-type path with no ID', 'https://api.openalex.org/works'],
+      ['a port', 'https://openalex.org:8443/W2741809807'],
+      ['another scheme', 'ftp://openalex.org/W2741809807'],
+    ])('passes %s through unchanged (gh #99)', async (_label, id) => {
+      expect((await searchById(id)).pathname).toBe(`/works/${id}`);
+    });
+
+    it.each([
+      [
+        'https://openalex.org/works/W27418\n09807',
+        '/works/https://openalex.org/works/W27418%0A09807',
+      ],
+      ['openalex.org/W27 41809807', '/works/openalex.org/W27%2041809807'],
+    ])(
+      'does not read the URL %j, with whitespace inside it, as an OpenAlex ID (gh #99)',
+      async (id, path) => {
+        // The URL parser drops tabs and line breaks, which would quietly join the halves. The
+        // value passes through as written, its whitespace percent-encoded inside the path.
+        expect((await searchById(id)).pathname).toBe(path);
+      },
+    );
   });
 
   // --- Keyword identifiers: slugs, not native IDs (gh #68) ---
@@ -375,6 +518,15 @@ describe('OpenAlexService', () => {
       expect((await lookupKeyword(id)).pathname).toBe('/keywords/groundwater');
     });
 
+    it.each([
+      'http://openalex.org/keywords/groundwater',
+      'https://api.openalex.org/keywords/groundwater',
+      'https://www.openalex.org/keywords/groundwater?x=1',
+      'openalex.org/keywords/groundwater',
+    ])('resolves the keyword URL %s to /keywords/groundwater (gh #99)', async (id) => {
+      expect((await lookupKeyword(id)).pathname).toBe('/keywords/groundwater');
+    });
+
     it('resolves a multi-word keyword slug', async () => {
       expect((await lookupKeyword('https://openalex.org/keywords/machine-learning')).pathname).toBe(
         '/keywords/machine-learning',
@@ -397,7 +549,19 @@ describe('OpenAlexService', () => {
     it('infers the keywords entity type from a keyword URL', async () => {
       const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
       expect(inferIdentifier('https://openalex.org/keywords/groundwater')).toEqual({
-        entityType: 'keywords',
+        entityTypes: ['keywords'],
+        id: 'groundwater',
+        scheme: 'openalex',
+      });
+    });
+
+    it.each([
+      ['http://openalex.org/keywords/groundwater'],
+      ['https://api.openalex.org/keywords/groundwater'],
+    ])('infers the keywords entity type from the keyword URL %s (gh #99)', async (query) => {
+      const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+      expect(inferIdentifier(query)).toEqual({
+        entityTypes: ['keywords'],
         id: 'groundwater',
         scheme: 'openalex',
       });
@@ -405,6 +569,7 @@ describe('OpenAlexService', () => {
 
     it.each([
       ['a slugless keyword path', 'https://openalex.org/keywords/'],
+      ['a slugless keyword path without the slash', 'https://api.openalex.org/keywords'],
       ['a look-alike host', 'https://notopenalex.org/keywords/groundwater'],
       ['a bare slug, which is indistinguishable from a name', 'groundwater'],
     ])('leaves %s to name resolution', async (_label, query) => {
@@ -453,9 +618,9 @@ describe('OpenAlexService', () => {
   // --- Identifier shape → entity type inference (gh #50) ---
 
   describe('inferIdentifier', () => {
-    async function infer(query: string) {
+    async function infer(query: string, requested?: EntityType) {
       const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
-      return inferIdentifier(query);
+      return inferIdentifier(query, requested);
     }
 
     it.each([
@@ -463,27 +628,27 @@ describe('OpenAlexService', () => {
       ['DOI URL', 'https://doi.org/10.1038/nature12373', 'works', 'doi'],
       ['bare ORCID', '0000-0002-1825-0097', 'authors', 'orcid'],
       ['ORCID URL', 'https://orcid.org/0000-0001-9487-6983', 'authors', 'orcid'],
-      ['ROR URL', 'https://ror.org/00hx57361', 'institutions', 'ror'],
-      ['bare ROR', '013meh722', 'institutions', 'ror'],
-      ['all-digit bare ROR', '005781934', 'institutions', 'ror'],
       ['ISSN', '0028-0836', 'sources', 'issn'],
       ['PMCID', 'PMC1234567', 'works', 'pmcid'],
       ['PMID', '23903748', 'works', 'pmid'],
       ['already-prefixed DOI', 'doi:10.1038/nature12373', 'works', 'doi'],
       ['uppercase-scheme PMID', 'PMID:21491125', 'works', 'pmid'],
       ['uppercase-scheme ORCID', 'ORCID:0000-0002-1825-0097', 'authors', 'orcid'],
-      ['uppercase-scheme ROR', 'ROR:013meh722', 'institutions', 'ror'],
       ['PubMed URL', 'https://pubmed.ncbi.nlm.nih.gov/21491125', 'works', 'pmid'],
       ['PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', 'works', 'pmcid'],
       ['legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/', 'works', 'pmcid'],
     ])('maps a %s to %s', async (_label, query, entityType, scheme) => {
       expect(await infer(query)).toEqual({
-        entityType,
+        entityTypes: [entityType],
         scheme,
         id: expect.stringContaining(':'),
       });
     });
 
+    /**
+     * A bare native ID is also the shape of a short name — keyword `p53`, `F1`, `S1` — so it is
+     * marked as one a miss should search by name next. (gh #106)
+     */
     it.each([
       ['W2159974629', 'works'],
       ['A5022021627', 'authors'],
@@ -493,15 +658,118 @@ describe('OpenAlexService', () => {
       ['P4310320595', 'publishers'],
       ['F4320332161', 'funders'],
     ])('derives %s → %s from the native ID letter', async (query, entityType) => {
-      expect(await infer(query)).toEqual({ entityType, id: query, scheme: 'openalex' });
+      expect(await infer(query)).toEqual({
+        entityTypes: [entityType],
+        id: query,
+        scheme: 'openalex',
+        mayBeName: true,
+      });
+    });
+
+    it.each(['P53', 'F1', 'S1', 'A1', 'T10159', 'W2741809807'])(
+      'reads the bare native-ID shape %s as a keyword name under entity_type keywords (gh #106)',
+      async (query) => {
+        expect(await infer(query, 'keywords')).toBeUndefined();
+      },
+    );
+
+    it('keeps an OpenAlex URL an identifier under entity_type keywords (gh #106)', async () => {
+      // The URL names its record outright, so neither entity_type nor a name search applies.
+      expect(await infer('https://openalex.org/P53', 'keywords')).toEqual({
+        entityTypes: ['publishers'],
+        id: 'P53',
+        scheme: 'openalex',
+      });
     });
 
     it('strips the OpenAlex URL form before reading the letter', async () => {
       expect(await infer('https://openalex.org/I241749')).toEqual({
-        entityType: 'institutions',
+        entityTypes: ['institutions'],
         id: 'I241749',
         scheme: 'openalex',
       });
+    });
+
+    /**
+     * One ROR can address an institution, a funder, and a publisher record at once — NSF's
+     * `021nxhr62` is all three — so with no `entity_type` (or one a ROR cannot name) every
+     * type is looked up, institution first; one of the three narrows it to that type. (gh #98)
+     */
+    it.each([
+      ['ROR URL', 'https://ror.org/021nxhr62', 'ror:https://ror.org/021nxhr62'],
+      ['bare ROR', '021nxhr62', 'ror:021nxhr62'],
+      ['all-digit bare ROR', '005781934', 'ror:005781934'],
+      ['uppercase-scheme ROR', 'ROR:013meh722', 'ror:013meh722'],
+    ])('looks a %s up as all three organization types (gh #98)', async (_label, query, id) => {
+      const all = ['institutions', 'funders', 'publishers'];
+      expect(await infer(query)).toEqual({ entityTypes: all, id, scheme: 'ror' });
+      expect(await infer(query, 'works')).toEqual({ entityTypes: all, id, scheme: 'ror' });
+      expect(await infer(query, 'keywords')).toEqual({ entityTypes: all, id, scheme: 'ror' });
+    });
+
+    it.each(['institutions', 'funders', 'publishers'] as const)(
+      'narrows a ROR to %s when entity_type names it (gh #98)',
+      async (requested) => {
+        expect(await infer('021nxhr62', requested)).toEqual({
+          entityTypes: [requested],
+          id: 'ror:021nxhr62',
+          scheme: 'ror',
+        });
+      },
+    );
+
+    /**
+     * Funders are keyed by Crossref Funder Registry DOIs (`10.13039/…`), so one reads as a funder
+     * unless the caller asks for works — 3,147 works carry such a DOI by mis-attribution, and
+     * `entity_type: "works"` keeps each of them reachable. (gh #98)
+     */
+    it.each([
+      ['a bare funder DOI', '10.13039/100000001'],
+      ['a doi:-prefixed funder DOI', 'doi:10.13039/100000001'],
+      ['a doi.org funder DOI URL', 'https://doi.org/10.13039/100000001'],
+    ])('reads %s as a funder unless works is asked for (gh #98)', async (_label, query) => {
+      const funder = { entityTypes: ['funders'], id: 'doi:10.13039/100000001', scheme: 'doi' };
+      expect(await infer(query)).toEqual(funder);
+      expect(await infer(query, 'funders')).toEqual(funder);
+      expect(await infer(query, 'authors')).toEqual(funder);
+      expect(await infer(query, 'works')).toEqual({ ...funder, entityTypes: ['works'] });
+    });
+
+    it.each([
+      ['an ordinary DOI', '10.1038/nature12373', 'works'],
+      ['an ORCID', '0000-0002-1825-0097', 'authors'],
+      ['an ISSN', '0028-0836', 'sources'],
+      ['a native ID', 'W2159974629', 'works'],
+    ])(
+      'keeps %s on its own entity type whatever entity_type asks for (gh #98)',
+      async (_label, query, own) => {
+        for (const requested of ['funders', 'institutions', 'publishers', undefined] as const) {
+          expect((await infer(query, requested))?.entityTypes).toEqual([own]);
+        }
+      },
+    );
+
+    it.each([
+      ['https://openalex.org/works/W2741809807', 'works', 'W2741809807'],
+      ['https://api.openalex.org/works/W2741809807', 'works', 'W2741809807'],
+      ['https://api.openalex.org/W2741809807', 'works', 'W2741809807'],
+      ['http://openalex.org/W2741809807', 'works', 'W2741809807'],
+      ['openalex.org/works/W2741809807', 'works', 'W2741809807'],
+      ['https://openalex.org/W2741809807/', 'works', 'W2741809807'],
+      ['https://api.openalex.org/works/W2741809807?select=id', 'works', 'W2741809807'],
+      ['https://openalex.org/works/w2741809807', 'works', 'W2741809807'],
+      ['https://openalex.org/authors/A5023888391', 'authors', 'A5023888391'],
+      ['https://openalex.org/funders/F4320306076', 'funders', 'F4320306076'],
+    ])('reads the OpenAlex URL %s as a %s ID (gh #99)', async (query, entityType, id) => {
+      expect(await infer(query)).toEqual({ entityTypes: [entityType], id, scheme: 'openalex' });
+    });
+
+    it.each([
+      ['a bare lowercase work ID', 'w2741809807'],
+      ['a bare lowercase keyword-shaped name', 'p53'],
+      ['an OpenAlex path that is not an entity type', 'https://openalex.org/fields/17'],
+    ])('leaves %s to name resolution (gh #99)', async (_label, query) => {
+      expect(await infer(query)).toBeUndefined();
     });
 
     it.each([
@@ -529,7 +797,7 @@ describe('OpenAlexService', () => {
 
     it('stamps the folded scheme onto the id it hands the by-ID lookup (gh #66)', async () => {
       expect(await infer('PMID:21491125')).toEqual({
-        entityType: 'works',
+        entityTypes: ['works'],
         id: 'pmid:21491125',
         scheme: 'pmid',
       });
@@ -537,7 +805,7 @@ describe('OpenAlexService', () => {
 
     it('reads a bare PubMed URL as a PMID instead of falling through (gh #66)', async () => {
       expect(await infer('https://pubmed.ncbi.nlm.nih.gov/21491125')).toEqual({
-        entityType: 'works',
+        entityTypes: ['works'],
         id: 'pmid:21491125',
         scheme: 'pmid',
       });
@@ -565,7 +833,7 @@ describe('OpenAlexService', () => {
       );
       const service = await getService();
       return service.resolveIdentifier(
-        { entityType: entityType as 'works', id, scheme: 'doi' },
+        { entityTypes: [entityType as 'works'], id, scheme: 'doi' },
         createMockContext(),
       );
     }
@@ -649,10 +917,663 @@ describe('OpenAlexService', () => {
 
       await expect(
         service.resolveIdentifier(
-          { entityType: 'works', id: 'doi:10.1038/x', scheme: 'doi' },
+          { entityTypes: ['works'], id: 'doi:10.1038/x', scheme: 'doi' },
           createMockContext(),
         ),
       ).rejects.toMatchObject({ code: JsonRpcErrorCode.Unauthorized });
+    });
+
+    /**
+     * A ROR with no narrowing entity_type is looked up as an institution, a funder, and a
+     * publisher at once — three unbilled singleton fetches — and every record found comes back,
+     * institution first, whatever order the responses arrive in. (gh #98)
+     */
+    describe('ROR fan-out (gh #98)', () => {
+      const ROR_TYPES = ['institutions', 'funders', 'publishers'] as const;
+      const nsf = {
+        institutions: { id: 'https://openalex.org/I1311060795', display_name: 'U.S. NSF' },
+        funders: { id: 'https://openalex.org/F4320306076', display_name: 'NSF' },
+        publishers: { id: 'https://openalex.org/P4365365866', display_name: 'NSF' },
+      };
+
+      /** Answer each type's `/…/ror:<ror>` path after `delayMs`, with its record or a 404. */
+      function routeRor(
+        ror: string,
+        answers: Partial<Record<(typeof ROR_TYPES)[number], () => Response>>,
+        delayMs: Partial<Record<(typeof ROR_TYPES)[number], number>> = {},
+      ) {
+        vi.mocked(globalThis.fetch).mockImplementation((input) => {
+          const url = new URL(String(input));
+          const type = ROR_TYPES.find((t) => url.pathname === `/${t}/ror:${ror}`);
+          if (url.hostname !== 'api.openalex.org' || type === undefined) {
+            return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+          }
+          const answer = answers[type] ?? html404;
+          return new Promise((resolve) => setTimeout(() => resolve(answer()), delayMs[type] ?? 0));
+        });
+      }
+
+      async function resolveRor(ror: string, ctx = createMockContext()) {
+        const service = await getService();
+        return service.resolveIdentifier(
+          { entityTypes: ROR_TYPES, id: `ror:${ror}`, scheme: 'ror' },
+          ctx,
+        );
+      }
+
+      it('returns every record found, institution first, in parallel', async () => {
+        // The funder answers first and the institution last; the order stays I, F, P.
+        let requestedWhenFunderAnswered = 0;
+        routeRor(
+          '021nxhr62',
+          {
+            institutions: () => jsonResponse(nsf.institutions),
+            funders: () => {
+              requestedWhenFunderAnswered = vi.mocked(globalThis.fetch).mock.calls.length;
+              return jsonResponse(nsf.funders);
+            },
+            publishers: () => jsonResponse(nsf.publishers),
+          },
+          { institutions: 30, funders: 0, publishers: 15 },
+        );
+
+        const result = await resolveRor('021nxhr62');
+
+        // All three lookups were in flight before the first answer; one at a time, the funder
+        // lookup would answer after only the institution's and its own were sent.
+        expect(requestedWhenFunderAnswered).toBe(3);
+        expect(result.results.map((r) => [r.id, r.entity_type])).toEqual([
+          ['https://openalex.org/I1311060795', 'institution'],
+          ['https://openalex.org/F4320306076', 'funder'],
+          ['https://openalex.org/P4365365866', 'publisher'],
+        ]);
+        expect(result.failedEntityTypes).toBeUndefined();
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('returns the one record a ROR holds when the other two 404', async () => {
+        routeRor('04dzdm737', {
+          institutions: () =>
+            jsonResponse({ id: 'https://openalex.org/I1327191685', display_name: 'deCODE' }),
+        });
+
+        const result = await resolveRor('04dzdm737');
+
+        expect(result.results.map((r) => r.id)).toEqual(['https://openalex.org/I1327191685']);
+        expect(result.failedEntityTypes).toBeUndefined();
+      });
+
+      it('returns no results, without throwing, when all three 404', async () => {
+        routeRor('0zzzzzz99', {});
+        const result = await resolveRor('0zzzzzz99');
+        expect(result).toEqual({ results: [] });
+      });
+
+      it('keeps the records that resolved when one lookup fails, and names the failed type', async () => {
+        routeRor('021nxhr62', {
+          institutions: () => jsonResponse(nsf.institutions),
+          funders: () => jsonResponse({ error: 'Forbidden' }, 403),
+          publishers: () => jsonResponse(nsf.publishers),
+        });
+
+        const result = await resolveRor('021nxhr62');
+
+        expect(result.results.map((r) => r.entity_type)).toEqual(['institution', 'publisher']);
+        expect(result.failedEntityTypes).toEqual(['funders']);
+      });
+
+      it('throws when a lookup fails and none returned a record', async () => {
+        // An empty answer would claim no funder exists when the funder lookup never finished.
+        routeRor('021nxhr62', { funders: () => jsonResponse({ error: 'Forbidden' }, 403) });
+
+        await expect(resolveRor('021nxhr62')).rejects.toMatchObject({
+          code: JsonRpcErrorCode.Forbidden,
+        });
+      });
+
+      it('never reports a caller cancellation as a partial success', async () => {
+        const controller = new AbortController();
+        let hung = 0;
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const url = new URL(String(input));
+          if (url.hostname !== 'api.openalex.org') {
+            return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+          }
+          if (url.pathname === '/institutions/ror:021nxhr62') {
+            return Promise.resolve(jsonResponse(nsf.institutions));
+          }
+          // The funder and publisher lookups hang until the caller cancels, which it does once
+          // both are in flight, so the institution's record is in hand when the abort lands.
+          hung += 1;
+          if (hung === 2) setTimeout(() => controller.abort(), 0);
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          });
+        });
+
+        await expect(
+          resolveRor('021nxhr62', createMockContext({ signal: controller.signal })),
+        ).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+        expect(hung).toBe(2);
+      });
+    });
+
+    /**
+     * A bare native-ID shape is also a short name (`P53` is a keyword), so a lookup that finds no
+     * record runs the caller's name search next — once, on a miss only, inside one deadline that
+     * starts with the lookup. (gh #106)
+     */
+    describe('name search after an ID miss (gh #106)', () => {
+      const P53 = {
+        entityTypes: ['publishers'],
+        id: 'P53',
+        scheme: 'openalex',
+        mayBeName: true,
+      } as const;
+      const nameSearch = { query: 'P53', entityType: 'keywords' } as const;
+      const p53Keyword = {
+        id: 'https://openalex.org/keywords/p53',
+        display_name: 'p53',
+        entity_type: 'keyword',
+        external_id: null,
+        cited_by_count: 3606453,
+        works_count: 116388,
+        hint: null,
+      };
+
+      /** A fetch that never settles on its own — only an abort of its signal ends it. */
+      function hang(init: RequestInit | undefined): Promise<Response> {
+        return new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
+
+      it('runs no name search when the identifier resolves, so a real ID costs one request', async () => {
+        routeFetch({
+          '/publishers/P4310320595': () =>
+            jsonResponse({ id: 'https://openalex.org/P4310320595', display_name: 'Elsevier' }),
+        });
+        const service = await getService();
+
+        const result = await service.resolveIdentifier(
+          { ...P53, id: 'P4310320595' },
+          createMockContext(),
+          nameSearch,
+        );
+
+        expect(result).toEqual({
+          results: [expect.objectContaining({ id: 'https://openalex.org/P4310320595' })],
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('returns the name matches after a miss, flagged as a name search', async () => {
+        routeFetch({
+          '/publishers/P53': html404,
+          '/autocomplete/keywords': () =>
+            jsonResponse({ meta: { count: 1 }, results: [p53Keyword] }),
+        });
+        const service = await getService();
+
+        const result = await service.resolveIdentifier(P53, createMockContext(), nameSearch);
+
+        expect(result).toEqual({ results: [p53Keyword], nameFallback: {} });
+        expect(lastFetchUrl().searchParams.get('q')).toBe('P53');
+      });
+
+      it('keeps the plain miss when no name search is given', async () => {
+        routeFetch({ '/publishers/P53': html404 });
+        const service = await getService();
+
+        const result = await service.resolveIdentifier(P53, createMockContext());
+
+        expect(result).toEqual({ results: [] });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('settles the slow lookup and its name search under one 45 s deadline', async () => {
+        vi.useFakeTimers();
+        let lookups = 0;
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const url = new URL(String(input));
+          if (url.hostname !== 'api.openalex.org') {
+            return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+          }
+          // Two by-ID attempts time out before the third answers 404; the name search never answers.
+          if (url.pathname === '/publishers/P53') {
+            lookups += 1;
+            return lookups < 3 ? hang(init) : Promise.resolve(html404());
+          }
+          if (url.pathname === '/autocomplete/keywords') return hang(init);
+          return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+        });
+        const service = await getService();
+        const startedAt = Date.now();
+
+        let settledAt = 0;
+        const pending = service
+          .resolveIdentifier(P53, createMockContext(), nameSearch)
+          .finally(() => {
+            settledAt = Date.now();
+          });
+        const outcome = expect(pending).resolves.toEqual({
+          results: [],
+          nameFallback: { failedReason: 'upstream_timeout' },
+        });
+        await vi.runAllTimersAsync();
+
+        await outcome;
+        expect(lookups).toBe(3);
+        expect(settledAt - startedAt).toBeLessThanOrEqual(45_000);
+        // The ID phase alone took over 20 s, so the deadline — not the name search's own retry
+        // budget, which outlasts what was left — is what ended the call.
+        expect(settledAt - startedAt).toBeGreaterThan(40_000);
+      });
+
+      it('rethrows a caller cancellation during the name search instead of degrading it', async () => {
+        const controller = new AbortController();
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const url = new URL(String(input));
+          if (url.hostname !== 'api.openalex.org') {
+            return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+          }
+          if (url.pathname === '/publishers/P53') return Promise.resolve(html404());
+          if (url.pathname === '/autocomplete/keywords') {
+            setTimeout(() => controller.abort(), 0);
+            return hang(init);
+          }
+          return Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+        });
+        const service = await getService();
+
+        await expect(
+          service.resolveIdentifier(
+            P53,
+            createMockContext({ signal: controller.signal }),
+            nameSearch,
+          ),
+        ).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      });
+
+      it.each([
+        ['an outage', 503, { error: 'Service Unavailable' }, 'upstream_unavailable'],
+        ['a burst throttle', 429, { error: 'Rate limit exceeded' }, 'rate_limited'],
+      ])(
+        'discloses %s on the name search as a failed fallback, not an error',
+        async (_label, status, body, failedReason) => {
+          vi.useFakeTimers();
+          routeFetch({
+            '/publishers/P53': html404,
+            '/autocomplete/keywords': () => jsonResponse(body, status),
+          });
+          const service = await getService();
+
+          const outcome = expect(
+            service.resolveIdentifier(P53, createMockContext(), nameSearch),
+          ).resolves.toEqual({ results: [], nameFallback: { failedReason } });
+          await vi.runAllTimersAsync();
+
+          await outcome;
+          // One lookup, then every attempt the retry budget allows at the name search.
+          expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+        },
+      );
+
+      it.each([
+        [
+          'a rejected filter',
+          400,
+          { error: 'Invalid query parameters error.', message: 'bogus is not a valid field.' },
+          JsonRpcErrorCode.InvalidParams,
+        ],
+        [
+          'a spent daily budget',
+          429,
+          { error: 'Rate limit exceeded', message: 'Insufficient budget. Resets at midnight UTC.' },
+          JsonRpcErrorCode.RateLimited,
+        ],
+        // gh #114: a filter the caller's name search carries that OpenAlex serves only on a paid plan.
+        [
+          'a plan-gated filter',
+          429,
+          {
+            error: 'Plan upgrade required',
+            message:
+              'The "from_created_date:2026-10-01" filter is part of daily sync, which comes with the Member+ and Partner plans. See https://help.openalex.org/access/sync/ for details.',
+          },
+          JsonRpcErrorCode.Forbidden,
+        ],
+      ])('fails the call on %s from the name search', async (_label, status, body, code) => {
+        routeFetch({
+          '/publishers/P53': html404,
+          '/autocomplete/keywords': () => jsonResponse(body, status),
+        });
+        const service = await getService();
+
+        await expect(
+          service.resolveIdentifier(P53, createMockContext(), nameSearch),
+        ).rejects.toMatchObject({ code });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
+
+  // --- A funder looked up by its Crossref Funder Registry DOI (gh #98) ---
+
+  describe('funder DOI lookups (gh #98)', () => {
+    const nsfFunder = {
+      id: 'https://openalex.org/F4320306076',
+      display_name: 'National Science Foundation',
+    };
+
+    /**
+     * OpenAlex's `/funders/doi:` path resolves nothing, while the `ids.doi` filter matches a
+     * funder by its bare registry DOI; the DOI's URL form matches nothing there.
+     */
+    it.each([
+      '10.13039/100000001',
+      'doi:10.13039/100000001',
+      'DOI:10.13039/100000001',
+      'https://doi.org/10.13039/100000001',
+    ])('looks %s up through the ids.doi filter', async (id) => {
+      routeFetch({
+        '/funders': () =>
+          jsonResponse({
+            meta: { count: 1, per_page: 1, next_cursor: null },
+            results: [nsfFunder],
+          }),
+      });
+      const service = await getService();
+
+      const result = await service.search({ entityType: 'funders', id }, createMockContext());
+
+      const url = lastFetchUrl();
+      expect(url.pathname).toBe('/funders');
+      expect(url.searchParams.get('filter')).toBe('ids.doi:10.13039/100000001');
+      expect(url.searchParams.get('per_page')).toBe('1');
+      expect(url.searchParams.get('select')).toBe(DEFAULT_SELECT.funders.join(','));
+      expect(result).toEqual({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [nsfFunder],
+      });
+    });
+
+    it('fails a DOI no funder carries as entity_not_found', async () => {
+      routeFetch({
+        '/funders': () =>
+          jsonResponse({ meta: { count: 0, per_page: 1, next_cursor: null }, results: [] }),
+      });
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'funders', id: '10.1038/nature12373' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'entity_not_found' },
+        message: expect.stringContaining('10.1038/nature12373'),
+      });
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('ids.doi:10.1038/nature12373');
+    });
+
+    /**
+     * A filter value is read as filter syntax: `|` is OR, `+` is AND, `!` negates, and a comma
+     * splits the clause. A DOI carrying one would match some other funder — or every funder —
+     * and come back as "the entity at that ID", so it fails without a request.
+     */
+    it.each([
+      '10.1000/a|10.13039/100000001',
+      'doi:!10.13039/100000001',
+      'doi:10.13039/1+10.13039/2',
+      'doi:10.13039/1,2',
+      'doi:>10.13039/1',
+    ])('fails %j as entity_not_found without a request', async (id) => {
+      routeFetch({});
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'funders', id }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'entity_not_found' },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['works', '10.13039/100000001', '/works/doi:10.13039/100000001'],
+      ['funders', 'https://ror.org/021nxhr62', '/funders/ror:https://ror.org/021nxhr62'],
+      ['funders', 'F4320306076', '/funders/F4320306076'],
+    ])('keeps a %s lookup of %s on its by-ID path', async (entityType, id, path) => {
+      routeFetch({ [path]: () => jsonResponse(nsfFunder) });
+      const service = await getService();
+
+      await service.search({ entityType: entityType as 'works', id }, createMockContext());
+
+      expect(lastFetchUrl().pathname).toBe(path);
+    });
+  });
+
+  // --- A by-ID `id` stays inside its own path segment (gh #109) ---
+
+  describe('by-ID request URLs (gh #109)', () => {
+    /** Send one by-ID lookup and return the URL it requested. */
+    async function requestFor(entityType: EntityType, id: string): Promise<URL> {
+      vi.mocked(globalThis.fetch).mockImplementation((input) => {
+        const url = new URL(String(input));
+        return url.hostname === 'api.openalex.org'
+          ? Promise.resolve(jsonResponse({ id: 'https://openalex.org/W1', display_name: 'One' }))
+          : Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+      });
+      const service = await getService();
+      await service.search({ entityType, id, select: ['id'] }, createMockContext());
+      return lastFetchUrl();
+    }
+
+    /**
+     * Characterization: every legitimate identifier shape is sent exactly as it was before the
+     * path was confined — `/` stays a separator (DOIs carry it), and the characters a URL parse
+     * already encodes (`<`, `>`, a space) are encoded the same way.
+     */
+    it.each([
+      ['works', 'W2741809807', '/works/W2741809807'],
+      ['works', 'w2741809807', '/works/w2741809807'],
+      ['works', 'https://openalex.org/works/W2741809807', '/works/W2741809807'],
+      ['works', 'https://api.openalex.org/W2741809807', '/works/W2741809807'],
+      ['authors', 'https://openalex.org/authors/A5023888391', '/authors/A5023888391'],
+      ['sources', 'V137773608', '/sources/V137773608'],
+      ['funders', 'F4320306076', '/funders/F4320306076'],
+      ['keywords', 'groundwater', '/keywords/groundwater'],
+      ['keywords', 'https://openalex.org/keywords/machine-learning', '/keywords/machine-learning'],
+      ['works', '10.1038/nature12373', '/works/doi:10.1038/nature12373'],
+      ['works', 'https://doi.org/10.1038/nature12373', '/works/doi:10.1038/nature12373'],
+      ['works', 'DOI:10.1136/BMJ.F5137', '/works/doi:10.1136/BMJ.F5137'],
+      ['works', '10.1000/a/b/c', '/works/doi:10.1000/a/b/c'],
+      [
+        'works',
+        '10.1002/(SICI)1097-4636(199706)35:4<439::AID-JBM4>3.0.CO;2-H',
+        '/works/doi:10.1002/(SICI)1097-4636(199706)35:4%3C439::AID-JBM4%3E3.0.CO;2-H',
+      ],
+      ['works', '10.1000/100%25', '/works/doi:10.1000/100%25'],
+      ['works', '10.1000/a b', '/works/doi:10.1000/a%20b'],
+      ['authors', '0000-0002-1825-0097', '/authors/orcid:0000-0002-1825-0097'],
+      [
+        'authors',
+        'https://orcid.org/0000-0002-1825-0097',
+        '/authors/orcid:https://orcid.org/0000-0002-1825-0097',
+      ],
+      ['institutions', 'https://ror.org/021nxhr62', '/institutions/ror:https://ror.org/021nxhr62'],
+      ['publishers', '021nxhr62', '/publishers/ror:021nxhr62'],
+      ['sources', '0028-0836', '/sources/issn:0028-0836'],
+      ['works', '23903748', '/works/pmid:23903748'],
+      ['works', 'https://pubmed.ncbi.nlm.nih.gov/21491125', '/works/pmid:21491125'],
+      ['works', 'PMC3084216', '/works/pmcid:PMC3084216'],
+      ['works', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/', '/works/pmcid:PMC3084216'],
+      ['works', 'X-Custom:AbC', '/works/X-Custom:AbC'],
+    ])('requests %s %s at %s', async (entityType, id, path) => {
+      const url = await requestFor(entityType as EntityType, id);
+      expect(url.pathname).toBe(path);
+      expect([...url.searchParams.keys()]).toEqual(['api_key', 'select']);
+      expect(url.hash).toBe('');
+    });
+
+    /**
+     * `?` and `#` are legal in a DOI — SICI DOIs end in a `#` check character — and reach
+     * OpenAlex percent-encoded, which it decodes back into the ID, instead of starting a query
+     * string or a fragment that drops the rest of the DOI.
+     */
+    it.each([
+      [
+        '10.1002/(sici)1097-461x(1997)64:6<735::aid-qua10>3.0.co;2-#',
+        '/works/doi:10.1002/(sici)1097-461x(1997)64:6%3C735::aid-qua10%3E3.0.co;2-%23',
+      ],
+      ['10.1000/what?x=1', '/works/doi:10.1000/what%3Fx=1'],
+      ['10.1000/a?b#c', '/works/doi:10.1000/a%3Fb%23c'],
+    ])('keeps the ? and # of %s inside the ID', async (id, path) => {
+      const url = await requestFor('works', id);
+      expect(url.pathname).toBe(path);
+      expect([...url.searchParams.keys()]).toEqual(['api_key', 'select']);
+      expect(url.hash).toBe('');
+    });
+
+    it('fails a dot segment as id_dot_segment before any request', async () => {
+      const service = await getService();
+      await expect(
+        service.search({ entityType: 'works', id: '../authors/A5023888391' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'id_dot_segment', id: '../authors/A5023888391', entityType: 'works' },
+        message: expect.stringContaining('".."'),
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('fails every lookup of a ROR with a dot segment instead of answering for some', async () => {
+      const service = await getService();
+      await expect(
+        service.resolveIdentifier(
+          {
+            entityTypes: ['institutions', 'funders', 'publishers'],
+            id: 'ror:https://ror.org/../x',
+            scheme: 'ror',
+          },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'id_dot_segment' } });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- A native ID's letter names its entity type (gh #99) ---
+
+  describe('id_type_mismatch (gh #99)', () => {
+    /**
+     * A native ID's letter names the one entity type that holds it — no record of one type
+     * carries another type's letter, and every cross-letter lookup 404s upstream — so a
+     * mismatch is settled before any request, naming the type the ID belongs to.
+     */
+    it.each([
+      ['authors', 'W2741809807', 'work', 'works'],
+      ['authors', 'w2741809807', 'work', 'works'],
+      ['works', 'https://openalex.org/authors/A5023888391', 'author', 'authors'],
+      ['funders', 'I1311060795', 'institution', 'institutions'],
+      ['institutions', 'F4320306076', 'funder', 'funders'],
+      ['sources', 'P4310320990', 'publisher', 'publishers'],
+      ['works', 'S137773608', 'source', 'sources'],
+      ['works', 'T10159', 'topic', 'topics'],
+    ])(
+      'rejects entity_type %s with %s before any request',
+      async (entityType, id, noun, ownType) => {
+        routeFetch({});
+        const service = await getService();
+        const error = await service
+          .search({ entityType: entityType as 'works', id }, createMockContext())
+          .then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'id_type_mismatch' },
+        });
+        const message = (error as Error).message;
+        expect(message).toContain(`${noun} ID`);
+        expect(message).toContain(`entity_type "${ownType}"`);
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('names a concept ID as a type this server does not serve', async () => {
+      routeFetch({});
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'topics', id: 'C71924100' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'id_type_mismatch' },
+        message: expect.stringMatching(/C71924100 is an OpenAlex concept ID/),
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('quotes at most 200 characters of the id in the message, and the whole id in data', async () => {
+      routeFetch({});
+      const service = await getService();
+      const id = `W${'1'.repeat(80_000)}`;
+
+      const error = await service
+        .search({ entityType: 'authors', id }, createMockContext())
+        .catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ data: { reason: 'id_type_mismatch', id } });
+      const { message } = error as Error;
+      expect(message).toContain(`W${'1'.repeat(199)}… is an OpenAlex work ID`);
+      expect(message.length).toBeLessThan(500);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Characterization — these resolve upstream and must keep doing so. Keyword slugs can look
+     * like native IDs (`P53`, `F1`, `S1`, `A1` are all real keywords, matched case-insensitively),
+     * and a legacy `V…` venue ID still resolves under `/sources/`.
+     */
+    it.each([
+      ['keywords', 'P53', '/keywords/P53'],
+      ['keywords', 'F1', '/keywords/F1'],
+      ['keywords', 's1', '/keywords/s1'],
+      ['keywords', 'A1', '/keywords/A1'],
+      ['sources', 'V137773608', '/sources/V137773608'],
+      ['authors', 'A5023888391', '/authors/A5023888391'],
+      ['works', 'w2741809807', '/works/w2741809807'],
+    ])('looks up %s %s without a mismatch', async (entityType, id, path) => {
+      routeFetch({
+        [path]: () => jsonResponse({ id: 'https://openalex.org/X1', display_name: 'X' }),
+      });
+      const service = await getService();
+
+      const result = await service.search(
+        { entityType: entityType as 'works', id },
+        createMockContext(),
+      );
+
+      expect(result.results).toHaveLength(1);
+      expect(lastFetchUrl().pathname).toBe(path);
+    });
+
+    it('leaves a missing ID of the right type on entity_not_found', async () => {
+      routeFetch({ '/works/W99999999999': html404 });
+      const service = await getService();
+
+      await expect(
+        service.search({ entityType: 'works', id: 'W99999999999' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'entity_not_found' },
+      });
     });
   });
 
@@ -703,6 +1624,48 @@ describe('OpenAlexService', () => {
       expect(filter).toBe('title.search:"deep, learning"');
     });
 
+    /**
+     * Every free-text search filter takes a phrase, whatever follows `.search` — so a comma in one
+     * is part of the phrase, sent double-quoted as a `.search` value is. OpenAlex answers
+     * `title.search.exact:"cats, dogs"` with the works whose title holds that phrase. (gh #113)
+     */
+    it.each([
+      'title.search.exact',
+      'abstract.search.exact',
+      'title_and_abstract.search.exact',
+      'title_abstract_keywords.search',
+      'title_abstract_keywords.search.exact',
+      'raw_affiliation_strings.search.exact',
+      'semantic.search',
+    ])('wraps a %s value containing a comma in double quotes (gh #113)', async (key) => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { [key]: 'cats, dogs' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe(`${key}:"cats, dogs"`);
+    });
+
+    it('does not double-wrap a quoted .search.exact value (gh #113)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { 'title.search.exact': '"cats, dogs"' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('title.search.exact:"cats, dogs"');
+    });
+
+    it.each(['title.searchable', 'research_area', 'search', 'title_search'])(
+      'still refuses a comma in %s, which only resembles a search filter (gh #113)',
+      async (key) => {
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', filters: { [key]: 'a, b' } }, createMockContext()),
+        ).rejects.toMatchObject({ data: { reason: 'comma_in_filter_value', filterKey: key } });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      },
+    );
+
     it('throws comma_in_filter_value for a non-search filter with a comma, naming the field', async () => {
       const service = await getService();
       await expect(
@@ -726,6 +1689,1108 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(lastFetchUrl().searchParams.get('filter')).toBe('publication_year:2020-2024');
+    });
+  });
+
+  /**
+   * A value the clause sends double-quoted — a free-text search value or a whole-text field — is
+   * matched as one phrase. OpenAlex ends that phrase at the next `"`, with no escape for one
+   * inside, so a value carrying a `"` beyond its own outer pair would let the text after it parse
+   * as further filter clauses. Such a value is refused before any request; the caller's own
+   * wrapping pair is fine, and a value with no comma that the caller quoted goes out unchanged.
+   */
+  describe('quote_in_filter_value', () => {
+    it.each([
+      ['title.search.exact', 'cats", publication_year:1800, title.search:"dogs'],
+      ['raw_affiliation_strings', 'Harvard", publication_year:1800, display_name:"x'],
+      ['raw_affiliation_strings', 'one phrase" two'],
+      ['display_name', '"a""b"'],
+      ['geo.city', 'New "York'],
+      // Quoting each `|` alternative separately leaves a `"` mid-value; the whole-value wrap is the
+      // form that ORs two phrases. Both returned nothing upstream before; now they fail loudly.
+      ['geo.city', '"New York"|"Boston"'],
+      ['raw_affiliation_strings', '"A, B"|"C, D"'],
+    ])(
+      'refuses a %s value carrying a stray double quote before any request',
+      async (key, value) => {
+        routeFetch({});
+        const service = await getService();
+        await expect(
+          service.search({ entityType: 'works', filters: { [key]: value } }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining(`Filter ${JSON.stringify(key)}`),
+          data: { reason: 'quote_in_filter_value', filterKey: key },
+        });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['title.search', '"deep, learning"', 'title.search:"deep, learning"'],
+      [
+        'raw_affiliation_strings',
+        '"University of California, Berkeley"',
+        'raw_affiliation_strings:"University of California, Berkeley"',
+      ],
+      ['geo.city', '"New York"', 'geo.city:"New York"'],
+      ['geo.city', '!"New York"', 'geo.city:!"New York"'],
+    ])('sends a cleanly quoted %s value %j unchanged', async (key, value, filter) => {
+      const service = await getService();
+      await service.search({ entityType: 'works', filters: { [key]: value } }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('filter')).toBe(filter);
+    });
+  });
+
+  // --- "+" reaches OpenAlex as AND (gh #107) ---
+
+  /**
+   * OpenAlex reads AND within a field only from a decoded space — a raw `+` in the query string.
+   * `URLSearchParams` sends a `+` in a value as `%2B`, a literal plus that matches nothing. These
+   * read the `filter=` pair exactly as the request put it on the wire, still percent-encoded,
+   * because the decoded `searchParams.get('filter')` cannot tell a raw `+` from a space.
+   */
+  describe('"+" on the wire (gh #107)', () => {
+    /** The `filter=` pair of the last request, as sent. */
+    function sentFilter(): string | undefined {
+      const call = vi.mocked(globalThis.fetch).mock.lastCall;
+      if (!call) throw new Error('fetch was not called');
+      return new URL(String(call[0])).search
+        .slice(1)
+        .split('&')
+        .find((pair) => pair.startsWith('filter='));
+    }
+
+    const emptyList = () => jsonResponse({ meta: { count: 0, per_page: 25 }, results: [] });
+
+    async function searchWith(filters: Record<string, string>): Promise<string | undefined> {
+      routeFetch({ '/works': emptyList });
+      const service = await getService();
+      await service.search({ entityType: 'works', filters }, createMockContext());
+      return sentFilter();
+    }
+
+    it.each([
+      [
+        'OR',
+        { 'authorships.institutions.country_code': 'DE|US' },
+        'filter=authorships.institutions.country_code%3ADE%7CUS',
+      ],
+      [
+        'NOT',
+        { 'authorships.institutions.country_code': '!DE' },
+        'filter=authorships.institutions.country_code%3A%21DE',
+      ],
+      [
+        'no operator',
+        { 'authorships.institutions.country_code': 'DE' },
+        'filter=authorships.institutions.country_code%3ADE',
+      ],
+      ['a year range', { publication_year: '2020-2024' }, 'filter=publication_year%3A2020-2024'],
+      [
+        'a date bound',
+        { from_publication_date: '2020-01-01' },
+        'filter=from_publication_date%3A2020-01-01',
+      ],
+      [
+        'a literal space',
+        { 'authorships.author.id': 'A5023888391 A5014420283' },
+        'filter=authorships.author.id%3AA5023888391+A5014420283',
+      ],
+      [
+        'free text holding a space',
+        { 'title.search': 'machine learning' },
+        'filter=title.search%3Amachine+learning',
+      ],
+    ])('sends %s exactly as before', async (_label, filters, wire) => {
+      expect(await searchWith(filters)).toBe(wire);
+    });
+
+    it.each([
+      ['DE+US', 'filter=authorships.institutions.country_code%3ADE+US'],
+      ['!DE+!FR', 'filter=authorships.institutions.country_code%3A%21DE+%21FR'],
+    ])('sends the AND in %s as a raw "+"', async (value, wire) => {
+      expect(await searchWith({ 'authorships.institutions.country_code': value })).toBe(wire);
+    });
+
+    /**
+     * OpenAlex splits a filter value on `|` first, and an alternative holding a `+` — raw or
+     * `%2B` — matches nothing: `DE|FR+US` returns the 7,274,418 works with a German institution,
+     * not the 1,201,334 in (DE or FR) and US, `DE|FR+` returns the same German set, and
+     * `!DE+!FR|US` on institutions returns every institution outside the US. Where `+` means AND,
+     * such a value fails before any request.
+     */
+    it.each([
+      ['authorships.institutions.country_code', 'DE|FR+US'],
+      ['authorships.institutions.country_code', 'US+DE|FR'],
+      ['authorships.institutions.country_code', '!DE+!FR|US'],
+      ['authorships.institutions.country_code', 'DE|FR+'],
+      ['authorships.institutions.country-code', 'DEU|FRA+USA'],
+      ['authorships.institutions.country_code', 'Narnia|FR+US'],
+      ['authorships.author.id', 'A5023888391|A5014420283+A5051226891'],
+      ['language', 'en|fr+de'],
+      ['type', 'article+review|book'],
+      ['has_pdf_url', 'true+false|true'],
+      ['authorships.institutions.geo.city', 'Tokyo+Kyoto|Osaka'],
+      ['raw_affiliation_strings', 'Harvard University+MIT|Yale University'],
+      // A space is the AND operator too: an alternative of more than one value drops to its first
+      // ID, or matches nothing for a code — the same silent partial a "+" would make. (gh-follow-up)
+      ['authorships.author.id', 'A5023888391 A5014420283|A5051226891'],
+      ['type', 'article review|book'],
+      ['indexed_in', 'crossref pubmed|doaj'],
+      ['language', 'en fr|de'],
+      // A language segment that names no language is sent as given, so its space is still an AND.
+      ['language', 'Scottish Gaelic|en fr'],
+      // So is a country path form, its space with it.
+      ['authorships.institutions.country_code', 'countries/DE countries/FR|US'],
+      // A "+" beside a "|" is read before the conversion, multi-word names included.
+      ['authorships.institutions.country_code', 'South Korea|Japan+US'],
+    ])('fails %s %j as mixed_and_or_in_filter_value before any request', async (key, value) => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search({ entityType: 'works', filters: { [key]: value } }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(`Filter ${JSON.stringify(key)} value mixes "|" (OR)`),
+        data: { reason: 'mixed_and_or_in_filter_value', filterKey: key },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Unchanged: where `+` is a literal character — free-text search phrases, DOIs, exactly
+     * matched names, `biblio` fields — and in a phrase the caller quoted, which OpenAlex reads
+     * as text split on `|`, a `+` beside a `|` is not an AND to lose. Inside the caller's quotes
+     * the `+` is literal text and reaches OpenAlex as `%2B`, not a decoded space.
+     */
+    it.each([
+      ['display_name', 'C++|Java', 'filter=display_name%3AC%2B%2B%7CJava'],
+      [
+        'awards.funder_display_name',
+        'Erasmus+|DFG',
+        'filter=awards.funder_display_name%3AErasmus%2B%7CDFG',
+      ],
+      ['biblio.issue', '1+2|3', 'filter=biblio.issue%3A1%2B2%7C3'],
+      ['title.search', 'c++|java', 'filter=title.search%3Ac%2B%2B%7Cjava'],
+      ['doi', '10.1/a+b|10.1/c', 'filter=doi%3A10.1%2Fa%2Bb%7C10.1%2Fc'],
+      [
+        'authorships.institutions.geo.city',
+        '"Tokyo+Kyoto|Osaka"',
+        'filter=authorships.institutions.geo.city%3A%22Tokyo%2BKyoto%7COsaka%22',
+      ],
+      [
+        'raw_affiliation_strings',
+        ' !"China+Japan|Korea" ',
+        'filter=raw_affiliation_strings%3A+%21%22China%2BJapan%7CKorea%22+',
+      ],
+    ])(
+      'still sends a %s value %j holding "|" and a "+" that is not AND',
+      async (key, value, wire) => {
+        expect(await searchWith({ [key]: value })).toBe(wire);
+      },
+    );
+
+    /**
+     * A caller who wraps a comma-free value in quotes keeps its `+` as a literal character — the
+     * comma path already sent a quoted value's `+` literal, and the comma-free path now matches it.
+     * The space form the comma-free path used to send matched nothing where the literal `+` form
+     * matched (a `PRISMA+` affiliation: 31 works literal, 0 with the space).
+     */
+    it.each([
+      ['geo.city', '"A+B"', 'filter=geo.city%3A%22A%2BB%22'],
+      [
+        'raw_affiliation_strings',
+        '"PRISMA+ Cluster"',
+        'filter=raw_affiliation_strings%3A%22PRISMA%2B+Cluster%22',
+      ],
+      ['type', '"a+b"', 'filter=type%3A%22a%2Bb%22'],
+    ])('keeps "+" literal inside a caller-quoted %s value %j', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    /**
+     * The space-as-AND mix fires only on an interior space inside a `|` alternative. A space at the
+     * edge of an alternative, or on a value with no `|`, is not an AND beside an OR, so it reaches
+     * the wire as before rather than being refused.
+     */
+    it.each([
+      [
+        'authorships.author.id',
+        'A5023888391|A5014420283 ',
+        'filter=authorships.author.id%3AA5023888391%7CA5014420283+',
+      ],
+      [
+        'authorships.author.id',
+        'A5023888391| A5014420283',
+        'filter=authorships.author.id%3AA5023888391%7C+A5014420283',
+      ],
+      ['indexed_in', 'crossref pubmed', 'filter=indexed_in%3Acrossref+pubmed'],
+    ])('sends %s value %j rather than refusing its space', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    /**
+     * A `+` stays a literal character where the value is text rather than filter syntax: free-text
+     * `.search` filters (a semantic search embeds the characters it is given), and DOIs — SICI
+     * supplement DOIs carry one, and `doi:<that DOI>` matches its work only as `%2B`.
+     */
+    it.each([
+      ['title.search', 'c++', 'filter=title.search%3Ac%2B%2B'],
+      ['title.search.exact', 'dna+rna', 'filter=title.search.exact%3Adna%2Brna'],
+      ['semantic.search', 'C++ templates', 'filter=semantic.search%3AC%2B%2B+templates'],
+      [
+        'doi',
+        '10.1002/1097-0142(19940801)74:3+<1030::aid-cncr2820741510>3.0.co;2-q',
+        'filter=doi%3A10.1002%2F1097-0142%2819940801%2974%3A3%2B%3C1030%3A%3Aaid-cncr2820741510%3E3.0.co%3B2-q',
+      ],
+      [
+        'doi_starts_with',
+        '10.1002/1097-0142(19940801)74:3+',
+        'filter=doi_starts_with%3A10.1002%2F1097-0142%2819940801%2974%3A3%2B',
+      ],
+      ['awards.doi', '10.1/a+b', 'filter=awards.doi%3A10.1%2Fa%2Bb'],
+    ])('keeps the "+" in a %s value literal', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    /**
+     * Dates and URLs are text too. In a timestamp, `+hh:mm` is the UTC offset — OpenAlex reads
+     * `from_created_date:2026-10-01T00:00:00+00:00` from `%2B` and `…T00:00:00 00:00` from a raw
+     * `+`. A landing-page URL can carry a `+` of its own: W1999130958's
+     * `https://doi.org/10.1002/(sici)1097-0142(19980515)82:10+<2057::aid-cncr14>3.0.co;2-a`
+     * matches its work as `%2B` and nothing as a raw `+`. `has_pdf_url` is a boolean, not a URL.
+     */
+    it.each([
+      [
+        'from_created_date',
+        '2026-10-01T00:00:00+00:00',
+        'filter=from_created_date%3A2026-10-01T00%3A00%3A00%2B00%3A00',
+      ],
+      [
+        'to_updated_date',
+        '2026-10-01T00:00:00+05:30',
+        'filter=to_updated_date%3A2026-10-01T00%3A00%3A00%2B05%3A30',
+      ],
+      [
+        'from-created-date',
+        '2026-10-01T00:00:00+00:00',
+        'filter=from-created-date%3A2026-10-01T00%3A00%3A00%2B00%3A00',
+      ],
+      ['publication_date', '2020-01-01+x', 'filter=publication_date%3A2020-01-01%2Bx'],
+      [
+        'primary_location.landing_page_url',
+        'https://doi.org/10.1002/(sici)1097-0142(19980515)82:10+<2057::aid-cncr14>3.0.co;2-a',
+        'filter=primary_location.landing_page_url%3Ahttps%3A%2F%2Fdoi.org%2F10.1002%2F%28sici%291097-0142%2819980515%2982%3A10%2B%3C2057%3A%3Aaid-cncr14%3E3.0.co%3B2-a',
+      ],
+      [
+        'locations.landing_page_url',
+        'https://example.org/a+b',
+        'filter=locations.landing_page_url%3Ahttps%3A%2F%2Fexample.org%2Fa%2Bb',
+      ],
+    ])('keeps the "+" in a %s value literal', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    /**
+     * Exact-match text keys hold stored values with a literal `+`, and a raw `+` matches none of
+     * them: works titled `C++` (20) and the keyword `C++` match `display_name` only as `%2B`, as do
+     * 202 works in `biblio.issue` `1+2`, 3,932 works whose `awards.funder_display_name` is
+     * `Erasmus+`, and the works carrying `awards.funder_award_id` `2.05E+13`.
+     */
+    it.each([
+      ['display_name', 'C++', 'filter=display_name%3AC%2B%2B'],
+      ['biblio.issue', '1+2', 'filter=biblio.issue%3A1%2B2'],
+      ['biblio.volume', '1+2', 'filter=biblio.volume%3A1%2B2'],
+      ['biblio.first_page', '1+', 'filter=biblio.first_page%3A1%2B'],
+      ['awards.funder_display_name', 'Erasmus+', 'filter=awards.funder_display_name%3AErasmus%2B'],
+      ['awards.funder_award_id', '2.05E+13', 'filter=awards.funder_award_id%3A2.05E%2B13'],
+    ])('keeps the "+" in a %s value literal', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    it('still sends a "+" in has_pdf_url, a boolean, as the AND operator', async () => {
+      expect(await searchWith({ has_pdf_url: 'true+false' })).toBe(
+        'filter=has_pdf_url%3Atrue+false',
+      );
+    });
+
+    /**
+     * Other text-valued exact-match keys keep the AND reading, which OpenAlex applies to each of
+     * them: their stored values carry no `+` a filter could reach. No institution city holds one,
+     * `listed_in` and `indexed_in` are fixed vocabularies, and every raw affiliation string seen
+     * with a `+` also holds a comma, which sends the value quoted with its `+` literal (gh #115).
+     */
+    it.each([
+      ['geo.city', 'Tokyo+Kyoto', 'filter=geo.city%3ATokyo+Kyoto'],
+      [
+        'authorships.institutions.geo.city',
+        'Tokyo+Kyoto',
+        'filter=authorships.institutions.geo.city%3ATokyo+Kyoto',
+      ],
+      ['raw_affiliation_strings', 'China+Japan', 'filter=raw_affiliation_strings%3AChina+Japan'],
+      ['indexed_in', 'crossref+pubmed', 'filter=indexed_in%3Acrossref+pubmed'],
+      [
+        'primary_location.source.listed_in',
+        'doaj+medline',
+        'filter=primary_location.source.listed_in%3Adoaj+medline',
+      ],
+    ])('sends the "+" in a %s value as the AND operator', async (key, value, wire) => {
+      expect(await searchWith({ [key]: value })).toBe(wire);
+    });
+
+    /** A phrase holding a comma goes out quoted, its space and `+` as any other phrase's. (gh #113) */
+    it.each([
+      ['title.search.exact', 'cats, dogs', 'filter=title.search.exact%3A%22cats%2C+dogs%22'],
+      [
+        'abstract.search.exact',
+        'c++, java',
+        'filter=abstract.search.exact%3A%22c%2B%2B%2C+java%22',
+      ],
+    ])(
+      'sends a comma in a %s value inside the quoted phrase (gh #113)',
+      async (key, value, wire) => {
+        expect(await searchWith({ [key]: value })).toBe(wire);
+      },
+    );
+
+    it('carries the raw "+" on both requests of a sampled search', async () => {
+      routeFetch({ '/works': emptyList });
+      const service = await getService();
+      await service.search(
+        {
+          entityType: 'works',
+          filters: { 'authorships.institutions.country_code': 'DE+US' },
+          sample: 5,
+        },
+        createMockContext(),
+      );
+      const sent = vi.mocked(globalThis.fetch).mock.calls.map(([input]) =>
+        new URL(String(input)).search
+          .slice(1)
+          .split('&')
+          .find((pair) => pair.startsWith('filter=')),
+      );
+      expect(sent).toEqual([
+        'filter=authorships.institutions.country_code%3ADE+US',
+        'filter=authorships.institutions.country_code%3ADE+US',
+      ]);
+    });
+
+    it('sends a raw "+" from analyze()', async () => {
+      routeFetch({ '/works': () => jsonResponse({ meta: { count: 0 }, group_by: [] }) });
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'is_oa',
+          filters: { 'authorships.institutions.country_code': 'DE+US' },
+        },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe('filter=authorships.institutions.country_code%3ADE+US');
+    });
+
+    it('sends a raw "+" from autocomplete()', async () => {
+      routeFetch({ '/autocomplete/institutions': () => jsonResponse({ results: [] }) });
+      const service = await getService();
+      await service.autocomplete(
+        {
+          entityType: 'institutions',
+          query: 'technische',
+          filters: { type: 'education+facility' },
+        },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe('filter=type%3Aeducation+facility');
+    });
+  });
+
+  // --- Multi-word values on exact-match text keys (gh #115) ---
+
+  /**
+   * OpenAlex reads an unquoted space in a filter value as AND, so a multi-word name on a key it
+   * matches whole — `geo.city:New York` — asks for a city named both `New` and `York` and matches
+   * nothing, while `geo.city:"New York"` matches the 1,552 institutions there. A quote around the
+   * whole value carries `!` (`"!New York"`, every institution but those 1,552) and `|`
+   * (`"New York|Boston"`, 1,552 + 492); a quote around one `|` alternative is read as part of it,
+   * and no form ANDs a phrase with another value inside one clause. These read the `filter=` pair
+   * as the request put it on the wire.
+   */
+  describe('multi-word values on exact-match text keys (gh #115)', () => {
+    /** The `filter=` pair of the last request, as sent. */
+    function sentFilter(): string | undefined {
+      const call = vi.mocked(globalThis.fetch).mock.lastCall;
+      if (!call) throw new Error('fetch was not called');
+      return new URL(String(call[0])).search
+        .slice(1)
+        .split('&')
+        .find((pair) => pair.startsWith('filter='));
+    }
+
+    async function searchWith(
+      entityType: EntityType,
+      filters: Record<string, string>,
+    ): Promise<string | undefined> {
+      routeFetch({
+        [`/${entityType}`]: () => jsonResponse({ meta: { count: 0, per_page: 25 }, results: [] }),
+      });
+      const service = await getService();
+      await service.search({ entityType, filters }, createMockContext());
+      return sentFilter();
+    }
+
+    it.each([
+      [
+        'works',
+        'awards.funder_display_name',
+        'National Science Foundation',
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      ],
+      ['institutions', 'geo.city', 'New York', 'filter=geo.city%3A%22New+York%22'],
+      [
+        'works',
+        'authorships.institutions.geo.city',
+        'New York',
+        'filter=authorships.institutions.geo.city%3A%22New+York%22',
+      ],
+      ['institutions', 'geo.region', 'New York', 'filter=geo.region%3A%22New+York%22'],
+      [
+        'authors',
+        'last_known_institutions.geo.region',
+        'New York',
+        'filter=last_known_institutions.geo.region%3A%22New+York%22',
+      ],
+      [
+        'sources',
+        'display_name',
+        'Nature Communications',
+        'filter=display_name%3A%22Nature+Communications%22',
+      ],
+      [
+        'works',
+        'display_name',
+        'Attention Is All You Need',
+        'filter=display_name%3A%22Attention+Is+All+You+Need%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        'Harvard University',
+        'filter=raw_affiliation_strings%3A%22Harvard+University%22',
+      ],
+      [
+        'works',
+        'raw-affiliation-strings',
+        'Harvard University',
+        'filter=raw-affiliation-strings%3A%22Harvard+University%22',
+      ],
+      [
+        'works',
+        'awards.funder_award_id',
+        'DE AC02 05CH11231',
+        'filter=awards.funder_award_id%3A%22DE+AC02+05CH11231%22',
+      ],
+      ['works', 'biblio.issue', 'Supplement 1', 'filter=biblio.issue%3A%22Supplement+1%22'],
+      ['authors', 'block_key', 'j priem', 'filter=block_key%3A%22j+priem%22'],
+      [
+        'authors',
+        'parsed_longest_name.first',
+        'Mary Ann',
+        'filter=parsed_longest_name.first%3A%22Mary+Ann%22',
+      ],
+    ] as const)(
+      'on %s, sends a %s value with a space as one quoted phrase',
+      async (entityType, key, value, wire) => {
+        expect(await searchWith(entityType, { [key]: value })).toBe(wire);
+      },
+    );
+
+    /**
+     * The quote goes around the whole value, operators included: `"!New York"` and
+     * `!"New York"` both match the 141,903 institutions outside New York, and
+     * `"National Science Foundation|National Institutes of Health"` matches the works funded by
+     * either. A `+` on a key that keeps it literal stays a literal inside the phrase, and the
+     * value is quoted without its edge whitespace, which a quoted phrase would otherwise keep.
+     */
+    it.each([
+      ['institutions', 'geo.city', '!New York', 'filter=geo.city%3A%22%21New+York%22'],
+      ['institutions', 'geo.city', 'New York|Boston', 'filter=geo.city%3A%22New+York%7CBoston%22'],
+      [
+        'works',
+        'awards.funder_display_name',
+        'National Science Foundation|National Institutes of Health',
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%7CNational+Institutes+of+Health%22',
+      ],
+      ['works', 'display_name', 'C++ Primer', 'filter=display_name%3A%22C%2B%2B+Primer%22'],
+      ['institutions', 'geo.city', '  New York  ', 'filter=geo.city%3A%22New+York%22'],
+    ] as const)(
+      'on %s, sends the %s value %j as one quoted phrase',
+      async (entityType, key, value, wire) => {
+        expect(await searchWith(entityType, { [key]: value })).toBe(wire);
+      },
+    );
+
+    /**
+     * Unchanged: values with no space between words, values the caller already quoted (a leading
+     * `!` aside), every key that is not exact-match text — IDs, codes, free-text search — and a
+     * name ANDed with `+` on a key where `+` is AND, which no single clause can express.
+     */
+    it.each([
+      ['institutions', 'geo.city', 'Tokyo', 'filter=geo.city%3ATokyo'],
+      ['institutions', 'geo.city', 'Boston ', 'filter=geo.city%3ABoston+'],
+      ['institutions', 'geo.city', 'Tokyo+Kyoto', 'filter=geo.city%3ATokyo+Kyoto'],
+      ['institutions', 'geo.city', 'New York+Boston', 'filter=geo.city%3ANew+York+Boston'],
+      [
+        'works',
+        'raw_affiliation_strings',
+        'Harvard University+MIT',
+        'filter=raw_affiliation_strings%3AHarvard+University+MIT',
+      ],
+      [
+        'works',
+        'awards.funder_display_name',
+        '"National Science Foundation"',
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      ],
+      ['institutions', 'geo.city', '!"New York"', 'filter=geo.city%3A%21%22New+York%22'],
+      [
+        'works',
+        'authorships.institutions.lineage',
+        'I136199984 I27837315',
+        'filter=authorships.institutions.lineage%3AI136199984+I27837315',
+      ],
+      ['works', 'indexed_in', 'crossref pubmed', 'filter=indexed_in%3Acrossref+pubmed'],
+      ['works', 'language', 'Old English', 'filter=language%3AOld+English'],
+      ['works', 'display_name.search', 'New York', 'filter=display_name.search%3ANew+York'],
+      [
+        'works',
+        'raw_affiliation_strings.search',
+        'Harvard University',
+        'filter=raw_affiliation_strings.search%3AHarvard+University',
+      ],
+      [
+        'works',
+        'title.search.exact',
+        'machine learning',
+        'filter=title.search.exact%3Amachine+learning',
+      ],
+    ] as const)('on %s, sends the %s value %j as before', async (entityType, key, value, wire) => {
+      expect(await searchWith(entityType, { [key]: value })).toBe(wire);
+    });
+
+    /**
+     * A comma inside a phrase is part of it: raw affiliation strings almost always carry one.
+     * OpenAlex reads the comma inside the quotes as text, not as its clause separator —
+     * `raw_affiliation_strings:"Associazione Meteonetwork OdV, Milano, Italy"` matches that
+     * string's 129,488 works, beside another clause in either order — and reads the quoted value
+     * as the other phrases are read: `|` ORs (`"…, Italy|University of California, Berkeley"`,
+     * 129,488 + 92,012), a leading `!` negates the whole value, and a `+` is the literal character
+     * (`"PRISMA+ Cluster of Excellence & …, Mainz, Germany"` matches its 31 works only as `%2B`).
+     * So the value goes out as a free-text search phrase does — whole, quoted, `+` literal —
+     * trimmed as any other phrase is. (gh #115)
+     */
+    it.each([
+      [
+        'works',
+        'raw_affiliation_strings',
+        'Associazione Meteonetwork OdV, Milano, Italy',
+        'filter=raw_affiliation_strings%3A%22Associazione+Meteonetwork+OdV%2C+Milano%2C+Italy%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        'PRISMA+ Cluster of Excellence & Mainz Institute for Theoretical Physics, Johannes Gutenberg University, 55099, Mainz, Germany',
+        'filter=raw_affiliation_strings%3A%22PRISMA%2B+Cluster+of+Excellence+%26+Mainz+Institute+for+Theoretical+Physics%2C+Johannes+Gutenberg+University%2C+55099%2C+Mainz%2C+Germany%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        'Associazione Meteonetwork OdV, Milano, Italy|University of California, Berkeley',
+        'filter=raw_affiliation_strings%3A%22Associazione+Meteonetwork+OdV%2C+Milano%2C+Italy%7CUniversity+of+California%2C+Berkeley%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        '!University of California, Berkeley',
+        'filter=raw_affiliation_strings%3A%22%21University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        '  University of California, Berkeley  ',
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'works',
+        'raw_affiliation_strings',
+        'PRISMA+, Mainz|University of California, Berkeley',
+        'filter=raw_affiliation_strings%3A%22PRISMA%2B%2C+Mainz%7CUniversity+of+California%2C+Berkeley%22',
+      ],
+      [
+        'works',
+        'raw-affiliation-strings',
+        'University of California, Berkeley',
+        'filter=raw-affiliation-strings%3A%22University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'authors',
+        'last_known_institutions.geo.city',
+        'Washington, D.C.',
+        'filter=last_known_institutions.geo.city%3A%22Washington%2C+D.C.%22',
+      ],
+      [
+        'authors',
+        'parsed_longest_name.suffix',
+        'Jr., PhD',
+        'filter=parsed_longest_name.suffix%3A%22Jr.%2C+PhD%22',
+      ],
+      [
+        'works',
+        'awards.funder_display_name',
+        'Ministry of Education, Culture, Sports, Science and Technology',
+        'filter=awards.funder_display_name%3A%22Ministry+of+Education%2C+Culture%2C+Sports%2C+Science+and+Technology%22',
+      ],
+      [
+        'institutions',
+        'display_name',
+        'University of California, Berkeley',
+        'filter=display_name%3A%22University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'works',
+        'display_name',
+        'Cancer statistics, 2020',
+        'filter=display_name%3A%22Cancer+statistics%2C+2020%22',
+      ],
+      ['institutions', 'geo.city', 'New York, NY', 'filter=geo.city%3A%22New+York%2C+NY%22'],
+      ['works', 'biblio.issue', '1,2', 'filter=biblio.issue%3A%221%2C2%22'],
+      ['authors', 'block_key', 'smith, j', 'filter=block_key%3A%22smith%2C+j%22'],
+    ] as const)(
+      'on %s, sends a %s value holding a comma as one quoted phrase: %j',
+      async (entityType, key, value, wire) => {
+        expect(await searchWith(entityType, { [key]: value })).toBe(wire);
+      },
+    );
+
+    /**
+     * A comma value the caller already quoted goes out as written — `!` outside the quotes
+     * negates it as well (`!"…, Italy"`, every work but those 129,488). To OR two comma phrases,
+     * the caller wraps the whole value once (`A, B|C, D` → `"A, B|C, D"`); quoting each alternative
+     * separately leaves a `"` mid-value, which OpenAlex cannot read, so it is refused below.
+     */
+    it.each([
+      [
+        'raw_affiliation_strings',
+        '"University of California, Berkeley"',
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'raw_affiliation_strings',
+        '!"University of California, Berkeley"',
+        'filter=raw_affiliation_strings%3A%21%22University+of+California%2C+Berkeley%22',
+      ],
+      [
+        'raw_affiliation_strings',
+        'University of California, Berkeley|Stanford University, Stanford',
+        'filter=raw_affiliation_strings%3A%22University+of+California%2C+Berkeley%7CStanford+University%2C+Stanford%22',
+      ],
+    ] as const)('sends the quoted %s value %j as written', async (key, value, wire) => {
+      expect(await searchWith('works', { [key]: value })).toBe(wire);
+    });
+
+    /**
+     * Elsewhere a comma can only be read as OpenAlex's clause separator, so it still fails before
+     * any request — on keys that merely resemble a phrase key too.
+     */
+    it.each([
+      ['works', 'publication_year', '2020,2021'],
+      ['works', 'authorships.author.id', 'A5023888391,A5014420283'],
+      ['works', 'type', 'article, review'],
+      ['works', 'authorships.institutions.country_code', 'DE,FR'],
+      ['works', 'language', 'en, fr'],
+      ['works', 'primary_location.raw_type', 'Journal Article, Review'],
+      ['institutions', 'display_name_alternatives', 'UC Berkeley, Cal'],
+      ['institutions', 'geo.city_id', 'New York, NY'],
+    ] as const)(
+      'on %s, still refuses a comma in %s %j before any request',
+      async (entityType, key, value) => {
+        routeFetch({});
+        const service = await getService();
+        await expect(
+          service.search({ entityType, filters: { [key]: value } }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          message: expect.stringContaining(`Filter ${JSON.stringify(key)} value contains a comma`),
+          data: { reason: 'comma_in_filter_value', filterKey: key },
+        });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('quotes the phrase on analyze() and autocomplete() requests too', async () => {
+      routeFetch({
+        '/works': () => jsonResponse({ meta: { count: 0 }, group_by: [] }),
+        '/autocomplete/institutions': () => jsonResponse({ results: [] }),
+      });
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'is_oa',
+          filters: { 'awards.funder_display_name': 'National Science Foundation' },
+        },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe(
+        'filter=awards.funder_display_name%3A%22National+Science+Foundation%22',
+      );
+      await service.autocomplete(
+        { entityType: 'institutions', query: 'columbia', filters: { 'geo.city': 'New York' } },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe('filter=geo.city%3A%22New+York%22');
+    });
+
+    it('quotes a comma phrase on analyze() and autocomplete() requests too', async () => {
+      routeFetch({
+        '/works': () => jsonResponse({ meta: { count: 0 }, group_by: [] }),
+        '/autocomplete/institutions': () => jsonResponse({ results: [] }),
+      });
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'publication_year',
+          filters: { raw_affiliation_strings: 'Associazione Meteonetwork OdV, Milano, Italy' },
+        },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe(
+        'filter=raw_affiliation_strings%3A%22Associazione+Meteonetwork+OdV%2C+Milano%2C+Italy%22',
+      );
+      await service.autocomplete(
+        {
+          entityType: 'institutions',
+          query: 'berkeley',
+          filters: { display_name: 'University of California, Berkeley' },
+        },
+        createMockContext(),
+      );
+      expect(sentFilter()).toBe('filter=display_name%3A%22University+of+California%2C+Berkeley%22');
+    });
+  });
+
+  // --- Country and language filter values (gh #101) ---
+
+  /**
+   * OpenAlex country fields hold ISO 3166-1 alpha-2 codes and `language` holds ISO 639-1 codes;
+   * any other spelling still gets HTTP 200 and matches nothing (or, negated, everything). Each
+   * `|`/`+` segment is trimmed and converted where the mapping is certain, a country segment that
+   * cannot be a code fails before any request, and everything else is sent as given — the stored
+   * values are not clean, so a spelling that matches records today must keep matching.
+   */
+  describe('country and language filter values (gh #101)', () => {
+    const emptyList = () => jsonResponse({ meta: { count: 0, per_page: 25 }, results: [] });
+
+    async function searchWith(entityType: EntityType, filters: Record<string, string>) {
+      routeFetch({ [`/${entityType}`]: emptyList });
+      const service = await getService();
+      await service.search({ entityType, filters }, createMockContext());
+      return lastFetchUrl().searchParams.get('filter');
+    }
+
+    it.each([
+      ['institutions', 'country_code', 'de'],
+      ['institutions', 'country_code', 'XK'],
+      ['funders', 'country_code', 'EU'],
+      ['sources', 'country_code', 'NYU'],
+      ['institutions', 'country_code', 'null'],
+      ['institutions', 'country_code', '!null'],
+      ['institutions', 'country_code', 'DE|'],
+      ['institutions', 'country_code', 'https://openalex.org/countries/DE'],
+      ['sources', 'country_code', 'countries/DEU'],
+      ['works', 'language', 'ceb'],
+      ['works', 'language', 'zh-cn'],
+      ['works', 'language', 'EN-US'],
+      ['works', 'language', '中文'],
+      ['works', 'language', 'uk'],
+      ['works', 'language', 'languages/ENGLISH'],
+      ['works', 'language', 'constructor'],
+      ['works', 'language', '__proto__'],
+      ['works', 'countries_distinct_count', '276'],
+      ['institutions', 'type', 'Germany'],
+      ['works', 'title.search', 'Germany'],
+    ] as const)('sends %s %s %j unchanged', async (entityType, key, value) => {
+      expect(await searchWith(entityType, { [key]: value })).toBe(`${key}:${value}`);
+    });
+
+    it.each([
+      ['institutions', 'country_code', 'DEU', 'DE'],
+      ['institutions', 'country_code', 'deu', 'DE'],
+      ['institutions', 'country_code', '276', 'DE'],
+      ['institutions', 'country_code', 'Germany', 'DE'],
+      ['institutions', 'country_code', 'GERMANY', 'DE'],
+      ['institutions', 'country_code', 'United States', 'US'],
+      ['institutions', 'country_code', 'South Korea', 'KR'],
+      ['institutions', 'country_code', 'Türkiye', 'TR'],
+      ['institutions', 'country_code', 'UK', 'GB'],
+      ['institutions', 'country_code', 'uk', 'GB'],
+      ['institutions', 'country_code', 'Uk', 'GB'],
+      ['institutions', 'country_code', '!DEU', '!DE'],
+      ['institutions', 'country_code', 'DEU|FRA', 'DE|FR'],
+      ['institutions', 'country_code', 'DE| FR', 'DE|FR'],
+      ['institutions', 'country_code', ' DE ', 'DE'],
+      ['institutions', 'country_code', '!null|DEU', '!null|DE'],
+      ['institutions', 'country-code', 'DEU', 'DE'],
+      ['works', 'authorships.institutions.country_code', 'USA', 'US'],
+      ['works', 'authorships.countries', 'DEU', 'DE'],
+      ['works', 'institutions.country_code', 'uk', 'GB'],
+      ['authors', 'last_known_institutions.country_code', 'FRA', 'FR'],
+      ['publishers', 'country_codes', 'usa', 'US'],
+      ['works', 'language', 'eng', 'en'],
+      ['works', 'language', 'ENG', 'en'],
+      ['works', 'language', 'ger', 'de'],
+      ['works', 'language', 'deu', 'de'],
+      ['works', 'language', 'English', 'en'],
+      ['works', 'language', 'english', 'en'],
+      ['works', 'language', 'Castilian', 'es'],
+      ['works', 'language', 'Cebuano', 'ceb'],
+      ['works', 'language', '!English', '!en'],
+      ['works', 'language', 'eng| fre', 'en|fr'],
+    ] as const)('sends %s %s %j as %j', async (entityType, key, value, sent) => {
+      expect(await searchWith(entityType, { [key]: value })).toBe(`${key}:${sent}`);
+    });
+
+    /**
+     * A multi-word English name is one segment, so a `|` beside it ORs whole names: the space
+     * inside `South Korea` is part of the name, never an AND to lose.
+     */
+    it.each([
+      ['institutions', 'country_code', 'South Korea|Japan', 'KR|JP'],
+      ['institutions', 'country_code', 'United States|DE', 'US|DE'],
+      ['institutions', 'country_code', '!South Korea|New Zealand', '!KR|NZ'],
+      ['institutions', 'country_code', 'South Africa | Saudi Arabia', 'ZA|SA'],
+      ['institutions', 'country-code', 'United Kingdom|United States', 'GB|US'],
+      ['works', 'authorships.institutions.country_code', 'south korea|null', 'KR|null'],
+      ['works', 'language', 'Scottish Gaelic|English', 'gd|en'],
+      ['works', 'language', '!Central Khmer|Haitian Creole', '!km|ht'],
+    ] as const)(
+      'sends the multi-word names in %s %s %j as %j',
+      async (entityType, key, value, sent) => {
+        expect(await searchWith(entityType, { [key]: value })).toBe(`${key}:${sent}`);
+      },
+    );
+
+    /**
+     * The names OpenAlex itself displays for country groups (`key_display_name` on a country
+     * `group_by`) where they differ from every ISO name, so a name copied from an OpenAlex facet
+     * converts like an ISO one.
+     */
+    it.each([
+      ['Bosnia & Herzegovina', 'BA'],
+      ['British Virgin Islands', 'VG'],
+      ['Brunei', 'BN'],
+      ['Caribbean Netherlands', 'BQ'],
+      ['Dominican Rep.', 'DO'],
+      ['DR Congo', 'CD'],
+      ['Falkland Islands', 'FK'],
+      ['Ivory Coast', 'CI'],
+      ['Kosovo', 'XK'],
+      ['Micronesia', 'FM'],
+      ['Northern Mariana Is.', 'MP'],
+      ['Palestine', 'PS'],
+      ['Russia', 'RU'],
+      ['Saint Martin', 'MF'],
+      ['São Tomé & Príncipe', 'ST'],
+      ['Sint Maarten', 'SX'],
+      ['South Georgia & South Sandwich Is.', 'GS'],
+      ['St. Kitts & Nevis', 'KN'],
+      ['St. Vincent & Grenadines', 'VC'],
+      ['Trinidad & Tobago', 'TT'],
+      ['Turkey', 'TR'],
+      ['Turks & Caicos Islands', 'TC'],
+      ['US Virgin Islands', 'VI'],
+      ['Vatican City', 'VA'],
+    ])('converts the OpenAlex country name %j to %s', async (name, code) => {
+      expect(
+        await searchWith('works', { 'authorships.institutions.country_code': name.toLowerCase() }),
+      ).toBe(`authorships.institutions.country_code:${code}`);
+      expect(await searchWith('institutions', { country_code: `!${name}` })).toBe(
+        `country_code:!${code}`,
+      );
+    });
+
+    /** A converted `+` segment still reaches OpenAlex as the AND it spells (gh #107). */
+    it.each([
+      ['DEU+FRA', 'filter=authorships.institutions.country_code%3ADE+FR'],
+      ['!DEU+!FRA', 'filter=authorships.institutions.country_code%3A%21DE+%21FR'],
+      ['Germany + United States', 'filter=authorships.institutions.country_code%3ADE+US'],
+      ['South Korea+Japan', 'filter=authorships.institutions.country_code%3AKR+JP'],
+    ])('sends %j as an AND of alpha-2 codes', async (value, wire) => {
+      routeFetch({ '/works': emptyList });
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { 'authorships.institutions.country_code': value } },
+        createMockContext(),
+      );
+      const pair = lastFetchUrl()
+        .search.slice(1)
+        .split('&')
+        .find((p) => p.startsWith('filter='));
+      expect(pair).toBe(wire);
+    });
+
+    it.each([
+      'Germanyy',
+      '999',
+      'NULL',
+      'unknown',
+      'Narnia',
+      'DE|Germanyy',
+      '!Narnia',
+      'DEU+Narnia',
+      'toString',
+      '__proto__',
+      'DE US|FR',
+      'South Koreaa|Japan',
+      'Narnia Land|DE',
+    ])('fails country segment %j as invalid_country_code before any request', async (value) => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'institutions', filters: { type: 'education', country_code: value } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringMatching(/"country_code".*ISO 3166-1 alpha-2/),
+        data: { reason: 'invalid_country_code', filterKey: 'country_code' },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('names the segment it rejected, not the whole value', async () => {
+      routeFetch({});
+      const service = await getService();
+      const failure = service.search(
+        { entityType: 'institutions', filters: { country_code: 'DEU|Narnia' } },
+        createMockContext(),
+      );
+      await expect(failure).rejects.toMatchObject({
+        message: expect.stringContaining('"Narnia"'),
+        data: { segment: 'Narnia' },
+      });
+    });
+
+    /**
+     * A space is no operator on a country key — a segment is one code or one name — so a `|`
+     * beside it changes nothing: `DE US|FR` fails the way `DE US` does, naming that segment, and
+     * the message says how codes are joined.
+     */
+    it.each(['DE US', 'DE US|FR'])('refuses %j for its segment "DE US"', async (value) => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'institutions', filters: { country_code: value } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        message: expect.stringMatching(
+          /value "DE US" is not a country code\..* A space is part of a country name \("South Korea"\), never a separator: join codes with "\|" for OR or "\+" for AND\.$/,
+        ),
+        data: { reason: 'invalid_country_code', filterKey: 'country_code', segment: 'DE US' },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('adds no separator advice for a segment without a space', async () => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'institutions', filters: { country_code: 'DE|Germanyy' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        message: expect.not.stringContaining('separator'),
+        data: { reason: 'invalid_country_code', segment: 'Germanyy' },
+      });
+    });
+
+    it('keeps the comma pre-flight ahead of the country check', async () => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'institutions', filters: { country_code: 'Germany,France' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'comma_in_filter_value' } });
+    });
+
+    it('converts the values analyze() sends', async () => {
+      routeFetch({ '/works': () => jsonResponse({ meta: { count: 0 }, group_by: [] }) });
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'is_oa',
+          filters: { 'authorships.institutions.country_code': 'USA', language: 'English' },
+        },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe(
+        'authorships.institutions.country_code:US,language:en',
+      );
+    });
+
+    it('converts the values autocomplete() sends, and rejects there before any request', async () => {
+      routeFetch({ '/autocomplete/institutions': () => jsonResponse({ results: [] }) });
+      const service = await getService();
+      await service.autocomplete(
+        { entityType: 'institutions', query: 'technische', filters: { country_code: 'DEU' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('country_code:DE');
+
+      vi.mocked(globalThis.fetch).mockClear();
+      await expect(
+        service.autocomplete(
+          { entityType: 'institutions', query: 'technische', filters: { country_code: '999' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'invalid_country_code' } });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('carries the invalid_country_code recovery from the calling contract', async () => {
+      routeFetch({});
+      const recovery =
+        'Pass an ISO 3166-1 alpha-2 code such as DE, or null for records with no country.';
+      const error = await failThroughContract(
+        [
+          {
+            reason: 'invalid_country_code',
+            code: JsonRpcErrorCode.ValidationError,
+            when: 'A country filter segment cannot be a country code.',
+            recovery,
+          },
+        ],
+        async (ctx) => {
+          const service = await getService();
+          await service.search(
+            { entityType: 'institutions', filters: { country_code: 'Narnia' } },
+            ctx,
+          );
+        },
+      );
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_country_code', recovery: { hint: recovery } },
+      });
     });
   });
 
@@ -1307,7 +3372,7 @@ describe('OpenAlexService', () => {
       });
       const service = await getService();
       const result = await service.resolveIdentifier(
-        { entityType: 'authors', id: 'A1', scheme: 'openalex' },
+        { entityTypes: ['authors'], id: 'A1', scheme: 'openalex' },
         createMockContext(),
       );
       expect(result.results[0]).toMatchObject({
@@ -1799,6 +3864,59 @@ describe('OpenAlexService', () => {
       );
     });
 
+    /**
+     * On sources OpenAlex names a journal's publisher `host_organization_name`; `publisher` is
+     * a 400 whose ranked suggestions cannot reach it. The alias shares the sources map with the
+     * summary_stats leaves, so both kinds translate in one request. (gh #97)
+     */
+    it.each([
+      [['publisher'], 'id,display_name,host_organization_name'],
+      [['publisher', 'host_organization_name'], 'id,display_name,host_organization_name'],
+      [['publisher', 'h_index'], 'id,display_name,host_organization_name,summary_stats'],
+    ])('aliases sources select %j to host_organization_name (gh #97)', async (select, sent) => {
+      const service = await getService();
+      await service.search({ entityType: 'sources', select }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('select')).toBe(sent);
+    });
+
+    it('aliases publisher on a sources id lookup too (gh #97)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'S1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search(
+        { entityType: 'sources', id: 'S137773608', select: ['publisher'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,host_organization_name',
+      );
+    });
+
+    it.each(['works', 'publishers', 'authors', 'topics'] as const)(
+      'forwards publisher untranslated in %s select, where no field carries it (gh #97)',
+      async (entityType) => {
+        const service = await getService();
+        await service.search({ entityType, select: ['publisher'] }, createMockContext());
+        expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,publisher');
+      },
+    );
+
+    it('leaves publisher as a sources filter key, sort, and group_by untouched (gh #97)', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'sources', filters: { publisher: 'P4310320990' }, sort: 'publisher' },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('publisher:P4310320990');
+      expect(lastFetchUrl().searchParams.get('sort')).toBe('publisher');
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+      );
+      await service.analyze({ entityType: 'sources', groupBy: 'publisher' }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('group_by')).toBe('publisher');
+    });
+
     it('fails open on an unmapped field name for an aliased entity type (gh #64)', async () => {
       // #17's rule: a miss passes through untranslated so upstream's 400 names the valid fields.
       const service = await getService();
@@ -1934,6 +4052,51 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(filterParam()).toBe('id:not-an-openalex-id');
+    });
+
+    /**
+     * Upstream's `openalex` filter accepts every spelling of an OpenAlex ID — record pages, API
+     * URLs, `http://`, scheme-less, lowercase, and space-padded `|` segments — while `id` is no
+     * filter at all. The key is rewritten; the value is forwarded exactly as given. (gh #99)
+     */
+    it.each([
+      'https://openalex.org/works/W2741809807',
+      'W2741809807|https://api.openalex.org/works/W3002222772',
+      'http://openalex.org/W2741809807',
+      'openalex.org/works/W2741809807',
+      'w2741809807',
+      'W2741809807| https://openalex.org/works/W3002222772',
+    ])('rewrites id → openalex for %j and forwards the value unchanged (gh #99)', async (value) => {
+      const service = await getService();
+      await service.search({ entityType: 'works', filters: { id: value } }, createMockContext());
+      expect(filterParam()).toBe(`openalex:${value}`);
+    });
+
+    it.each([
+      ['a keyword URL', 'https://openalex.org/keywords/groundwater'],
+      ['a path that is not an entity type', 'https://openalex.org/fields/17'],
+      ['a look-alike host', 'https://notopenalex.org/works/W2741809807'],
+      ['one non-ID segment among IDs', 'W2741809807|https://openalex.org/fields/17'],
+    ])('leaves id unrewritten for %s (gh #99)', async (_label, value) => {
+      const service = await getService();
+      await service.search({ entityType: 'works', filters: { id: value } }, createMockContext());
+      expect(filterParam()).toBe(`id:${value}`);
+    });
+
+    it('rewrites a URL-form id filter on the group_by path too (gh #99)', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        jsonResponse({ meta: { count: 1, groups_count: 1 }, group_by: [] }),
+      );
+      const service = await getService();
+      await service.analyze(
+        {
+          entityType: 'works',
+          groupBy: 'publication_year',
+          filters: { id: 'https://openalex.org/works/W2741809807' },
+        },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:https://openalex.org/works/W2741809807');
     });
 
     it('does not rewrite cited_works on non-works entities (fail-open to upstream)', async () => {
@@ -2211,6 +4374,165 @@ describe('OpenAlexService', () => {
       await service.search({ entityType: 'authors', select: ['id', 'orcid'] }, createMockContext());
       expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,orcid');
     });
+  });
+
+  // --- author_list: a compact author array derived from authorships (gh #102) ---
+
+  describe('author_list (gh #102)', () => {
+    /**
+     * Authorships shaped the ways OpenAlex returns them: a full entry, one with no ORCID key,
+     * one with `orcid: null`, one whose `author` is missing outright, and a display name
+     * carrying an HTML entity the provider-text pass decodes.
+     */
+    const upstreamAuthorships = [
+      {
+        author_position: 'first',
+        author: {
+          id: 'https://openalex.org/A5010999391',
+          display_name: 'Shumin Ren',
+          orcid: 'https://orcid.org/0000-0002-1376-1891',
+        },
+        institutions: [{ id: 'https://openalex.org/I1', display_name: 'Some University' }],
+        raw_author_name: 'S. Ren',
+      },
+      { author_position: 'middle', author: { id: 'https://openalex.org/A2', display_name: 'B' } },
+      {
+        author_position: 'middle',
+        author: { id: 'https://openalex.org/A3', display_name: 'Jos&eacute; Ruiz', orcid: null },
+      },
+      { author_position: 'last', institutions: [] },
+    ];
+    const expectedAuthorList = [
+      {
+        id: 'https://openalex.org/A5010999391',
+        display_name: 'Shumin Ren',
+        orcid: 'https://orcid.org/0000-0002-1376-1891',
+      },
+      { id: 'https://openalex.org/A2', display_name: 'B', orcid: null },
+      { id: 'https://openalex.org/A3', display_name: 'José Ruiz', orcid: null },
+      { id: null, display_name: null, orcid: null },
+    ];
+    const work = { id: 'https://openalex.org/W1', display_name: 'A work' };
+
+    function serveWorks(results: Record<string, unknown>[]): void {
+      routeFetch({
+        '/works': () => jsonResponse({ meta: { count: results.length, per_page: 25 }, results }),
+        '/works/W1': () => jsonResponse(results[0]),
+      });
+    }
+
+    it('requests authorships and returns author_list in its place on a list search', async () => {
+      serveWorks([{ ...work, authorships: upstreamAuthorships }]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['author_list'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,authorships');
+      expect(result.results).toEqual([{ ...work, author_list: expectedAuthorList }]);
+    });
+
+    it('returns author_list in place of authorships on an id lookup', async () => {
+      serveWorks([{ ...work, authorships: upstreamAuthorships }]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', id: 'W1', select: ['author_list'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().pathname).toBe('/works/W1');
+      expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,authorships');
+      expect(result.results).toEqual([{ ...work, author_list: expectedAuthorList }]);
+    });
+
+    it.each([['authorships'], ['authors']])(
+      'returns author_list beside authorships from one upstream field when %s is selected too',
+      async (alias) => {
+        serveWorks([{ ...work, authorships: upstreamAuthorships }]);
+        const service = await getService();
+        const result = await service.search(
+          { entityType: 'works', select: ['author_list', alias, 'doi'] },
+          createMockContext(),
+        );
+        expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,authorships,doi');
+        const [record] = result.results;
+        expect(record?.author_list).toEqual(expectedAuthorList);
+        expect(record?.authorships).toHaveLength(upstreamAuthorships.length);
+      },
+    );
+
+    it('returns author_list beside the full record for ["*", "author_list"]', async () => {
+      serveWorks([{ ...work, authorships: upstreamAuthorships, doi: 'https://doi.org/10.1/x' }]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['*', 'author_list'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.has('select')).toBe(false);
+      expect(result.results[0]).toMatchObject({ author_list: expectedAuthorList });
+      expect(result.results[0]?.authorships).toHaveLength(upstreamAuthorships.length);
+    });
+
+    it.each([
+      ['the default projection', undefined],
+      ['["*"]', ['*']],
+      ['an explicit authorships', ['authorships']],
+    ])('adds no author_list under %s', async (_label, select) => {
+      serveWorks([{ ...work, authorships: upstreamAuthorships }]);
+      const service = await getService();
+      const result = await service.search({ entityType: 'works', select }, createMockContext());
+      expect(result.results[0]).not.toHaveProperty('author_list');
+      expect(lastFetchUrl().searchParams.get('select') ?? '').not.toContain('author_list');
+    });
+
+    it('returns an empty author_list for an empty authorships array', async () => {
+      serveWorks([{ ...work, authorships: [] }]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['author_list'] },
+        createMockContext(),
+      );
+      expect(result.results).toEqual([{ ...work, author_list: [] }]);
+    });
+
+    it('derives no author_list from a record OpenAlex returned without authorships', async () => {
+      serveWorks([work]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['author_list'] },
+        createMockContext(),
+      );
+      expect(result.results).toEqual([work]);
+    });
+
+    it('derives author_list and abstract on one record', async () => {
+      serveWorks([
+        {
+          ...work,
+          authorships: upstreamAuthorships.slice(0, 1),
+          abstract_inverted_index: { Hello: [0], world: [1] },
+        },
+      ]);
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['abstract', 'author_list'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,abstract_inverted_index,authorships',
+      );
+      expect(result.results).toEqual([
+        { ...work, abstract: 'Hello world', author_list: expectedAuthorList.slice(0, 1) },
+      ]);
+    });
+
+    it.each(['authors', 'sources', 'topics'] as const)(
+      'forwards author_list untranslated on %s, where upstream rejects it',
+      async (entityType) => {
+        const service = await getService();
+        await service.search({ entityType, select: ['author_list'] }, createMockContext());
+        expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,author_list');
+      },
+    );
   });
 
   // --- Curated default + full-record opt-out (gh #29) ---
@@ -3315,6 +5637,145 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     });
 
+    /**
+     * OpenAlex answers a semantic search whose query-embedding call failed for any reason but a
+     * timeout with HTTP 400 `Failed to embed query: <requests exception>` — and with HTTP 400
+     * `Semantic search is not configured` when its embedder is unset. Neither is the caller's
+     * mistake, and the exception text names the embedding service's host. Both are relabelled
+     * an outage under a message of the server's own; every outage of a semantic request carries
+     * the retry-or-keyword hint. Bodies follow ourresearch/openalex-elastic-api@0cba1f8
+     * `core/semantic_search.py` and `app.py`. (gh #96)
+     */
+    describe('semantic embedding failures (gh #96)', () => {
+      const EMBED_429 =
+        'Failed to embed query: 429 Client Error: Too Many Requests for url: https://embed.example.com/ai-gateway/mlflow/v1/embeddings';
+      const EMBED_CONNECTION =
+        "Failed to embed query: HTTPSConnectionPool(host='embed.example.com', port=443): Max retries exceeded with url: /ai-gateway/mlflow/v1/embeddings (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f>: Failed to establish a new connection: [Errno 111] Connection refused'))";
+      const BUSY =
+        'Semantic search is busy (the query embedding timed out). Please retry in a minute.';
+
+      /** Answer every request with `status` and an OpenAlex error envelope carrying `message`. */
+      function answer(status: number, message: string, error = 'Invalid query parameters error.') {
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(jsonResponse({ error, message }, status)),
+        );
+      }
+
+      async function search(searchMode: 'semantic' | 'keyword') {
+        vi.useFakeTimers();
+        const service = await getService();
+        const outcome = service
+          .search(
+            { entityType: 'works', query: 'graph neural networks for molecules', searchMode },
+            createMockContext(),
+          )
+          .then(
+            () => {
+              throw new Error('expected the search to fail');
+            },
+            (error: unknown) => error as McpErrorShape,
+          );
+        await vi.runAllTimersAsync();
+        return outcome;
+      }
+
+      interface McpErrorShape {
+        code: number;
+        data: Record<string, unknown> & { recovery?: { hint?: string } };
+        message: string;
+      }
+
+      it.each([
+        ['an embedding-service 429', EMBED_429],
+        ['an embedding-service connection failure', EMBED_CONNECTION],
+        ['an unconfigured embedder', 'Semantic search is not configured'],
+      ])('relabels %s at HTTP 400 as an outage with the semantic hint', async (_label, message) => {
+        answer(400, message);
+        const { SEMANTIC_UNAVAILABLE_HINT } = await import(
+          '@/services/openalex/openalex-service.js'
+        );
+
+        const error = await search('semantic');
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: expect.stringMatching(
+            /^OpenAlex could not embed the query for semantic search\. The failure is upstream; the request itself is valid\./,
+          ),
+          data: {
+            reason: 'upstream_unavailable',
+            recovery: { hint: SEMANTIC_UNAVAILABLE_HINT },
+            upstreamMessage: message,
+            upstreamError: 'Invalid query parameters error.',
+            responseBody: JSON.stringify({ error: 'Invalid query parameters error.', message }),
+          },
+        });
+        expect(error.message).not.toContain('embed.example.com');
+        expect(error.message).not.toContain(message);
+        // Retried like every other outage: three attempts, then the classified failure.
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('gives a semantic 503 the semantic hint and keeps its reason', async () => {
+        answer(503, BUSY, 'Semantic search is busy');
+        const { SEMANTIC_UNAVAILABLE_HINT } = await import(
+          '@/services/openalex/openalex-service.js'
+        );
+
+        const error = await search('semantic');
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'upstream_unavailable', recovery: { hint: SEMANTIC_UNAVAILABLE_HINT } },
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      it('leaves a keyword-mode 503 to the contract recovery', async () => {
+        answer(503, 'Service Unavailable', 'Service Unavailable');
+
+        const error = await search('keyword');
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'upstream_unavailable' },
+        });
+        expect(error.data).not.toHaveProperty('recovery');
+      });
+
+      it.each([
+        [
+          'an unsupported semantic filter',
+          'semantic',
+          "Filter '_x' is not supported with semantic search. Supported filters: author.id, funders.id",
+        ],
+        [
+          'a semantic search with no query',
+          'semantic',
+          'Search query is required for semantic search',
+        ],
+        [
+          'two search methods at once',
+          'semantic',
+          'Cannot combine search.semantic with filter=title.search. Use only one search method per request.',
+        ],
+        ['a keyword-mode 400 with the embed wording', 'keyword', `${EMBED_429}`],
+        ['the embed wording anywhere but the start', 'semantic', `Query rejected. ${EMBED_429}`],
+      ] as const)('keeps %s an InvalidParams caller error', async (_label, searchMode, message) => {
+        answer(400, message);
+
+        const error = await search(searchMode);
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          message,
+          data: { reason: 'upstream_invalid_params_other' },
+        });
+        expect(error.data).not.toHaveProperty('recovery');
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+    });
+
     // --- Invalid-params 400 reason branching (gh #43) ---
 
     describe('invalid-params 400 reason branching (gh #43)', () => {
@@ -3930,6 +6391,311 @@ describe('OpenAlexService', () => {
       });
     });
 
+    // --- A filter OpenAlex serves only on a paid plan (gh #114) ---
+
+    /**
+     * OpenAlex answers a filter its paid plans gate — `created_date`, `updated_date`, and their
+     * `from_`/`to_` forms — with HTTP 429 `{"error":"Plan upgrade required", …}`. No wait clears a
+     * plan gate, so it fails on its one request under a reason and message of its own; every other
+     * 429 keeps the rate-limit handling. `CREATED_BODY` is a verbatim live capture (2026-10-18), and
+     * `planBody` rebuilds the same shape for the other clauses OpenAlex refused.
+     */
+    describe('plan-gated filters (gh #114)', () => {
+      const CREATED_BODY =
+        '{"error":"Plan upgrade required","message":"The \\"from_created_date:2026-10-01\\" filter is part of daily sync, which comes with the Member+ and Partner plans. See https://help.openalex.org/access/sync/ for details."}';
+      const CREATED_MESSAGE =
+        "The `from_created_date` filter needs a paid OpenAlex plan, which this server's OpenAlex access does not include.";
+      const UNNAMED_MESSAGE =
+        "A filter in this request needs a paid OpenAlex plan, which this server's OpenAlex access does not include.";
+
+      /** The upstream body for a plan-gated filter `clause`, as OpenAlex words it. */
+      function planBody(clause: string): string {
+        return JSON.stringify({
+          error: 'Plan upgrade required',
+          message: `The "${clause}" filter is part of daily sync, which comes with the Member+ and Partner plans. See https://help.openalex.org/access/sync/ for details.`,
+        });
+      }
+
+      function status429(body: string): Response {
+        return new Response(body, { status: 429, statusText: 'Too Many Requests' });
+      }
+
+      interface Failure {
+        code: number;
+        data: Record<string, unknown>;
+        message: string;
+      }
+
+      /** Run a works search under fake timers, so a retried failure settles without real waits. */
+      async function failSearch(filters: Record<string, string>): Promise<Failure> {
+        vi.useFakeTimers();
+        const service = await getService();
+        const outcome = service.search({ entityType: 'works', filters }, createMockContext()).then(
+          () => {
+            throw new Error('expected the search to fail');
+          },
+          (error: unknown) => error as Failure,
+        );
+        await vi.runAllTimersAsync();
+        return outcome;
+      }
+
+      it('fails on its one request under its own reason and message, keeping the body', async () => {
+        routeFetch({ '/works': () => status429(CREATED_BODY) });
+
+        const error = await failSearch({ from_created_date: '2026-10-01' });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.Forbidden,
+          message: CREATED_MESSAGE,
+          data: {
+            reason: 'upstream_plan_required',
+            retryable: false,
+            statusCode: 429,
+            upstreamError: 'Plan upgrade required',
+            upstreamMessage: JSON.parse(CREATED_BODY).message,
+            responseBody: CREATED_BODY,
+          },
+        });
+        expect(error.data).not.toHaveProperty('retryAttempts');
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+        expect(lastFetchUrl().searchParams.get('filter')).toBe('from_created_date:2026-10-01');
+      });
+
+      it.each([
+        ['from_created_date', 'from_created_date:2026-10-01T00:00:00+00:00'],
+        ['to_created_date', 'to_created_date:2026-10-01'],
+        ['from_updated_date', 'from_updated_date:2026-10-01T00:00:00+00:00'],
+        ['to_updated_date', 'to_updated_date:2026-10-01'],
+        ['created_date', 'created_date:2026-10-01'],
+        ['updated_date', 'updated_date:2026-10-01'],
+      ])('names %s, the filter the upstream message refused', async (key, clause) => {
+        routeFetch({ '/works': () => status429(planBody(clause)) });
+
+        const error = await failSearch({ [key]: clause.slice(key.length + 1) });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.Forbidden,
+          message: CREATED_MESSAGE.replace('from_created_date', key),
+          data: { reason: 'upstream_plan_required', retryable: false },
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['no message', JSON.stringify({ error: 'Plan upgrade required' })],
+        [
+          'a message in another shape',
+          JSON.stringify({
+            error: 'Plan upgrade required',
+            message: 'Daily sync comes with the Member+ and Partner plans.',
+          }),
+        ],
+        ['a clause whose name is not a field name', planBody('x\n# Forged heading:2026-10-01')],
+        ['a clause whose name holds a backtick', planBody('a`b:2026-10-01')],
+      ])('falls back to an unnamed filter on %s', async (_label, body) => {
+        routeFetch({ '/works': () => status429(body) });
+
+        const error = await failSearch({ from_created_date: '2026-10-01' });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.Forbidden,
+          message: UNNAMED_MESSAGE,
+          data: { reason: 'upstream_plan_required', retryable: false, responseBody: body },
+        });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('still classifies a body cut to the capture limit, and names its filter', async () => {
+        const value = Array.from(
+          { length: 60 },
+          (_, i) => `2026-10-${String(i).padStart(2, '0')}`,
+        ).join('|');
+        const body = planBody(`from_created_date:${value}`);
+        routeFetch({ '/works': () => status429(body) });
+
+        const error = await failSearch({ from_created_date: value });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.Forbidden,
+          message: CREATED_MESSAGE,
+          data: { reason: 'upstream_plan_required', upstreamError: 'Plan upgrade required' },
+        });
+        // The framework keeps the head and tail of an over-limit body; the cut is what reaches us.
+        expect(error.data.responseBody).toMatch(/^\{"error":"Plan upgrade required".*elided\]…/s);
+        expect(body.length).toBeGreaterThan(String(error.data.responseBody).length);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['a plain-text throttle', 'Rate limited'],
+        [
+          'a burst throttle',
+          JSON.stringify({
+            error: 'Rate limit exceeded',
+            message: 'Anonymous search is temporarily rate-limited due to heavy load.',
+          }),
+        ],
+        [
+          'a throttle whose message mentions a plan',
+          JSON.stringify({
+            error: 'Rate limit exceeded',
+            message: 'Plan upgrade required for a higher per-second rate limit.',
+          }),
+        ],
+      ])('keeps %s on the retried rate_limited reason', async (_label, body) => {
+        routeFetch({ '/works': () => status429(body) });
+
+        const error = await failSearch({ from_created_date: '2026-10-01' });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.RateLimited,
+          data: { reason: 'rate_limited', retryAttempts: 3, responseBody: body },
+        });
+        expect(error.data).not.toHaveProperty('retryable');
+        expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+      });
+
+      /** A loaded tool: its declared contract, and the call that runs the repro through it. */
+      interface LoadedTool {
+        call: () => ReturnType<typeof runToolContract>;
+        errors: readonly ErrorContract[] | undefined;
+      }
+
+      /**
+       * Every tool that sends `filters` fails the same way, with its own contract's recovery on
+       * both surfaces. Each case answers the filtered request with the plan-gated 429 and any
+       * request before it (the citation graph's seed lookup) as OpenAlex does. The tool module
+       * loads before fake timers start, so a retry's backoff would run instead of stalling.
+       */
+      describe.each<
+        [
+          name: string,
+          gatedPath: string,
+          routes: Record<string, (url: URL) => Response>,
+          load: () => Promise<LoadedTool>,
+        ]
+      >([
+        [
+          'openalex_search_entities',
+          '/works',
+          {},
+          async () => {
+            const { searchEntitiesTool } = await import(
+              '@/mcp-server/tools/definitions/search-entities.tool.js'
+            );
+            return {
+              errors: searchEntitiesTool.errors,
+              call: () =>
+                runToolContract(searchEntitiesTool, {
+                  entity_type: 'works',
+                  filters: { from_created_date: '2026-10-01' },
+                }),
+            };
+          },
+        ],
+        [
+          'openalex_analyze_trends',
+          '/works',
+          {},
+          async () => {
+            const { analyzeTrendsTool } = await import(
+              '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+            );
+            return {
+              errors: analyzeTrendsTool.errors,
+              call: () =>
+                runToolContract(analyzeTrendsTool, {
+                  entity_type: 'works',
+                  group_by: 'type',
+                  filters: { from_created_date: '2026-10-01' },
+                }),
+            };
+          },
+        ],
+        [
+          'openalex_resolve_name',
+          '/autocomplete/works',
+          {},
+          async () => {
+            const { resolveNameTool } = await import(
+              '@/mcp-server/tools/definitions/resolve-name.tool.js'
+            );
+            return {
+              errors: resolveNameTool.errors,
+              call: () =>
+                runToolContract(resolveNameTool, {
+                  query: 'cancer',
+                  entity_type: 'works',
+                  filters: { from_created_date: '2026-10-01' },
+                }),
+            };
+          },
+        ],
+        [
+          'openalex_get_citation_graph',
+          '/works',
+          { '/works/W2741809807': () => jsonResponse({ id: 'https://openalex.org/W2741809807' }) },
+          async () => {
+            const { getCitationGraphTool } = await import(
+              '@/mcp-server/tools/definitions/citation-graph.tool.js'
+            );
+            return {
+              errors: getCitationGraphTool.errors,
+              call: () =>
+                runToolContract(getCitationGraphTool, {
+                  seed_id: 'W2741809807',
+                  direction: 'cites',
+                  filters: { from_created_date: '2026-10-01' },
+                }),
+            };
+          },
+        ],
+      ])('on %s', (_name, gatedPath, routes, load) => {
+        it('fails on one gated request with the contract recovery on both surfaces', async () => {
+          routeFetch({ ...routes, [gatedPath]: () => status429(CREATED_BODY) });
+          await getService();
+          const { errors, call } = await load();
+
+          vi.useFakeTimers();
+          const pending = call();
+          await vi.runAllTimersAsync();
+          const result = await pending;
+
+          const gatedCalls = vi
+            .mocked(globalThis.fetch)
+            .mock.calls.filter(([input]) => new URL(String(input)).pathname === gatedPath);
+          expect(gatedCalls).toHaveLength(1);
+          expect(globalThis.fetch).toHaveBeenCalledTimes(Object.keys(routes).length + 1);
+
+          const recovery = errors?.find((e) => e.reason === 'upstream_plan_required')?.recovery;
+          expect(recovery).toMatch(/publication_date/);
+          expect(result.isError).toBe(true);
+          const { error } = result.structuredContent as { error: ErrorEnvelope };
+          expect(error).toMatchObject({
+            code: JsonRpcErrorCode.Forbidden,
+            message: CREATED_MESSAGE,
+            data: {
+              reason: 'upstream_plan_required',
+              retryable: false,
+              recovery: { hint: recovery },
+              upstreamError: 'Plan upgrade required',
+              upstreamMessage: JSON.parse(CREATED_BODY).message,
+              responseBody: CREATED_BODY,
+            },
+          });
+
+          const text = (result.content ?? [])
+            .map((block) => ('text' in block ? block.text : ''))
+            .join('\n');
+          expect(text).toContain(`Error: ${CREATED_MESSAGE}`);
+          expect(text).toContain(`Recovery: ${recovery}`);
+          expect(text).toContain('(reason upstream_plan_required · not retryable)');
+          expect(text).not.toMatch(/Wait several seconds|failed after/);
+        });
+      });
+    });
+
     // --- Statusless fetch failures: timeout, network, unparseable body (gh #53) ---
 
     describe('statusless fetch failures (gh #53)', () => {
@@ -4446,6 +7212,27 @@ describe('OpenAlexService', () => {
         reason: 'upstream_invalid_params',
         upstreamMessage: expect.stringContaining('Valid fields are'),
       });
+    });
+
+    it('suggests the server-derived author_list for a near-miss works select field (gh #102)', async () => {
+      const longMessage = `author_names is not a valid select field. Valid fields: ${'apc_list, '.repeat(60)}id`;
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: 'Invalid query parameters error.', message: longMessage }),
+          {
+            status: 400,
+          },
+        ),
+      );
+      const service = await getService();
+
+      const err = (await service
+        .search({ entityType: 'works', select: ['author_names'] }, createMockContext())
+        .catch((e) => e)) as { message: string };
+
+      expect(err.message).toMatch(
+        /^author_names is not a valid select field\. Did you mean: author_list,/,
+      );
     });
 
     it('marks a syntactically valid head-tail elision as truncated', async () => {

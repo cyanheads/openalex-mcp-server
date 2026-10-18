@@ -36,7 +36,14 @@ const NON_GROUPABLE_DATE_FIELDS: ReadonlySet<string> = new Set([
  * (`concepts.id` fails on authors and groups on works). The catalog stores names only, and name
  * shape does not predict the outcome — `summary_stats.2yr_mean_citedness` and `publication_year`
  * group while `fwci` and sources' `first_publication_year` do not — so the sweep is the rule.
- * Re-run it after regenerating the field catalog.
+ *
+ * The fields the 2026-10-18 catalog regeneration added were each grouped once: the lookup fields
+ * below answered "Cannot group by <field>: it is looked up from the related <entity> at query
+ * time.", and the rest grouped. The split is per field, not per prefix —
+ * `primary_location.source.listed_in` groups while `primary_location.source.is_ojs` does not, and
+ * institutions' own `geo.city` groups while works' `authorships.institutions.geo.city` does not.
+ * Probe each new field after regenerating the field catalog; the generator rewrites only the JSON,
+ * so these exclusions survive it.
  */
 const GROUP_BY_REJECTED_FIELDS: Record<EntityType, ReadonlySet<string>> = {
   works: new Set([
@@ -57,8 +64,28 @@ const GROUP_BY_REJECTED_FIELDS: Record<EntityType, ReadonlySet<string>> = {
     'related_to',
     'sustainable_development_goals.score',
     'topics_count',
+    // looked up from a related entity at query time (2026-10-18)
+    'authorships.institutions.geo.city',
+    'authorships.institutions.geo.region',
+    'funders.country_code',
+    'primary_location.source.country_code',
+    'primary_location.source.host_organization.country_code',
+    'primary_location.source.is_global_south',
+    'primary_location.source.is_high_oa_rate',
+    'primary_location.source.is_ojs',
+    'primary_location.source.is_preprint_repository',
+    'primary_location.source.summary_stats.2yr_mean_citedness',
+    'primary_location.source.summary_stats.h_index',
   ]),
-  authors: new Set(['concept.id', 'concepts.id', 'display_name', 'x_concepts.id']),
+  authors: new Set([
+    'concept.id',
+    'concepts.id',
+    'display_name',
+    'x_concepts.id',
+    // looked up from a related entity at query time (2026-10-18)
+    'last_known_institutions.geo.city',
+    'last_known_institutions.geo.region',
+  ]),
   sources: new Set([
     'apc_prices.price',
     'display_name',
@@ -69,6 +96,8 @@ const GROUP_BY_REJECTED_FIELDS: Record<EntityType, ReadonlySet<string>> = {
     'is_in_jstage_since_year',
     'last_publication_year',
     'oa_flip_year',
+    // looked up from a related entity at query time (2026-10-18)
+    'host_organization.country_code',
   ]),
   institutions: new Set(['display_name']),
   topics: new Set(['display_name']),
@@ -122,7 +151,7 @@ export const describeFieldsTool = tool('openalex_describe_fields', {
     context: z
       .enum(CONTEXTS)
       .describe(
-        'Field usage context. "filter": fields accepted in the filter param. "group_by": fields accepted in group_by — a subset of the filter set that leaves out what OpenAlex refuses to aggregate (raw dates, *.search operators, decimal scores, display_name, and external-ID fields among them). "select": fields accepted in select.',
+        'Field usage context. "filter": fields accepted in the filter param; created_date, updated_date, and their from_/to_ forms, where listed, are ones OpenAlex serves only on a paid plan, and a filter on one fails without it. "group_by": fields accepted in group_by — a subset of the filter set that leaves out what OpenAlex refuses to aggregate (raw dates, *.search operators, decimal scores, display_name, external-ID fields, and fields OpenAlex looks up from a related entity, such as primary_location.source.country_code, among them). "select": fields accepted in select.',
       ),
     query: z
       .string()
@@ -154,7 +183,8 @@ export const describeFieldsTool = tool('openalex_describe_fields', {
         ? catalogPool.filter((field) => isGroupableField(input.entity_type, field))
         : catalogPool;
 
-    const fields = input.query ? rankAllFields(input.query, pool) : pool;
+    // A copy: `pool` is the shared catalog the "Did you mean" suggestions also read.
+    const fields = input.query ? rankAllFields(input.query, pool) : [...pool];
 
     ctx.log.info('Field catalog lookup', {
       entityType: input.entity_type,

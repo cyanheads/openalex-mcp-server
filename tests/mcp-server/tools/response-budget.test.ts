@@ -23,7 +23,13 @@ import {
 } from '@/mcp-server/tools/response-budget.js';
 import type { UpstreamBudget } from '@/services/openalex/budget.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
-import { authorships, utf8Bytes, workWithAuthorships } from '../../helpers/openalex-records.js';
+import {
+  authorships,
+  slimAuthorship,
+  utf8Bytes,
+  workWithAuthorList,
+  workWithAuthorships,
+} from '../../helpers/openalex-records.js';
 
 const mockSearch = vi.fn<() => Promise<SearchResult>>();
 
@@ -165,14 +171,14 @@ describe('response budget helper (gh #72, #73)', () => {
       expect(expectModelled(result, 'Total')).toContain('> No matches');
     });
 
-    it('matches when the echo ends in a line that opens a list item', async () => {
+    it('matches when the echoed query holds a line that would open a list item', async () => {
       serve([]);
       const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         query: 'alpha\n- beta',
       });
-      // The list-item line forces a blank line before the next field; the model must follow.
-      expect(expectModelled(result, 'Total')).toContain('- beta"\n\n**Total:**');
+      // The echo JSON-encodes the query, so the break stays escaped on the echo's one line.
+      expect(expectModelled(result, 'Total')).toContain('query="alpha\\n- beta"\n**Total:**');
     });
 
     it('matches on a citation-graph page, with and without a notice', async () => {
@@ -298,6 +304,113 @@ describe('response budget helper (gh #72, #73)', () => {
       expect(items).not.toBe(record.authorships);
       expect(items?.[0]).toBe((record.authorships as unknown[])[100]);
       expect(record.authorships).toHaveLength(2932);
+    });
+  });
+
+  /**
+   * OpenAlex caps a list record at 100 authorships, so the `author_list` derived from them is
+   * capped the same way; either array at exactly 100 on a list record gets its own possibly
+   * capped window, continued by an `id` + `slice` call on that same field. (gh #102)
+   */
+  describe('possibly-capped author arrays (gh #102)', () => {
+    const measureFrame = constantFrame(1_000, 1_000);
+
+    const capWindowFor = (record: EntityRecord, field: string) => ({
+      id: bareId(record.id),
+      field,
+      offset: 0,
+      shown: 100,
+      total: 100,
+      possibly_capped: true,
+      next: {
+        tool: 'openalex_search_entities',
+        arguments: { entity_type: 'works', id: bareId(record.id), slice: { field, offset: 100 } },
+      },
+    });
+
+    it.each([
+      [99, false],
+      [100, true],
+      [101, false],
+    ])('windows a %i-entry author_list on a list record: %s', (count, capped) => {
+      const record = workWithAuthorList(1, count);
+      const page = fitRecordsToBudget({
+        records: [record],
+        entityType: 'works',
+        path: 'list',
+        select: ['author_list'],
+        measureFrame,
+      });
+
+      expect(page.results).toEqual([record]);
+      expect(page.disclosure.windows).toEqual(
+        capped ? [capWindowFor(record, 'author_list')] : undefined,
+      );
+      if (capped) expect(page.notice).toMatch(/exactly 100 authorships or author_list entries/);
+      else expect(page.notice).toBeUndefined();
+    });
+
+    it('never windows a 100-entry author_list on an id lookup', () => {
+      const page = fitRecordsToBudget({
+        records: [workWithAuthorList(1, 100)],
+        entityType: 'works',
+        path: 'lookup',
+        select: ['author_list'],
+        measureFrame,
+      });
+
+      expect(page.disclosure.windows).toBeUndefined();
+      expect(page.notice).toBeUndefined();
+    });
+
+    it('gives each capped array its own window when a record carries both', () => {
+      const record: EntityRecord = {
+        ...workWithAuthorList(1, 100, slimAuthorship),
+        authorships: authorships(100, slimAuthorship),
+      };
+      const page = fitRecordsToBudget({
+        records: [record, workWithAuthorList(2, 3)],
+        entityType: 'works',
+        path: 'list',
+        select: ['author_list', 'authorships'],
+        measureFrame,
+      });
+
+      expect(page.results).toHaveLength(2);
+      expect(page.disclosure.windows).toEqual([
+        capWindowFor(record, 'authorships'),
+        capWindowFor(record, 'author_list'),
+      ]);
+      expect(page.notice).toMatch(/^1 record\(s\) carry exactly 100/);
+    });
+
+    it('marks a windowed 100-entry author_list possibly capped, continuing on author_list', () => {
+      // ~900-byte entries, so 100 of them exceed the budget on their own.
+      const record = workWithAuthorList(1, 100, (i) => ({
+        author: {
+          id: `https://openalex.org/A${i}`,
+          display_name: `${'Collaboration Member '.repeat(40)}${i}`,
+          orcid: null,
+        },
+      }));
+      const page = fitRecordsToBudget({
+        records: [record],
+        entityType: 'works',
+        path: 'list',
+        select: ['author_list'],
+        measureFrame,
+      });
+
+      const [window] = page.disclosure.windows ?? [];
+      expect(page.disclosure.windows).toHaveLength(1);
+      expect(window).toMatchObject({ field: 'author_list', total: 100, possibly_capped: true });
+      expect(window?.shown).toBeGreaterThan(0);
+      expect(window?.shown).toBeLessThan(100);
+      expect(window?.next?.arguments).toEqual({
+        entity_type: 'works',
+        id: bareId(record.id),
+        slice: { field: 'author_list', offset: window?.shown },
+      });
     });
   });
 

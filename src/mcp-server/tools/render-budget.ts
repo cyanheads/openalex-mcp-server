@@ -23,8 +23,10 @@ function formatCountdown(seconds: number): string {
 
 /**
  * One-line budget trailer. `costUsd: 0` renders as "free" rather than `$0.0000` because it
- * carries real signal — it means the call was a singleton ID lookup, which OpenAlex does not
- * bill, so batching by ID beats paging a filtered list. The prepaid segment appears only for
+ * carries real signal — OpenAlex billed none of the call's requests: an autocomplete, or a by-ID
+ * lookup of an OpenAlex ID, DOI, or other external identifier (a keyword slug, or an ID with
+ * characters past it such as `W2741809807#x`, bills like a list request instead), so batching
+ * known IDs beats paging a filtered list. The prepaid segment appears only for
  * an account holding that balance: without it, "left today" is the whole spendable figure;
  * with it, the daily line alone reads as broke on an account that keeps serving.
  */

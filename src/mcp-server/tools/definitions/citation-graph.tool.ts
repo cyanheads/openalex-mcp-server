@@ -15,7 +15,12 @@ import {
   overBudgetOutputSchema,
   windowsOutputSchema,
 } from '@/mcp-server/tools/response-budget.js';
-import { getOpenAlexService, translateFilterKey } from '@/services/openalex/openalex-service.js';
+import { quoteCallerText } from '@/services/openalex/filter-values.js';
+import {
+  buildSearchFilter,
+  getOpenAlexService,
+  translateFilterKey,
+} from '@/services/openalex/openalex-service.js';
 
 const OPENALEX_URL_PREFIX = 'https://openalex.org/';
 /** What `meta.count` counts, in the rendered header. */
@@ -26,17 +31,18 @@ type Direction = (typeof DIRECTIONS)[number];
 
 const RESERVED_FILTER_KEYS: ReadonlySet<string> = new Set<string>(DIRECTIONS);
 
+/** The request as one line: caller text is JSON-encoded, so a line break in it stays escaped. */
 function buildCitationEcho(input: {
   seed_id: string;
   direction: Direction;
   filters?: Record<string, string> | undefined;
   sort?: string | undefined;
 }): string {
-  const parts = [`seed_id=${input.seed_id}`, `direction=${input.direction}`];
+  const parts = [`seed_id=${JSON.stringify(input.seed_id)}`, `direction=${input.direction}`];
   if (input.filters && Object.keys(input.filters).length > 0) {
     parts.push(`filters=${JSON.stringify(input.filters)}`);
   }
-  if (input.sort) parts.push(`sort=${input.sort}`);
+  if (input.sort) parts.push(`sort=${JSON.stringify(input.sort)}`);
   return parts.join(' | ');
 }
 
@@ -63,6 +69,15 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       retryable: false,
       recovery:
         "This server's daily OpenAlex budget is spent and refills at midnight UTC — retrying before then will not succeed.",
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_plan_required',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'A filter is one OpenAlex serves only on a paid plan — created_date, updated_date, or a from_/to_ form of either (HTTP 429 "Plan upgrade required").',
+      retryable: false,
+      recovery:
+        'Drop the plan-gated filter and rerun; retrying it unchanged will not succeed. To bound works by date, filter on publication_date, from_publication_date, or to_publication_date, which need no paid plan.',
       thrownBy: 'service',
     },
     {
@@ -102,17 +117,41 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     {
       reason: 'comma_in_filter_value',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator, on a field that takes no phrase. Free-text search filters (any `.search` key, such as title.search or abstract.search.exact) and fields matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, authorships.institutions.geo.city, authorships.institutions.geo.region, raw_affiliation_strings, biblio fields) are exempt: a comma there is sent quoted, as part of the phrase.',
       recovery:
-        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a phrase that contains commas into a free-text search filter such as title.search or raw_affiliation_strings.search.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_country_code',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A country filter (a key ending in country_code, country_codes, or countries) holds a segment that cannot be a country code, such as a misspelled name, an unassigned number, "unknown", or two codes joined by a space ("DE US").',
+      recovery:
+        'Pass the country as an ISO 3166-1 alpha-2 code such as DE, US, or GB (an alpha-3 code, numeric code, or English name is converted), or null for works with no country.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'mixed_and_or_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value puts "|" (OR) beside an AND operator — a "+", or a space on a field where words mean AND (a space inside a country or language name is part of the name). OpenAlex splits the value on "|" first and drops every alternative that ANDs more than one value, so no single value can carry both.',
+      recovery:
+        'Keep "|" and the AND operator in separate filter keys: OR the alternatives in this key and put the AND in a second key that reaches the same values — {"authorships.institutions.country_code": "DE|FR", "institutions.country_code": "US"} matches works with (DE or FR) and US. The filters object holds each key once, so where no second key fits, run one call per alternative instead.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent to OpenAlex as a quoted phrase — a free-text search filter, or a field matched as whole text — carries a double quote of its own, beyond an outer pair the caller wrapped the value in.',
+      recovery:
+        'Remove the double quote from the value; a phrase is matched without quoting its own text.',
       thrownBy: 'service',
     },
     {
       reason: 'upstream_invalid_params',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'OpenAlex rejected an invalid filter or sort field name (HTTP 400).',
+      when: 'OpenAlex rejected an invalid filter, select, or sort field name (HTTP 400).',
       recovery:
-        'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, or use openalex_describe_fields(entity_type, "filter") to browse valid filter fields.',
+        'The upstream message names the rejected token and suggests close matches. Pass a valid OpenAlex work ID (W…), DOI, or PMID for seed_id, and browse the valid work fields with openalex_describe_fields("works", "filter") for filters or openalex_describe_fields("works", "select") for select.',
       thrownBy: 'service',
     },
     {
@@ -147,6 +186,22 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         'Remove the reserved key from filters, or restate the relationship through direction.',
     },
     {
+      reason: 'id_type_mismatch',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'seed_id is a native OpenAlex ID of another entity type — an author, source, institution, topic, publisher, funder, or concept ID rather than a work ID.',
+      recovery:
+        "seed_id must identify a work — pass the work's OpenAlex ID (W…), DOI, or PMID. To walk the works of an author or other entity, list them first with openalex_search_entities filters.",
+      thrownBy: 'service',
+    },
+    {
+      reason: 'id_dot_segment',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'seed_id holds a `.` or `..` path segment, written plainly or percent-encoded.',
+      recovery:
+        "Pass the work's identifier itself — its OpenAlex ID (W…), DOI, or PMID — with no relative path segments.",
+      thrownBy: 'service',
+    },
+    {
       reason: 'entity_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'OpenAlex has no work matching the seed_id.',
@@ -160,7 +215,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .min(1)
       .describe(
-        'Seed work identifier. Accepts OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373" or full URL), or PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"). A PMCID is recognized too, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. Use openalex_resolve_name first if you only have a title.',
+        'Seed work identifier. Accepts OpenAlex work ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807"), DOI ("10.1038/nature12373" or full URL), or PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"). A PMCID is recognized too, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. Use openalex_resolve_name first if you only have a title.',
       ),
     direction: z
       .enum(DIRECTIONS)
@@ -171,7 +226,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Do not include cites/cited_by/related_to, nor an alias of one such as cited_works — those keys are set by the `direction` parameter.',
+        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, authorships.institutions.geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Do not include cites/cited_by/related_to, nor an alias of one such as cited_works — those keys are set by the `direction` parameter.',
       ),
     sort: z
       .string()
@@ -183,7 +238,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted. Large projections may be cut to fit the response budget (`omitted`, `windows`).',
+        'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted. `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Large projections may be cut to fit the response budget (`omitted`, `windows`).',
       ),
     per_page: z
       .number()
@@ -239,7 +294,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
           ),
       )
       .describe(
-        'Works on the citation graph in this direction. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them. Works cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
+        'Works on the citation graph in this direction. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`, and a selected `author_list` as one `{id, display_name, orcid}` entry per author. Works cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
       ),
     omitted: omittedOutputSchema,
     windows: windowsOutputSchema,
@@ -260,14 +315,14 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when no edges are returned — a first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead — when the response budget cut works, windowed an array, or ran over, and when a work carries exactly 100 authorships (possibly capped). Absent otherwise.',
+        'Guidance notice. Set when no edges are returned — a first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead — when the response budget cut works, windowed an array, or ran over, and when a work carries exactly 100 authorships or author_list entries (possibly capped). Absent otherwise.',
       ),
     budget: z
       .object({
         costUsd: z
           .number()
           .describe(
-            'USD this call spent, covering both upstream requests — the seed validation lookup (unbilled) and the graph page itself.',
+            'USD this call spent, covering both upstream requests — the seed validation lookup and the graph page itself. The seed lookup is unbilled unless seed_id carries characters past the identifier itself (`W2741809807#x` still resolves to W2741809807), which OpenAlex bills like one list request.',
           ),
         remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
         resetsInSeconds: z
@@ -312,6 +367,9 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       );
     }
 
+    // A filter value the graph search would refuse fails here, before the seed lookup's request.
+    if (input.filters) buildSearchFilter('works', input.filters);
+
     const service = getOpenAlexService();
 
     /**
@@ -330,7 +388,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     if (!seedRecord?.id) {
       throw ctx.fail(
         'entity_not_found',
-        `Could not resolve seed_id "${input.seed_id}" to an OpenAlex work ID.`,
+        `Could not resolve seed_id ${quoteCallerText(input.seed_id)} to an OpenAlex work ID.`,
         { seedId: input.seed_id },
       );
     }

@@ -18,7 +18,8 @@ import {
   overBudgetOutputSchema,
   windowsOutputSchema,
 } from '@/mcp-server/tools/response-budget.js';
-import { getOpenAlexService, translateSelectField } from '@/services/openalex/openalex-service.js';
+import { quoteCallerText } from '@/services/openalex/filter-values.js';
+import { getOpenAlexService, selectRecordKey } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 const SEMANTIC_PER_PAGE_CAP = 50;
@@ -49,29 +50,32 @@ type SearchEchoInput = {
  */
 function searchOnlyParams(input: SearchEchoInput): { name: string; rendered: string }[] {
   const parts: { name: string; rendered: string }[] = [];
-  if (input.query) parts.push({ name: 'query', rendered: `query="${input.query}"` });
+  if (input.query) parts.push({ name: 'query', rendered: `query=${JSON.stringify(input.query)}` });
   if (input.search_mode && input.search_mode !== 'keyword') {
     parts.push({ name: 'search_mode', rendered: `search_mode=${input.search_mode}` });
   }
   if (input.filters && Object.keys(input.filters).length > 0) {
     parts.push({ name: 'filters', rendered: `filters=${JSON.stringify(input.filters)}` });
   }
-  if (input.sort) parts.push({ name: 'sort', rendered: `sort=${input.sort}` });
+  if (input.sort) parts.push({ name: 'sort', rendered: `sort=${JSON.stringify(input.sort)}` });
   if (input.sample !== undefined) {
     parts.push({ name: 'sample', rendered: `sample=${input.sample}` });
   }
-  if (input.seed !== undefined) parts.push({ name: 'seed', rendered: `seed=${input.seed}` });
+  if (input.seed !== undefined) {
+    parts.push({ name: 'seed', rendered: `seed=${JSON.stringify(input.seed)}` });
+  }
   return parts;
 }
 
 /**
  * Echo the criteria that actually ran. An `id` lookup echoes `entity_type` and `id` only —
  * echoing a filter the singleton path never applied reads as confirmation that it did, which
- * is the one thing this field exists not to do.
+ * is the one thing this field exists not to do. Caller text is JSON-encoded, so a line break in
+ * it cannot start a heading or end the line the echo renders on.
  */
 function buildSearchEcho(input: SearchEchoInput): string {
   const parts = [`entity_type=${input.entity_type}`];
-  if (input.id) return [...parts, `id=${input.id}`].join(' | ');
+  if (input.id) return [...parts, `id=${JSON.stringify(input.id)}`].join(' | ');
   return [...parts, ...searchOnlyParams(input).map((part) => part.rendered)].join(' | ');
 }
 
@@ -168,7 +172,23 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'The `slice` field is `*`, or is not an array on the record at `id` — absent, null, a scalar, or an object.',
       recovery:
-        'Name a top-level array field of that record, such as authorships, referenced_works, or locations; openalex_describe_fields(entity_type, "select") lists the field names.',
+        'Name a top-level array field of that record, such as authorships, author_list, referenced_works, or locations; openalex_describe_fields(entity_type, "select") lists the field names.',
+    },
+    {
+      reason: 'id_type_mismatch',
+      code: JsonRpcErrorCode.ValidationError,
+      when: '`id` is a native OpenAlex ID whose letter names another entity type than `entity_type`, or a concept ID (C…), a type this server does not serve.',
+      recovery:
+        'Pass the entity_type the ID letter names — W works, A authors, S sources, I institutions, T topics, P publishers, F funders. A concept ID (C…) has no entity_type here; search topics for the concept by name with openalex_resolve_name instead.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'id_dot_segment',
+      code: JsonRpcErrorCode.ValidationError,
+      when: '`id` holds a `.` or `..` path segment, written plainly or percent-encoded.',
+      recovery:
+        'Pass the identifier itself — an OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN — with no relative path segments, or drop `id` and search with `query` or `filters`.',
+      thrownBy: 'service',
     },
     {
       reason: 'entity_not_found',
@@ -196,6 +216,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       thrownBy: 'service',
     },
     {
+      reason: 'upstream_plan_required',
+      code: JsonRpcErrorCode.Forbidden,
+      when: 'A filter is one OpenAlex serves only on a paid plan — created_date, updated_date, or a from_/to_ form of either (HTTP 429 "Plan upgrade required").',
+      retryable: false,
+      recovery:
+        'Drop the plan-gated filter and rerun; retrying it unchanged will not succeed. To bound works by date, filter on publication_date, from_publication_date, or to_publication_date, which need no paid plan.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       when: 'OpenAlex did not respond within the request deadline.',
@@ -207,7 +236,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, or a body that was empty, HTML, or unparseable JSON.',
+      when: 'OpenAlex was unreachable or unusable — HTTP 503, a connection failure, a body that was empty, HTML, or unparseable JSON, or a semantic search whose query embedding failed upstream (HTTP 400 `Failed to embed query:`, or semantic search not configured).',
       retryable: true,
       recovery:
         'Wait and retry; check https://openalex.org for service status if the outage persists.',
@@ -232,9 +261,33 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'comma_in_filter_value',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator.',
+      when: 'A filter value contains a comma, which collides with the OpenAlex filter separator, on a field that takes no phrase. Free-text search filters (any `.search` key, such as title.search or abstract.search.exact) and fields matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, parsed_longest_name, biblio fields) are exempt: a comma there is sent quoted, as part of the phrase.',
       recovery:
-        'Use `|` for OR within a filter value (e.g. "2020|2021"), or use a `.search` filter or the `query` parameter for free-text phrases that contain commas.',
+        'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a phrase that contains commas into a free-text search filter such as title.search or raw_affiliation_strings.search, or into the `query` parameter.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_country_code',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A country filter (a key ending in country_code, country_codes, or countries) holds a segment that cannot be a country code, such as a misspelled name, an unassigned number, "unknown", or two codes joined by a space ("DE US").',
+      recovery:
+        'Pass the country as an ISO 3166-1 alpha-2 code such as DE, US, or GB (an alpha-3 code, numeric code, or English name is converted), or null for records with no country.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'mixed_and_or_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value puts "|" (OR) beside an AND operator — a "+", or a space on a field where words mean AND (a space inside a country or language name is part of the name). OpenAlex splits the value on "|" first and drops every alternative that ANDs more than one value, so no single value can carry both.',
+      recovery:
+        'Keep "|" and the AND operator in separate filter keys: OR the alternatives in this key and put the AND in a second key that reaches the same values — on works, {"authorships.institutions.country_code": "DE|FR", "institutions.country_code": "US"} matches (DE or FR) and US. The filters object holds each key once, so where no second key fits, run one call per alternative instead.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent to OpenAlex as a quoted phrase — a free-text search filter, or a field matched as whole text — carries a double quote of its own, beyond an outer pair the caller wrapped the value in.',
+      recovery:
+        'Remove the double quote from the value; a phrase is matched without quoting its own text.',
       thrownBy: 'service',
     },
     {
@@ -294,7 +347,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807"), DOI ("10.1038/nature12373"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). An array too long for the response budget comes back as a window (`windows`); page the rest with `slice`. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807" or "https://api.openalex.org/works/W2741809807"), whose letter must name `entity_type` — W works, A authors, S sources, I institutions, T topics, P publishers, F funders; DOI ("10.1038/nature12373"; under entity_type "funders", a funder\'s Crossref Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361" — one ROR can name an institution, a funder, and a publisher, and `entity_type` picks which), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). An array too long for the response budget comes back as a window (`windows`); page the rest with `slice`. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -313,7 +366,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
+        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate ("us+gb"); inside a `.search` value, a DOI, a date (a timestamp\'s "+00:00" offset), a URL field such as landing_page_url, an exactly matched name (display_name, awards.funder_display_name — "C++", "Erasmus+"), a biblio field (issue "1+2"), or awards.funder_award_id, "+" is a literal character. A value cannot mix "|" with an AND operator — a "+", or a space between values on an ID, code, or `language` key (a space inside a country or language name is part of the name) — OpenAlex splits it on "|" first and drops every alternative that ANDs more than one value, so such a value is rejected; put the AND in a second key instead ("institutions.country_code": "US" beside "authorships.institutions.country_code": "DE|FR" on works). On a field matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, biblio fields), a space is part of the value: "New York", "!New York", and "New York|Boston" match as written, but quotes around one "|" alternative make that alternative match nothing. A comma is part of such a value too ("University of California, Berkeley" on raw_affiliation_strings): a value holding one is sent as one quoted phrase, its "+" a literal character. A value sent as a quoted phrase cannot contain a double quote of its own. A multi-word value there cannot be ANDed with another ("New York+Boston" matches nothing); to require two funders or institutions, AND their IDs (awards.funder_id, authorships.institutions.id). Country fields (keys ending in country_code, country_codes, or countries) take ISO 3166-1 alpha-2 codes ("DE"): an alpha-3 code ("DEU"), numeric code ("276"), or English name ("Germany", "South Korea") is converted, "UK" becomes "GB", and a value that cannot be a country code is rejected. A space there is part of a name, never a separator: "South Korea|Japan" ORs two countries, and "DE US" is rejected. `language` takes ISO 639-1 codes ("en"): an ISO 639-2 code ("eng") or English name ("English") is converted. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
       ),
     sort: z
       .string()
@@ -325,7 +378,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. Invalid field names produce an error identifying the rejected field. Large projections may be cut to fit the response budget (`omitted`, `windows`). Not applied with `slice`. Example: ["doi", "authorships", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. Large projections may be cut to fit the response budget (`omitted`, `windows`). Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
       ),
     per_page: z
       .number()
@@ -371,7 +424,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         field: z
           .string()
           .describe(
-            'Top-level array field to page, such as "authorships" or "referenced_works". Leave it empty to skip slicing.',
+            'Top-level array field to page, such as "authorships", "author_list", or "referenced_works". Leave it empty to skip slicing.',
           ),
         offset: z
           .number()
@@ -382,7 +435,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       })
       .optional()
       .describe(
-        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. Walks any partial array, including a possibly capped 100-authorship list.',
+        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. Walks any partial array, including a possibly capped 100-entry `authorships` or `author_list`.',
       ),
   }),
   output: z.object({
@@ -428,7 +481,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           ),
       )
       .describe(
-        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`. Additional fields depend on entity_type and select. Records cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
+        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`, and a selected `author_list` as one `{id, display_name, orcid}` entry per author. Additional fields depend on entity_type and select. Records cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
       ),
     omitted: omittedOutputSchema,
     windows: windowsOutputSchema,
@@ -449,14 +502,14 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), on every semantic search to disclose that `meta.count` is a candidate total rather than a match total, when the response budget cut records, windowed an array, or ran over, when a list record carries exactly 100 authorships (possibly capped), when a `slice` offset is past the end of its array, and when `slice` was passed with `select`, which it replaces. Absent otherwise.',
+        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), on every semantic search to disclose that `meta.count` is a candidate total rather than a match total, when the response budget cut records, windowed an array, or ran over, when a list record carries exactly 100 authorships or author_list entries (possibly capped), when a `slice` offset is past the end of its array, and when `slice` was passed with `select`, which it replaces. Absent otherwise.',
       ),
     budget: z
       .object({
         costUsd: z
           .number()
           .describe(
-            'USD this call spent. 0 for an `id` lookup — OpenAlex does not bill single-entity fetches, so batching known IDs beats paging a filtered list.',
+            'USD this call spent. 0 for an `id` lookup by an OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN — OpenAlex does not bill those single-entity fetches, so batching known IDs beats paging a filtered list. OpenAlex bills like one list request a keyword looked up by its slug, an `id` carrying characters past the identifier itself (`W2741809807#x` still returns W2741809807), and a funder looked up by its Funder Registry DOI.',
           ),
         remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
         resetsInSeconds: z
@@ -676,15 +729,17 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       });
 
     let page: BudgetedPage;
-    if (slice) {
-      // The one-field projection lands under the canonical key — `authors` arrives as `authorships`.
-      const field = translateSelectField(input.entity_type, slice.field);
+    // A slice without an `id` was refused as `slice_without_id`, so `input.id` only narrows here.
+    if (slice && input.id) {
+      // The one-field projection lands under its record key — `authors` arrives as `authorships`,
+      // and `author_list` as itself.
+      const field = selectRecordKey(input.entity_type, slice.field);
       const [record] = result.results;
       const items = record?.[field];
       if (!record || !Array.isArray(items)) {
         throw ctx.fail(
           'slice_field_not_array',
-          `\`${slice.field}\` is not an array on the record at ${input.id}.`,
+          `${quoteCallerText(slice.field)} is not an array on the record at ${quoteCallerText(input.id)}.`,
           { field: slice.field, id: input.id },
         );
       }

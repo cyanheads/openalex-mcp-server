@@ -6,14 +6,9 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Mock the service module so tests don't need a live OpenAlex connection.
-// The describe-fields tool uses getFieldCatalog() from the service, so we
-// forward the real field catalog from the JSON source file.
+// The tool reads the real catalog through the service's getFieldCatalog(), which needs no
+// OpenAlex connection: the generated JSON plus the fields the server derives itself.
 import fieldCatalog from '@/services/openalex/field-catalog.json' with { type: 'json' };
-
-vi.mock('@/services/openalex/openalex-service.js', () => ({
-  getFieldCatalog: () => fieldCatalog,
-}));
 
 const { describeFieldsTool } = await import(
   '@/mcp-server/tools/definitions/describe-fields.tool.js'
@@ -53,10 +48,28 @@ describe('describeFieldsTool', () => {
 
       expect(result.context).toBe('select');
       expect(result.total).toBeGreaterThan(0);
-      // works select pool (~58) is far smaller than the filter pool (206)
+      // works select pool (~63) is far smaller than the filter pool (225)
       expect(result.total).toBeLessThan(100);
       expect(result.fields).toContain('id');
       expect(result.fields).toContain('display_name');
+    });
+
+    it('returns a fields list the caller can change without changing the catalog', async () => {
+      for (const context of ['filter', 'select'] as const) {
+        const input = describeFieldsTool.input.parse({ entity_type: 'works', context });
+        const first = await describeFieldsTool.handler(input, createMockContext());
+        const before = [...first.fields];
+
+        first.fields.splice(0, first.fields.length, 'changed');
+        try {
+          const second = await describeFieldsTool.handler(input, createMockContext());
+          expect(second.fields).toEqual(before);
+          expect(second.total).toBe(before.length);
+        } finally {
+          // A list that is the catalog itself is put back, so that regression fails here alone.
+          first.fields.splice(0, first.fields.length, ...before);
+        }
+      }
     });
 
     it('excludes non-groupable fields from group_by — a strict subset of filter (gh #42)', async () => {
@@ -127,6 +140,55 @@ describe('describeFieldsTool', () => {
       expect(sourcesFilter.fields).toContain('text.search');
       expect(sourcesSelect.fields).toContain('is_preprint_repository');
       expect(authorsFilter.fields).toContain('last_known_authorships.institutions.lineage');
+    });
+
+    /**
+     * `author_list` is a field this server derives, so it is listed in code beside the
+     * generated JSON, which no regeneration will ever give it. (gh #102)
+     */
+    it('lists author_list for works select, on both surfaces, and nowhere else (gh #102)', async () => {
+      const ctx = createMockContext();
+      const select = await describeFieldsTool.handler(
+        describeFieldsTool.input.parse({
+          entity_type: 'works',
+          context: 'select',
+          query: 'author',
+        }),
+        ctx,
+      );
+      expect(select.fields).toContain('author_list');
+      expect(select.total).toBe(fieldCatalog.works.select.length + 1);
+      const text = (describeFieldsTool.format?.(select) ?? [])
+        .map((b) => ('text' in b ? b.text : ''))
+        .join('\n');
+      expect(text).toMatch(/^- author_list$/m);
+      expect(text).toContain(`— ${fieldCatalog.works.select.length + 1} valid fields`);
+
+      for (const [entityType, context] of [
+        ['works', 'filter'],
+        ['works', 'group_by'],
+        ['authors', 'select'],
+        ['sources', 'select'],
+      ] as const) {
+        const result = await describeFieldsTool.handler(
+          describeFieldsTool.input.parse({ entity_type: entityType, context }),
+          ctx,
+        );
+        expect(result.fields, `${entityType}/${context}`).not.toContain('author_list');
+      }
+    });
+
+    it('lists no select alias, publisher included, in any sources context (gh #97)', async () => {
+      const ctx = createMockContext();
+      for (const context of ['filter', 'group_by', 'select'] as const) {
+        const result = await describeFieldsTool.handler(
+          describeFieldsTool.input.parse({ entity_type: 'sources', context }),
+          ctx,
+        );
+        for (const alias of ['publisher', 'h_index', 'i10_index', '2yr_mean_citedness']) {
+          expect(result.fields).not.toContain(alias);
+        }
+      }
     });
 
     it('keeps is_preprint_repository out of group_by, where upstream 500s on it (gh #56)', async () => {
@@ -221,14 +283,17 @@ describe('describeFieldsTool', () => {
       funders: ['awards_count', 'ror'],
     };
 
-    /** group_by view size per entity type after the sweep — every other listed field grouped. */
+    /**
+     * group_by view size per entity type after the sweep and the 2026-10-18 regeneration (gh #104)
+     * — every other listed field grouped.
+     */
     const GROUP_BY_TOTALS: Record<string, number> = {
-      works: 160,
-      authors: 33,
-      sources: 32,
-      institutions: 28,
+      works: 165,
+      authors: 36,
+      sources: 36,
+      institutions: 33,
       topics: 9,
-      keywords: 4,
+      keywords: 6,
       publishers: 19,
       funders: 20,
     };
@@ -260,6 +325,108 @@ describe('describeFieldsTool', () => {
       },
     );
 
+    /**
+     * Fields the 2026-10-18 regeneration added. Each one the group_by view could list was grouped
+     * live once: the lookup fields answered HTTP 400 ("Cannot group by …: it is looked up from the
+     * related … at query time") and the rest grouped. Text-search operators are excluded by rule
+     * and were not probed. (gh #104)
+     */
+    const NEW_FILTERS_GROUPED: Record<string, string[]> = {
+      works: [
+        'best_oa_location.source.listed_in',
+        'locations.source.listed_in',
+        'primary_location.source.listed_in',
+        'study_designs.id',
+        'volume.id',
+      ],
+      authors: ['topics.domain.id', 'topics.field.id', 'topics.subfield.id'],
+      sources: ['listed_in', 'topics.domain.id', 'topics.field.id', 'topics.subfield.id'],
+      institutions: [
+        'geo.city',
+        'geo.region',
+        'topics.domain.id',
+        'topics.field.id',
+        'topics.subfield.id',
+      ],
+      keywords: ['primary_topic.id', 'topics.id'],
+    };
+    const NEW_FILTERS_REFUSED: Record<string, string[]> = {
+      works: [
+        'authorships.institutions.geo.city',
+        'authorships.institutions.geo.region',
+        'funders.country_code',
+        'primary_location.source.country_code',
+        'primary_location.source.host_organization.country_code',
+        'primary_location.source.is_global_south',
+        'primary_location.source.is_high_oa_rate',
+        'primary_location.source.is_ojs',
+        'primary_location.source.is_preprint_repository',
+        'primary_location.source.summary_stats.2yr_mean_citedness',
+        'primary_location.source.summary_stats.h_index',
+        // text-search operators, excluded by rule
+        'raw_affiliation_strings.search.exact',
+        'title_abstract_keywords.search',
+        'title_abstract_keywords.search.exact',
+      ],
+      authors: ['last_known_institutions.geo.city', 'last_known_institutions.geo.region'],
+      sources: ['host_organization.country_code'],
+    };
+
+    it.each(['works', 'authors', 'sources', 'institutions', 'keywords'])(
+      'lists the regenerated %s filter fields, and offers only the groupable ones to group_by (gh #104)',
+      async (entityType) => {
+        const ctx = createMockContext();
+        const [filter, groupBy] = await Promise.all(
+          (['filter', 'group_by'] as const).map((context) =>
+            describeFieldsTool.handler(
+              describeFieldsTool.input.parse({ entity_type: entityType, context }),
+              ctx,
+            ),
+          ),
+        );
+
+        for (const field of NEW_FILTERS_GROUPED[entityType] ?? []) {
+          expect(filter?.fields, `${field} missing from ${entityType} filter`).toContain(field);
+          expect(groupBy?.fields, `${field} groups but is not offered`).toContain(field);
+        }
+        for (const field of NEW_FILTERS_REFUSED[entityType] ?? []) {
+          expect(filter?.fields, `${field} missing from ${entityType} filter`).toContain(field);
+          expect(groupBy?.fields, `${field} is refused but offered`).not.toContain(field);
+        }
+      },
+    );
+
+    it('lists the regenerated select fields (gh #104)', async () => {
+      const ctx = createMockContext();
+      const select = (entity_type: string) =>
+        describeFieldsTool.handler(
+          describeFieldsTool.input.parse({ entity_type, context: 'select' }),
+          ctx,
+        );
+      expect((await select('works')).fields).toEqual(
+        expect.arrayContaining([
+          'rerank_score',
+          'study_designs',
+          'sustainable_development_goals_aurora',
+          'volume',
+        ]),
+      );
+      expect((await select('authors')).fields).toContain('observed_orcids');
+      expect((await select('sources')).fields).toEqual(
+        expect.arrayContaining(['apc_usd_by_year', 'listed_in']),
+      );
+      expect((await select('topics')).fields).toContain('legacy_keywords');
+      expect((await select('keywords')).fields).toEqual(
+        expect.arrayContaining([
+          'description',
+          'display_name_alternatives',
+          'ids',
+          'primary_topic',
+          'topics',
+        ]),
+      );
+    });
+
     it('keeps a field rejected on one entity type listed where it groups (gh #86)', async () => {
       // concepts.id 400s as an authors group_by key but groups works, sources, and institutions.
       const ctx = createMockContext();
@@ -289,7 +456,7 @@ describe('describeFieldsTool', () => {
         .map((b) => ('text' in b ? b.text : ''))
         .join('\n');
 
-      expect(text).toContain('**works** / **group_by** — 160 valid fields');
+      expect(text).toContain('**works** / **group_by** — 165 valid fields');
       expect(text).not.toMatch(/^- fwci$/m);
       expect(text).toMatch(/^- publication_year$/m);
     });
@@ -408,7 +575,7 @@ describe('describeFieldsTool', () => {
       expect(result.fields.length).toBe(result.total);
     });
 
-    it('withholds nothing from the 206-field works/filter pool (gh #63)', async () => {
+    it('withholds nothing from the 225-field works/filter pool (gh #63)', async () => {
       const ctx = createMockContext();
       const input = describeFieldsTool.input.parse({
         entity_type: 'works',

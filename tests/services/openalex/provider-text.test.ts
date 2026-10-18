@@ -1,8 +1,9 @@
 /**
  * @fileoverview Property tests for the provider-text markup scanner: on tag-dense random input
  * its single linear pass must equal what repeating a regex replacement until nothing changes
- * produces, and with comments or CDATA/instruction/line-break delimiters mixed in it must leave
- * nothing to strip and be idempotent. Delimiter fixtures follow the property tests.
+ * produces, and with comments, CDATA/instruction/line-break delimiters, or MathType lines mixed
+ * in it must leave nothing to strip and be idempotent. Delimiter and MathType fixtures follow the
+ * property tests.
  * @module services/openalex/provider-text.test
  */
 
@@ -29,33 +30,27 @@ function rewriteTag(tag: string, closing: string, rawName: string): string {
 /**
  * Regex oracle for the tag rules (the inputs it checks carry no comments): rewrite every tag,
  * left to right, until a pass changes nothing — quadratic on deep nesting, which is fine at test
- * sizes.
+ * sizes — then, when the result holds a block tag's break, trim each paragraph and keep one break
+ * between them, once, as the scanner does. The inputs carry no line breaks, so every `\n\n` left
+ * came from a block tag. Trimming only at the end matters both ways: a break a later pass removes
+ * leaves no trimming behind, and a break a later pass brings to an edge or beside another is
+ * still trimmed.
  */
 function reference(text: string): string {
   let t = text;
   let prev: string;
   do {
     prev = t;
-    let hadBlock = false;
-    let rewritten = '';
-    let copied = 0;
-    for (const match of t.matchAll(TAG)) {
-      const [tag, closing = '', rawName = ''] = match;
-      const replacement = rewriteTag(tag, closing, rawName);
-      if (replacement === '\n\n') hadBlock = true;
-      rewritten += t.slice(copied, match.index) + replacement;
-      copied = match.index + tag.length;
-    }
-    t = rewritten + t.slice(copied);
-    if (hadBlock) {
-      t = t
-        .split('\n\n')
-        .map((p) => p.trim())
-        .filter(Boolean)
-        .join('\n\n');
-    }
+    t = t.replace(TAG, (tag, closing: string, rawName: string) =>
+      rewriteTag(tag, closing, rawName),
+    );
   } while (t !== prev);
-  return t;
+  if (!t.includes('\n\n')) return t;
+  return t
+    .split('\n\n')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 const TAG_ATOMS = [
@@ -100,13 +95,37 @@ const DELIMITER_ATOMS = [
   String.raw`\n`,
   '\\',
   'n',
+  // gh #92: MathType MTEF lines, terminators, and fragments that re-form a header.
+  '% MathType!MTEF!2!1!+- ',
+  '%MathType!MTEF!2!1!+-',
+  '% MathType!Translator!2!1!AMS LaTeX.tdl!TeX -- AMS-LaTeX! ',
+  '% MathType!End!2!1! ',
+  '% feaagCart1ev2 ',
+  '%aB9+-',
+  '% ',
+  '%',
+  '!44A1!',
+  '!3BD8',
+  '% !4DCA!',
+  '% Math',
+  'Type!MTEF!2!1!+-',
+  '\n',
+  // gh #110: an instruction target that a no-break space ends, before a block tag.
+  ' ',
+  '<?CDATA ',
+  '<?MML ',
+  '<?MML',
 ];
 
-/** Deterministic random strings built from `atoms`. */
+/**
+ * Deterministic random strings built from `atoms`. The multiply is `Math.imul`: a plain `*` of
+ * a 31-bit seed overflows 2^53, rounds, and falls into a short cycle that repeats a few hundred
+ * strings.
+ */
 function* randomInputs(atoms: string[], count: number) {
   let seed = 20260923;
   const random = () => {
-    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
     return seed / 0x7fffffff;
   };
   for (let n = 0; n < count; n++) {
@@ -127,19 +146,102 @@ const LITERAL_NEWLINE = /(?<!\\)\\n(?![A-Za-z])/;
 const MML_SPAN_CAP = 128;
 
 /**
- * Whether `text` holds an `<?MML` instruction another pass would remove: its target, a
- * separator, then a `?>` within the span cap with no other `<?` before it.
+ * How long a span reads once paragraphs are trimmed: a whitespace run holding a blank line
+ * becomes that one paragraph break, and each code point counts once.
  */
-function hasRemovableMml(text: string): boolean {
+const trimmedLength = (span: string) =>
+  [...span.replace(/\s+/g, (run) => (run.includes('\n\n') ? '\n\n' : run))].length;
+
+/**
+ * How long each `<?MML` instruction in `text` that another pass could close reads once
+ * paragraphs are trimmed: its target, a separator (whitespace or `?`), then a `?>` with no other
+ * `<?` before it.
+ */
+function closableMmlSpans(text: string): number[] {
+  const spans: number[] = [];
   for (let at = text.indexOf('<?MML'); at >= 0; at = text.indexOf('<?MML', at + 1)) {
-    if (!/[ \t\n\r?]/.test(text[at + 5] ?? '')) continue;
+    if (!/[\s?]/.test(text[at + 5] ?? '')) continue;
     const close = text.indexOf('?>', at + 5);
     if (close < 0) continue;
     const next = text.indexOf('<?', at + 2);
-    if ((next < 0 || next > close) && close + 2 - at <= MML_SPAN_CAP) return true;
+    if (next < 0 || next > close) spans.push(trimmedLength(text.slice(at, close + 2)));
   }
-  return false;
+  return spans;
 }
+
+/** Whether `text` holds an `<?MML` instruction another pass would remove: one within the cap. */
+const hasRemovableMml = (text: string) =>
+  closableMmlSpans(text).some((span) => span <= MML_SPAN_CAP);
+
+/**
+ * `<?MML` spans near the cap — one left literal by a removed `<?CDATA` among them — the blanks,
+ * blank lines, block tags, and script openers that make a span read longer or shorter than it is
+ * written (gh #111), and the tag openers and comments whose removal takes a `?>` that measured a
+ * span away (gh #112).
+ */
+const MML_SPAN_ATOMS = [
+  '<i',
+  '<!--',
+  '-->',
+  `<?MML ${'x'.repeat(112)}`,
+  `<?MML a <?CDATA b?>${'x'.repeat(108)}`,
+  '<?MML ',
+  '?>',
+  ' ?>',
+  '<?',
+  'x',
+  ' '.repeat(6),
+  ' ',
+  '\n',
+  ' \n\n ',
+  '<br/>',
+  '<p>',
+  '<sub>2</sub>',
+  ' ',
+  'a ',
+];
+
+/** MathType lines, terminators, and fragments that re-form a header across a removal (gh #92). */
+const MTEF_ATOMS = [
+  '% MathType!MTEF!2!1!+- ',
+  '%MathType!MTEF!2!1!+-',
+  '% MathType!Translator!2!1!LaTeX.tdl!TeX -- LaTeX 2.09 and later! ',
+  '% MathType!End!2!1!',
+  '% aB9+-',
+  '%cd',
+  '% ',
+  '%',
+  ' ',
+  '\n',
+  String.raw`\n`,
+  '!44A1!',
+  '!3BD8',
+  '% !4DCA!',
+  '!',
+  'x',
+  '% Math',
+  'Type!MTEF!2!1!+-',
+  '<i>',
+  '</i>',
+  '<p>',
+  '<',
+  '>',
+  // gh #110
+  ' ',
+  '<?CDATA ',
+  '<br/>',
+];
+
+const MTEF_HEADER = String.raw`%\s*MathType!MTEF![^\s%]*`;
+
+/**
+ * A blob another pass would remove: a header, further header and non-empty data lines, then a
+ * data line ending in `!` and four uppercase hex digits.
+ */
+const MTEF_BLOB = new RegExp(
+  String.raw`${MTEF_HEADER}(?:\s*(?:${MTEF_HEADER}|%\s*[A-Za-z0-9+-]+))*\s*%\s*[A-Za-z0-9+-]*![0-9A-F]{4}`,
+);
+const MTEF_END_LINE = /%\s*MathType!End!\d+!\d+!/;
 
 describe('normalizeProviderText markup scanner', () => {
   it('matches the regex fixed point on 20,000 random tag inputs', { timeout: 30_000 }, () => {
@@ -165,7 +267,7 @@ describe('normalizeProviderText markup scanner', () => {
     }
   });
 
-  it('leaves no CDATA, instruction, formula opener, or literal \\n and is idempotent on 20,000 random delimiter inputs (gh #89)', {
+  it('leaves no CDATA, instruction, formula opener, literal \\n, or MathType blob and is idempotent on 20,000 random delimiter inputs (gh #89, gh #92)', {
     timeout: 30_000,
   }, () => {
     for (const input of randomInputs(DELIMITER_ATOMS, 20_000)) {
@@ -176,8 +278,45 @@ describe('normalizeProviderText markup scanner', () => {
       expect(hasRemovableMml(output), label).toBe(false);
       expect(output, label).not.toContain('<!--inline-formula>');
       expect(output, label).not.toMatch(LITERAL_NEWLINE);
+      expect(output, label).not.toMatch(MTEF_BLOB);
+      expect(output, label).not.toMatch(MTEF_END_LINE);
       expect(normalizeProviderText(output), label).toBe(output);
     }
+  });
+
+  it('leaves no MathType blob or End line and is idempotent on 20,000 random MathType inputs (gh #92)', {
+    timeout: 30_000,
+  }, () => {
+    let blobInputs = 0;
+    for (const input of randomInputs(MTEF_ATOMS, 20_000)) {
+      const output = normalizeProviderText(input);
+      const label = JSON.stringify(input);
+      expect(output, label).not.toMatch(MTEF_BLOB);
+      expect(output, label).not.toMatch(MTEF_END_LINE);
+      expect(normalizeProviderText(output), label).toBe(output);
+      if (MTEF_BLOB.test(input)) blobInputs++;
+    }
+    // Whole blobs form often enough for the checks above to bite (1,037 with this seed).
+    expect(blobInputs).toBeGreaterThan(750);
+  });
+
+  it('leaves no removable <?MML span and is idempotent on 20,000 random inputs near the span cap (gh #111, gh #112)', {
+    timeout: 30_000,
+  }, () => {
+    let removableInputs = 0;
+    let keptPastCap = 0;
+    for (const input of randomInputs(MML_SPAN_ATOMS, 20_000)) {
+      const output = normalizeProviderText(input);
+      const label = JSON.stringify(input);
+      expect(hasRemovableMml(output), label).toBe(false);
+      expect(normalizeProviderText(output), label).toBe(output);
+      if (hasRemovableMml(input)) removableInputs++;
+      if (closableMmlSpans(output).some((span) => span > MML_SPAN_CAP)) keptPastCap++;
+    }
+    // Both sides of the cap come up often enough to be checked: inputs holding a span within it
+    // (3,314 with this seed), and outputs that keep a closable span past it (325).
+    expect(removableInputs).toBeGreaterThan(2_500);
+    expect(keptPastCap).toBeGreaterThan(250);
   });
 
   it('closes a comment at a `-->` that a tag removal inside it forms', () => {
@@ -441,6 +580,347 @@ describe('normalizeProviderText delimiters and literal \\n (gh #89)', () => {
       display_name: 'Seyfert nuclei',
       authorships: [{ raw_author_name: 'A. Smith' }],
     });
+  });
+});
+
+/**
+ * MathType MTEF equation blobs: a `% MathType!MTEF!` header, `%`-prefixed data lines, and a
+ * `!XXXX!` checksum, usually just before TeX that restates the equation. Fixtures marked with a
+ * work ID are copied from that record's upstream title or abstract as of 2026-10-17.
+ */
+describe('normalizeProviderText MathType MTEF blobs (gh #92)', () => {
+  const HEADER = '% MathType!MTEF!2!1!+-';
+  const TRANSLATOR = '% MathType!Translator!2!1!AMS LaTeX.tdl!TeX -- AMS-LaTeX!';
+
+  it.each([
+    [
+      'a spaced blob before CDATA-wrapped TeX (W1484087699)',
+      'the unit ball % MathType!MTEF!2!1!+- % feaagCart1ev2aqatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn % hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr % 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9 % vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x % fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaGcbaWaaqWaaeaaca % WG6bWaaSbaaSqaaiaaigdaaeqaaaGccaGLhWUaayjcSdWaaWbaaSqa % beaacaaIYaaaaOGaey4kaSYaaqWaaeaacaWG6bWaaSbaaSqaaiaaik % daaeqaaaGccaGLhWUaayjcSdWaaWbaaSqabeaacaaIYaaaaOGaeyip % aWJaaGymaaaa!44A1!]] <![CDATA[$${\\left| {{z_1}} \\right|^2} + {\\left| {{z_2}} \\right|^2} < 1$$ (see Yau [31]',
+      'the unit ball $${\\left| {{z_1}} \\right|^2} + {\\left| {{z_2}} \\right|^2} < 1$$ (see Yau [31]',
+    ],
+    [
+      'two blobs, each after a Translator line (W141500653)',
+      String.raw`Uniqueness of % MathType!Translator!2!1!AMS LaTeX.tdl!TeX -- AMS-LaTeX! % MathType!MTEF!2!1!+- % feaaeaart1ev0aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbbjxAHX % garmWu51MyVXgatuuDJXwAK1uy0HwmaeHbfv3ySLgzG0uy0Hgip5wz % aebbnrfifHhDYfgasaacH8qrps0lbbf9q8WrFfeuY-Hhbbf9v8qqaq % Fr0xc9pk0xbba9q8WqFfea0-yr0RYxir-Jbba9q8aq0-yq-He9q8qq % Q8frFve9Fve9Ff0dmeaabaqaciGacaGaaeqabaWaaeWaeaaakeaatu % uDJXwAK1uy0HMmaeXbfv3ySLgzG0uy0HgiuD3BaGqbbiab-jqidnaa % CaaaleqabaGaey4fIOcaaaaa!433C! $ \mathbb{C}^{ * } $ - and % MathType!Translator!2!1!AMS LaTeX.tdl!TeX -- AMS-LaTeX! % MathType!MTEF!2!1!+- % feaaeaart1ev0aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbbjxAHX % garmWu51MyVXgatuuDJXwAK1uy0HwmaeHbfv3ySLgzG0uy0Hgip5wz % aebbnrfifHhDYfgasaacH8qrps0lbbf9q8WrFfeuY-Hhbbf9v8qqaq % Fr0xc9pk0xbba9q8WqFfea0-yr0RYxir-Jbba9q8aq0-yq-He9q8qq % Q8frFve9Fve9Ff0dmeaabaqaciGacaGaaeqabaWaaeWaeaaakeaatu % uDJXwAK1uy0HMmaeXbfv3ySLgzG0uy0HgiuD3BaGqbbiab-jqidnaa % BaaaleaacaqGRaaabeaaaaa!42FA! $ \mathbb{C}_{{\text{ + }}} $ -actions on Gizatullin Surfaces`,
+      String.raw`Uniqueness of $ \mathbb{C}^{ * } $ - and $ \mathbb{C}_{{\text{ + }}} $ -actions on Gizatullin Surfaces`,
+    ],
+    [
+      'a glued blob and the End line after it (W2174515875)',
+      'The% MathType!Translator!2!1!AMS LaTeX.tdl!TeX -- AMS-LaTeX!% MathType!MTEF!2!1!+-% feaafiart1ev1aaatCvAUfKttLearuqr1ngBPrgarmqr1ngBPrgitL% xBI9gBamXvP5wqSXMqHnxAJn0BKvguHDwzZbqegm0B1jxALjhiov2D% aeHbuLwBLnhiov2DGi1BTfMBaebbfv3ySLgzGueE0jxyaibaieYlf9% irVeeu0dXdh9vqqj-hEeeu0xXdbba9frFj0-OqFfea0dXdd9vqaq-J% frVkFHe9pgea0dXdar-Jb9hs0dXdbPYxe9vr0-vr0-vqpWqaaeaabi% GaciaacaqabeaadaabauaaaOqaaiabec8aWjabec8aWjabgkziUkab% bUealnaanaaabaGaee4saSeaaaaa!46A8!% MathType!End!2!1! amplitude in the …',
+      'The amplitude in the …',
+    ],
+    [
+      'a blob inside a word, inserting nothing (W272469031)',
+      String.raw`in the Y% MathType!MTEF!2!1!+-% feaafiart1ev1aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn% hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr% 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9% vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x% fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaqcaaCaaiqaj+eaga% afaaaa!37A1!\[\user1{\overset{\lower0.5em\hbox{$\smash{\scriptscriptstyle\smile}$}}{O} }\]ngs`,
+      String.raw`in the Y\[\user1{\overset{\lower0.5em\hbox{$\smash{\scriptscriptstyle\smile}$}}{O} }\]ngs`,
+    ],
+    [
+      'a blob whose terminator has no closing ! (W1582174976)',
+      String.raw`Let % MathType!MTEF!2!1!+- % feaagCart1ev2aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn % hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr % 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9 % vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x % fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaGcbaGaeuyQdCLaey %OGIWSaeSyhHe6aaWbaaSqabeaacaaIZaaaaaaa!3BD8 $$Omega \subset {\mathbb{R}^3}$$ be an open`,
+      String.raw`Let $$Omega \subset {\mathbb{R}^3}$$ be an open`,
+    ],
+    [
+      'a blob whose terminator stands on its own line (W4211178014)',
+      String.raw`index of fit: % MathType!MTEF!2!1!+- % feaaguart1ev2aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn % hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr % 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9 % vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x % fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaGcbaGaamOuaiabg2 % da9maalaaabaGaeyyeIuUaam4DamaabmaabaGaamysamaaBaaaleaa % caWGJbGaamyyaiaadYgacaWGJbaabeaakiabgkHiTiaadMeadaWgaa % WcbaGaam4BaiaadkgacaWGZbaabeaaaOGaayjkaiaawMcaamaaCaaa % leqabaGaaGOmaaaaaOqaaiabggHiLlaadEhacaWGjbWaaSbaaSqaai % aad+gacaWGIbGaam4CaaqabaGcdaahaaWcbeqaaiaaikdaaaaaaaaa % !4DCA! $$R = \frac`,
+      String.raw`index of fit: $$R = \frac`,
+    ],
+    [
+      'a blob and its closing ! but not a stray second ! (W161645765)',
+      'Bernoulli (Binomial)-Verteilung B (n;p;x):= % MathType!MTEF!2!1!+- % feaagCart1ev2aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn % hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr % 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9 % vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x % fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaGcbaGaaiikamaaDa % aaleaacaWG4baabaGaamOBaaaakiaacMcacaWGWbWaaWbaaSqabeaa % caWG4baaaOGaamyCamaaCaaaleqabaGaamOBaiabgkHiTiaadIhaaa % GccaGG7aGaamiCaiabgUcaRiaadghacqGH9aqpcaaIXaaaaa!44F4!! $$ (_x^n){p^x}{q^{n - x}};p + q = 1 $$',
+      'Bernoulli (Binomial)-Verteilung B (n;p;x):= ! $$ (_x^n){p^x}{q^{n - x}};p + q = 1 $$',
+    ],
+    [
+      'a blob that repeats its header line (W4235298395)',
+      String.raw`equation are % MathType!MTEF!2!1!+- % MathType!MTEF!2!1!+- % feaaguart1ev2aaatCvAUfeBSjuyZL2yd9gzLbvyNv2CaerbuLwBLn % hiov2DGi1BTfMBaeXatLxBI9gBaerbd9wDYLwzYbItLDharqqtubsr % 4rNCHbGeaGqiVu0Je9sqqrpepC0xbbL8F4rqqrFfpeea0xe9Lq-Jc9 % vqaqpepm0xbba9pwe9Q8fs0-yqaqpepae9pg0FirpepeKkFr0xfr-x % fr-xb9adbaqaaeGaciGaaiaabeqaamaabaabaaGcbaGaaiikaiaadM % gacaGGPaWaaSaaaeaacaWGKbGaamyEaaqaaiaadsgacaWG4baaaiab % g2da9iaaikdacaWG4baaaa!3ED5! $$\matrix $$(i)\frac{{dy}}{{dx}} = 2x$$ ,`,
+      String.raw`equation are $$\matrix $$(i)\frac{{dy}}{{dx}} = 2x$$ ,`,
+    ],
+    [
+      'End lines with no blob before them (W2174515875)',
+      String.raw`region of the\(\pi \pi \to {\text{K}}\overline {\text{K}} \)% MathType!End!2!1! scattering. For`,
+      String.raw`region of the\(\pi \pi \to {\text{K}}\overline {\text{K}} \) scattering. For`,
+    ],
+  ])('removes %s', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(output).not.toContain('MathType!');
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it.each([
+    ['a blob at the start of the text', `${HEADER} % aB9+-!ABCD! x`, 'x'],
+    ['a blob at the end of the text', `x ${HEADER} % aB9+-!ABCD!`, 'x'],
+    ['a blob between blanks, merging them to one', `a ${HEADER} % b!ABCD! c`, 'a c'],
+    ['a blob with a blank on one side only', `a ${HEADER} % b!ABCD!c`, 'a c'],
+    ['a blob of glued lines', 'x%MathType!MTEF!2!1!+-%aB9+-%cd!ABCD!y', 'xy'],
+    ['a blob whose lines line breaks split', `a ${HEADER}\n% bc\r\n%de\n% !ABCD! f`, 'a f'],
+    ['a blob whose lines literal \\n split', String.raw`a ${HEADER}\n% bc\n% !ABCD! f`, 'a f'],
+    [
+      'a blob with a Translator line just before it',
+      `x ${TRANSLATOR} ${HEADER} % a!ABCD! y`,
+      'x y',
+    ],
+    [
+      'a blob but not the bare % line before it',
+      `tensor % ${HEADER} % a!ABCD! field`,
+      'tensor % field',
+    ],
+    ['back-to-back blobs', `a ${HEADER} % b!ABCD!${HEADER} % c!0F9E! d`, 'a d'],
+    ['an End line with longer numbers', 'a % MathType!End!12!305! b', 'a b'],
+    [
+      'an End line inside a run, which then closes',
+      `a ${HEADER} % MathType!End!2!1! % b!ABCD! c`,
+      'a c',
+    ],
+    [
+      'a header re-formed across a removed blob',
+      `x % Math${HEADER} % a!ABCD!Type!MTEF!2!1!+- % b!ABCD! y`,
+      'x y',
+    ],
+    [
+      'a header re-formed across a removed tag',
+      `x % Math<i></i>Type!MTEF!2!1!+- % a!ABCD! y`,
+      'x y',
+    ],
+    ['a blob whose removal completes a tag', `x <i${HEADER} % a!ABCD!>y`, 'x y'],
+    ['a blob holding a > whose removal completes a tag', '<i%MathType!MTEF!>%!3BD8>', ''],
+    ['a blob holding a > whose removal completes an mml: tag', '<mml:%MathType!MTEF!>%!ABCD>', ''],
+    ['the same blob between words', 'a <i%MathType!MTEF!>%!3BD8>b', 'a b'],
+    [
+      'blobs holding a > whose removals complete nested tags',
+      '<b<i%MathType!MTEF!>%!3BD8>%MathType!MTEF!>%!ABCD>',
+      '',
+    ],
+    [
+      'a blob whose removal re-forms a tag no allowlist holds',
+      '<Fish%MathType!MTEF!>%!ABCD>',
+      '<Fish>',
+    ],
+  ])('removes %s', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it.each([
+    ['a percent sign', '95% CI'],
+    ['a spaced percent sign', 'a 10 % change'],
+    ['MTEF as an acronym', 'Medium-Term Expenditure Framework (MTEF)'],
+    ['a run that meets prose', `${HEADER} % aaaa then prose`],
+    ['a run that meets the end of the text', `a ${HEADER} % feaag % hiov`],
+    ['a run that meets another character', `a ${HEADER} % fe.ag % b!ABCD! c`],
+    ['a run broken by an empty data line', `a ${HEADER} % % b!ABCD! c`],
+    ['a near-terminator', `a ${HEADER} % b!ABC d`],
+    ['a lowercase terminator', `a ${HEADER} % b!abcd! c`],
+    ['a header with no data before its terminator', `a ${HEADER}!ABCD! c`],
+    ['a Translator line with no header after it', `x ${TRANSLATOR} y`],
+    ['a Translator line followed by text, then a run', `${TRANSLATOR} and ${HEADER} % a`],
+    ['an End line missing a number', 'a % MathType!End!2! b % MathType!End!!1! c'],
+    ['MathType named in prose', 'equations typed with MathType! Then % of them'],
+    ['a tag opener a kept > in an unclosed run settles', `<i${HEADER}> % x>`],
+  ])('keeps %s literal', (_label, input) => {
+    expect(normalizeProviderText(input)).toBe(input);
+  });
+
+  it('keeps a Translator line that text separates from the header', () => {
+    expect(normalizeProviderText(`${TRANSLATOR} and ${HEADER} % a!ABCD! y`)).toBe(
+      `${TRANSLATOR} and y`,
+    );
+  });
+
+  it('removes blobs from every string leaf, titles included', () => {
+    expect(
+      normalizeProviderValue({
+        title: `A ${HEADER} % a!ABCD! $x$ title`,
+        abstract: `x % MathType!End!2!1! y`,
+      }),
+    ).toEqual({ title: 'A $x$ title', abstract: 'x y' });
+  });
+});
+
+/**
+ * Trimming paragraphs strips any whitespace beside a block tag's break, and a second pass reads
+ * the break itself as line breaks. So every such character has to end an instruction target in
+ * the first pass too, or the second pass finds a target the first left alone.
+ */
+describe('normalizeProviderText instruction targets ended by any whitespace (gh #110)', () => {
+  it.each([
+    ['a no-break space before a block tag', 'a <?CDATA <br/>b?>c', 'a\n\nbc'],
+    ['a space before a block tag', 'a <?CDATA <br/>b?>c', 'a\n\nbc'],
+    ['an ideographic space before a block tag', 'a <?CDATA　<br/>b?>c', 'a\n\nbc'],
+    ['a no-break space, a space, then a block tag', 'a <?CDATA  <p>b?>c', 'a\n\nbc'],
+    ['a no-break space before TeX', 'a <?CDATA $x$?> b', 'a $x$ b'],
+    ['an MML target and a no-break space', 'a <?MML <br/>( 1 ) ?> b', 'a b'],
+    ['an MML target and a space', 'a <?MML <br/>( 1 ) ?> b', 'a b'],
+  ])('settles %s in one pass', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it('drops a stray ?> that a literal MML target ended by a block tag would pair with', () => {
+    const output = normalizeProviderText('<?MML<br/> a <?CDATA b?> c ?>');
+    expect(output).toBe('<?MML\n\na b c');
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+});
+
+/**
+ * Trimming paragraphs shortens an `<?MML` span — blanks beside a block tag's break go, and a run
+ * of breaks or a blank line becomes one break — while a break or script opener reads as two
+ * characters. The span cap measures the span as the output reads it, so a second pass makes the
+ * same keep-or-remove call the first one made.
+ */
+describe('normalizeProviderText <?MML span cap measured as the output reads (gh #111)', () => {
+  const x = (count: number) => 'x'.repeat(count);
+  const blanks = ' '.repeat(10);
+
+  it.each([
+    ['blanks around a block tag', `a <?MML ${x(100)}${blanks}<br/>${blanks}?> b`, 'a b'],
+    ['the same span alone', `<?MML ${x(100)}${blanks}<br/>${blanks}?>`, ''],
+    ['a run of block tags', `a <?MML ${x(110)}${'<br/>'.repeat(15)}?> b`, 'a b'],
+    [
+      'a blank line, a block tag after it',
+      `a <?MML ${x(110)}  \n\n${blanks}?> b<br/>c`,
+      'a b\n\nc',
+    ],
+    ['a blank line, no block tag', `a <?MML ${x(110)}  \n\n${blanks}?> b`, 'a b'],
+  ])('removes a span trimming brings within the cap: %s', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it.each([
+    ['on its own text', `<?MML ${x(130)}?>`, `<?MML ${x(130)}?>`],
+    [
+      'with blanks around a block tag',
+      `a <?MML ${x(130)}${blanks}<br/>${blanks}?> b`,
+      `a <?MML ${x(130)}\n\n?> b`,
+    ],
+  ])('keeps a span past the cap %s literal', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  /**
+   * Spans that read exactly `span` characters in the output, each holding one construct, and the
+   * output a span one character past the cap keeps.
+   */
+  it.each([
+    [
+      'a block tag',
+      (span: number) => `<?MML ${x(span - 10)}<br/>?>`,
+      `a <?MML ${x(MML_SPAN_CAP - 9)}\n\n?> b`,
+    ],
+    [
+      'blanks around a block tag',
+      (span: number) => `<?MML ${x(span - 10)}${blanks}<p>${blanks}?>`,
+      `a <?MML ${x(MML_SPAN_CAP - 9)}\n\n?> b`,
+    ],
+    [
+      'a script',
+      (span: number) => `<?MML ${x(span - 12)}<sub>2</sub>?>`,
+      `a <?MML ${x(MML_SPAN_CAP - 11)}_{2}?> b`,
+    ],
+  ])(
+    'measures a span holding %s by the characters the output holds',
+    (_label, spanning, keptOutput) => {
+      expect(normalizeProviderText(`a ${spanning(MML_SPAN_CAP)} b`)).toBe('a b');
+      const kept = normalizeProviderText(`a ${spanning(MML_SPAN_CAP + 1)} b`);
+      expect(kept).toBe(keptOutput);
+      expect(normalizeProviderText(kept)).toBe(kept);
+    },
+  );
+
+  it('drops a stray ?> that trimming brings within the cap of a literal <?MML', () => {
+    const output = normalizeProviderText(
+      `<?MML a <?CDATA b?>${x(110)}${blanks}<br/>${blanks} ?> c`,
+    );
+    expect(output).toBe(`<?MML a b${x(110)}\n\nc`);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it('keeps a stray ?> past the cap of a literal <?MML on its own text', () => {
+    const output = normalizeProviderText(`<?MML a <?CDATA b?>${x(130)} ?> c`);
+    expect(output).toBe(`<?MML a b${x(130)} ?> c`);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+});
+
+/**
+ * A removal joins the text on either side of it, and the pass judges what that forms the way a
+ * second pass over its output would: a `<` whose tag a `>` inside the removed text had ruled
+ * out can open a tag again, and an `<?MML` span measured past the cap at a `?>` inside it is
+ * measured again at the next one.
+ */
+describe('normalizeProviderText constructs a removal joins (gh #112)', () => {
+  const x = (count: number) => 'x'.repeat(count);
+
+  it.each([
+    ['a tag opener whose > went with an MML instruction', '<b<?MML >?>>', ''],
+    ['the same between words', 'a <b<?MML >?>>c', 'a c'],
+    ['nested tag openers, each reopened in turn', '<b<i<?MML >?>><?MML >?>>', ''],
+    ['an opener no allowlist holds, reopened and kept', '<Fish<?MML >?>>', '<Fish>'],
+    ['an MML span past the cap until a tag inside it goes', `<?MML % <b ${x(125)}?>?>`, ''],
+    ['an MML span past the cap until a comment inside it goes', `<?MML <!-- ${x(130)}?>-->?>`, ''],
+    ['the same between words', `a <?MML <!-- ${x(130)}?>--> b ?> c`, 'a c'],
+  ])('settles %s in one pass', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it('keeps a span the cap still rules out once a comment inside it goes', () => {
+    const input = `<?MML ${x(130)}<!-- ?> --> ?> b`;
+    const output = normalizeProviderText(input);
+    expect(output).toBe(`<?MML ${x(130)} ?> b`);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it('keeps an MML span literal once another <? opens before its ?>, even one a removal takes', () => {
+    const output = normalizeProviderText('a <?MML ( 1 ) <!-- <? --> ?> b');
+    expect(output).toBe('a <?MML ( 1 )  b');
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  /**
+   * A literal `\n` right after the blank that ends an `<?MML` target merges with it, and the
+   * instruction must still be open once: the cap and an earlier `<?` keep the span literal.
+   */
+  const escapedBreak = String.raw`\n`;
+
+  it.each([
+    ['a span past the cap', `a <?MML ${escapedBreak}! ${x(130)}?> b`, `a <?MML ! ${x(130)}?> b`],
+    [
+      'a span past the cap whose target a tab ends',
+      `a <?MML\t${escapedBreak}! ${x(130)}?> b`,
+      `a <?MML\t! ${x(130)}?> b`,
+    ],
+    [
+      'a span past the cap with a CDATA instruction before it',
+      `a <?MML ${escapedBreak}! <?CDATA b <?MML ${x(130)}?> ?> c`,
+      `a <?MML ! b <?MML ${x(130)} ?> c`,
+    ],
+    [
+      'a span another <? opens inside',
+      `a <?MML ${escapedBreak}! ${x(10)} <?x ${x(10)}?> b`,
+      `a <?MML ! ${x(10)} <?x ${x(10)}?> b`,
+    ],
+    [
+      'a span a CDATA instruction opens inside',
+      `a <?MML ${escapedBreak}! <?CDATA c?> ${x(10)} ?> b`,
+      `a <?MML ! c ${x(10)} b`,
+    ],
+  ])('keeps literal %s, its target followed by a literal \\n', (_label, input, expected) => {
+    const output = normalizeProviderText(input);
+    expect(output).toBe(expected);
+    expect(normalizeProviderText(output)).toBe(output);
+  });
+
+  it('still removes a span within the cap whose target a literal \\n follows', () => {
+    const output = normalizeProviderText(`a <?MML ${escapedBreak}! ${x(10)} ?> b`);
+    expect(output).toBe('a b');
+    expect(normalizeProviderText(output)).toBe(output);
   });
 });
 

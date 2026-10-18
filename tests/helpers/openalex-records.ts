@@ -136,6 +136,27 @@ export function workWithAuthorships(n: number, count: number, make = authorship)
   };
 }
 
+/** The `author_list` the service derives from `authorships(count, make)`. */
+export function authorList(count: number, make = authorship): Record<string, unknown>[] {
+  return authorships(count, make).map((entry) => {
+    const author = (entry.author ?? {}) as Record<string, unknown>;
+    return {
+      id: author.id ?? null,
+      display_name: author.display_name ?? null,
+      orcid: author.orcid ?? null,
+    };
+  });
+}
+
+/** A works record carrying only `author_list` (plus the always-returned pair). */
+export function workWithAuthorList(n: number, count: number, make = authorship): EntityRecord {
+  return {
+    id: `https://openalex.org/W${3_000_000_000 + n}`,
+    display_name: `Collaboration paper ${n}`,
+    author_list: authorList(count, make),
+  };
+}
+
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 
 /** Summed UTF-8 bytes of every text block in a `CallToolResult`'s `content[]`. */

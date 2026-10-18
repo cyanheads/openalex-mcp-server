@@ -13,7 +13,7 @@ describe('renderBudgetTrailer', () => {
     ).toBe('**Budget:** $0.0010 this call · $0.0689 left today (resets in 1h 33m)');
   });
 
-  it('renders a zero cost as free — the signal that an ID lookup is unbilled', () => {
+  it('renders a zero cost as free — the signal that OpenAlex billed none of the requests', () => {
     expect(
       renderBudgetTrailer({ costUsd: 0, remainingUsd: 0.0699, resetsInSeconds: 5557 }),
     ).toContain('free this call');
