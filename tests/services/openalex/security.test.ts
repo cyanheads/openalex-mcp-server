@@ -189,7 +189,7 @@ describe('Security — API key and mailto non-leakage', () => {
       const serialized = `${message} ${JSON.stringify(data ?? {})}`;
       return (
         data?.reason === 'upstream_unavailable' &&
-        !message.includes('embed.example.com') &&
+        !/embed\.example\.com/.test(message) &&
         !serialized.includes(API_KEY) &&
         !serialized.includes('api_key')
       );
