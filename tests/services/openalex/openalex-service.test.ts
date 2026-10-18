@@ -1710,6 +1710,13 @@ describe('OpenAlexService', () => {
       // form that ORs two phrases. Both returned nothing upstream before; now they fail loudly.
       ['geo.city', '"New York"|"Boston"'],
       ['raw_affiliation_strings', '"A, B"|"C, D"'],
+      // A caller's quote pair the server's own wrap encloses — a pair set off by a blank or behind
+      // a `!` the wrap does not read as negation — puts a `"` inside the phrase as sent.
+      ['geo.city', '! "New York"'],
+      ['raw_affiliation_strings', '! "University of California, Berkeley"'],
+      ['title.search', ' "cats, dogs"'],
+      ['title.search', '"cats, dogs" '],
+      ['title.search.exact', '!"cats, dogs"'],
     ])(
       'refuses a %s value carrying a stray double quote before any request',
       async (key, value) => {

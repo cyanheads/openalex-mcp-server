@@ -43,15 +43,16 @@ export function quoteCallerText(text: string): string {
 }
 
 /**
- * Reject a value the clause sends double-quoted when it carries a `"` beyond its own outer pair.
- * OpenAlex ends a quoted phrase at the next `"` with no escape for one inside, so an interior
- * quote closes the phrase early and the text after it reads as further filter clauses. The caller's
- * own wrapping pair (a leading `!` aside) is fine; anything inside it, or any `"` in a value the
- * clause itself wraps, is not. Runs before any request.
+ * Reject a double-quoted value, `sent` exactly as the clause sends it, when a `"` sits inside its
+ * outer pair (a leading `!` aside). OpenAlex ends a quoted phrase at the next `"` with no escape
+ * for one inside, so an interior quote closes the phrase early and the text after it reads as
+ * further filter clauses. Checking the value as sent, after any wrapping, is what catches a
+ * caller's quote pair the wrap encloses (`! "New York"` goes out as `"! "New York""`). Runs before
+ * any request.
  */
-function assertNoInteriorQuote(key: string, value: string): void {
-  const trimmed = value.trim();
-  const body = trimmed.startsWith('!') ? trimmed.slice(1).trimStart() : trimmed;
+function assertNoInteriorQuote(key: string, sent: string): void {
+  const trimmed = sent.trim();
+  const body = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
   const inner =
     body.length >= 2 && body.startsWith('"') && body.endsWith('"') ? body.slice(1, -1) : body;
   if (inner.includes('"')) {
@@ -165,18 +166,21 @@ function quotedPhrase(field: string, value: string): string | undefined {
  * quotes, a leading `!` still negates the whole value, and a `+` is the literal character, which
  * no clause could AND with a phrase anyway. A phrase key's value is trimmed first, as
  * `quotedPhrase()` trims, and one the caller quoted (a leading `!` aside) is sent as written.
- * Either way the value cannot hold a `"` beyond its own outer pair, which would end the quoted
+ * Either way the value as sent cannot hold a `"` inside its outer pair, which would end the quoted
  * phrase early (`quote_in_filter_value`).
  */
 export function quotedCommaValue(key: string, value: string): string | undefined {
+  let sent: string;
   if (isFreeTextSearchKey(key)) {
-    assertNoInteriorQuote(key, value);
-    return value.startsWith('"') && value.endsWith('"') ? value : `"${value}"`;
+    sent = value.startsWith('"') && value.endsWith('"') ? value : `"${value}"`;
+  } else if (isPhraseKey(key.replaceAll('-', '_'))) {
+    const phrase = value.trim();
+    sent = isQuoted(phrase) ? phrase : `"${phrase}"`;
+  } else {
+    return;
   }
-  if (!isPhraseKey(key.replaceAll('-', '_'))) return;
-  const phrase = value.trim();
-  assertNoInteriorQuote(key, phrase);
-  return isQuoted(phrase) ? phrase : `"${phrase}"`;
+  assertNoInteriorQuote(key, sent);
+  return sent;
 }
 
 /**
@@ -291,7 +295,7 @@ export function upstreamFilterValue(key: string, value: string): string {
   if (mixesOrWithSpace(field, converted)) throw mixedAndOrError(key);
   const phrase = quotedPhrase(field, converted);
   if (phrase !== undefined) {
-    assertNoInteriorQuote(key, converted);
+    assertNoInteriorQuote(key, phrase);
     return phrase;
   }
   /**
