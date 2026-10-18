@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/openalex-mcp-server</h1>
-  <p><b>Access the OpenAlex academic research catalog - 270M+ publications through MCP. STDIO & Streamable HTTP.</b>
+  <p><b>Access the OpenAlex academic research catalog — 270M+ publications — via MCP. STDIO or Streamable HTTP.</b>
   <div>5 Tools &bull; 2 Prompts</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.8.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.8.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/openalex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/openalex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/openalex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90M+ authors, 100K+ sources, plus institutions, topics, keywords, publishers, and funders. Search, filter, and aggregate across all eight entity types, resolve ambiguous names to canonical IDs, and walk the citation graph one hop at a time. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90M+ authors, 100K+ sources, plus institutions, topics, keywords, publishers, and funders. Search, filter, and aggregate across all eight entity types, resolve ambiguous names to canonical IDs, and walk the citation graph one hop at a time.
 
 ### Tools
 
@@ -52,14 +52,15 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 
 ### `openalex_search_entities` <sub>tool</sub>
 
-- Retrieve a single entity by ID — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or PMCID (bare or URL form), or a keyword by its slug or keyword URL. `id` takes precedence: search parameters passed alongside it are dropped, and the response names which ones. A PMCID resolves nothing (OpenAlex indexes none) — use the work's PMID or DOI instead
+- Retrieve a single entity by ID — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or PMCID (bare or URL form, including OpenAlex record-page and API URLs such as `https://openalex.org/works/W2741809807`), or a keyword by its slug or keyword URL. Under `entity_type: "funders"`, a funder's Crossref Funder Registry DOI (`10.13039/…`) resolves through a one-result list request. OpenAlex does not bill a lookup by ID, with three exceptions it bills like one list call: a keyword looked up by its slug or URL, an `id` carrying characters past the identifier itself (`W2741809807#x` still returns W2741809807), and that funder-DOI request. `id` takes precedence: search parameters passed alongside it are dropped, and the response names which ones. An OpenAlex ID whose letter names another entity type than `entity_type` fails as `id_type_mismatch` before any upstream call, and an `id` holding a `.` or `..` path segment fails as `id_dot_segment`; a `?` or `#` inside an identifier (SICI DOIs end in `#`) is sent percent-encoded as part of it. A PMCID resolves nothing (OpenAlex indexes none) — use the work's PMID or DOI instead
 - Keyword search (boolean operators, quoted phrases, wildcards, fuzzy match) plus `exact` and `semantic` search modes — semantic ranks a query-dependent candidate set at ~1 req/sec (up to 50 per page), and its `meta.count` reports the candidate count rather than a match total
-- Rich filter syntax: AND across fields, OR within a field (`|`), NOT (`!`), ranges, comparisons; a comma inside a filter value is rejected (use `|`, or a `.search` filter for free text)
-- `select` returns a curated per-entity-type default unless overridden, or `["*"]` for the full record; invalid field names error with the valid set
+- Rich filter syntax: AND across fields, OR within a field (`|`), AND within a field (`+`), NOT (`!`), ranges, comparisons. One value cannot hold `|` beside an AND operator — a `+`, or a space between values on an ID, code, or `language` key (a space inside a country or language name is part of the name): OpenAlex splits a value on `|` first and drops every alternative that ANDs more than one value, so `DE|FR+US` and `authorships.author.id: A1 A2|A3` both fail as `mixed_and_or_in_filter_value` before any request — put the AND in a second key instead (`institutions.country_code: US` beside `authorships.institutions.country_code: DE|FR` on works). A comma inside a free-text search filter (any `.search` key — `title.search`, `abstract.search.exact`, `title_abstract_keywords.search`) or a field OpenAlex matches as whole text (listed below) is sent double-quoted as part of the phrase, while a comma in any other filter value fails as `comma_in_filter_value` (use `|` for OR); inside a `.search` value, a DOI, a date (a timestamp's `+00:00` offset), a URL (`landing_page_url`; not the boolean `has_pdf_url`), an exactly matched name (`display_name`, `awards.funder_display_name` — `C++`, `Erasmus+`), a `biblio` field (issue `1+2`), or `awards.funder_award_id`, a `+` is a literal character; a value with spaces on a field OpenAlex matches as whole text (`display_name`, `awards.funder_display_name`, `awards.funder_award_id`, `geo.city`, `geo.region`, `raw_affiliation_strings`, `block_key`, a `biblio` field) is sent double-quoted, so it matches as one phrase (`awards.funder_display_name: National Science Foundation`) — `!` and `|` work with it (`geo.city: New York|Boston`), but `+` cannot AND it with another value in the same field. A comma is part of such a value too (`raw_affiliation_strings: Associazione Meteonetwork OdV, Milano, Italy`): a value holding one goes out quoted with its `+` as a literal character. A value sent double-quoted cannot contain a double quote of its own, which fails as `quote_in_filter_value`
+- Country and language values are converted to the codes OpenAlex stores, here and in every other tool that takes `filters`: on a country field (a key ending in `country_code`, `country_codes`, or `countries`), an ISO 3166-1 alpha-3 code, numeric code, or English name — ISO's, or the one OpenAlex's own country facets display (`Russia`, `Ivory Coast`, `Trinidad & Tobago`) — becomes its alpha-2 code (`DEU`, `276`, `Germany` → `DE`) and `UK` becomes `GB`, while a value that cannot be a country code (`Germanyy`, `999`, `unknown`, or two codes joined by a space, `DE US`) fails as `invalid_country_code` without the filter being sent; on `language`, an ISO 639-2 code becomes its ISO 639-1 code and an English name becomes its code (`eng`, `English` → `en`; `Cebuano` → `ceb`). Each `|`/`+` segment is trimmed and converted on its own, so a multi-word name is one value (`South Korea|Japan` → `KR|JP`, `Scottish Gaelic|English` → `gd|en`), and anything else — `null`, `XK`, `ceb`, `zh-cn`, the `countries/DEU` path form — is sent as given
+- `select` returns a curated per-entity-type default unless overridden, or `["*"]` for the full record; invalid field names error with the valid set. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` — about a tenth the size of `authorships`, which adds institutions and affiliations — and is never part of the default or `["*"]`
 - Cursor pagination for keyword and exact search, up to 100 results per page (default 25); semantic search walks its candidates with `page` (1-based) instead, and mixing either knob with the wrong `search_mode` is rejected before the upstream call
 - `sample` (up to 100, single page only — neither `cursor` nor `page` applies) plus a deterministic `seed` for reproducible random sampling; keyword and exact modes only, and never alongside `sort` — OpenAlex does not sample a semantic search and refuses a sorted sample, so both combinations are rejected before the upstream call
 - Each response holds to 64,000 bytes per surface (`structuredContent`, and `content[]` with its trailer) unless the least it can return is larger, which it flags as `over_budget`: a page that would run over keeps its leading records whole and names the rest in `omitted` with the one call that returns them (as a set, in OpenAlex's order), without disturbing `next_cursor`; a record too large on its own comes back with its largest arrays windowed, filled in turn so each shows what fits and labeled with how much of the array it holds, and `slice: {field, offset}` on an `id` lookup pages any array to the end
-- A list record carrying exactly 100 `authorships` — the most OpenAlex returns in a list response — is flagged as possibly capped, with the unbilled `id` + `slice` call that fetches the rest
+- A list record carrying exactly 100 `authorships` or `author_list` entries — the most OpenAlex returns in a list response — is flagged as possibly capped, with the unbilled `id` + `slice` call that fetches the rest of that array
 - `display_name` is nullable for untitled records; every call reports OpenAlex daily-budget cost and remaining balance
 
 ---
@@ -69,7 +70,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 - Group any supported field for trend, distribution, or comparative analysis; combine with `filters` to scope the population before aggregation
 - Up to 200 groups per page (default). `order: "count"` (default) returns the top-N by count with no further pages; `order: "key"` enumerates all distinct values key-ascending with cursor pagination
 - `include_unknown` (default `false`) adds a group for entities with no value for the grouped field, flagged `is_unknown: true` and labeled as unknown in the text output. OpenAlex keys it `-111`/`-111.0` (numeric fields), `unknown` (text fields and `order: "key"`), or an ID ending in `/unknown`; the key is a sentinel, not a filter value. Boolean fields have no such group — a missing value counts as `false`
-- Not every field is groupable — raw date fields, `.search` operators, `from_*`/`to_*` range modifiers, decimal scores such as `fwci`, `display_name`, and external-ID fields such as `doi` are rejected; `openalex_describe_fields(entity_type, "group_by")` lists the fields that group
+- Not every field is groupable — raw date fields, `.search` operators, `from_*`/`to_*` range modifiers, decimal scores such as `fwci`, `display_name`, external-ID fields such as `doi`, and fields OpenAlex looks up from a related entity such as `primary_location.source.country_code` are rejected; `openalex_describe_fields(entity_type, "group_by")` lists the fields that group
 - A works group_by on `authorships.countries` says in its notice that OpenAlex counts only each work's first 100 authorships for that field, and names `authorships.institutions.country_code` as the field that counts all of them
 - Reports OpenAlex daily-budget cost and remaining balance — aggregation is priced far below paging the same entities
 
@@ -78,8 +79,9 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 ### `openalex_resolve_name` <sub>tool</sub>
 
 - A name or partial name runs an autocomplete search: up to 10 matches with disambiguation hints (last institution, host organization, place, etc.)
-- An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or keyword URL, bare or in URL form — resolves directly to the one record it addresses; no `entity_type` needed, since the identifier determines its own. A PMCID is recognized but resolves nothing — OpenAlex indexes none
-- `filters` narrows autocomplete only; on an identifier lookup they're ignored and named in a notice
+- An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, or keyword URL, bare or in URL form — resolves directly to the record it addresses, as the entity type it belongs to. A ROR can name an organization's institution, funder, and publisher records at once: with no `entity_type` (or any other type) all three are looked up in parallel as unbilled singleton fetches and every record found is returned, institution first; `entity_type` `institutions`, `funders`, or `publishers` narrows it to that one. A Crossref Funder Registry DOI (`10.13039/…`) resolves to the funder unless `entity_type` is `works`. A PMCID is recognized but resolves nothing — OpenAlex indexes none
+- Short names share the bare OpenAlex ID shape (keyword `p53` reads as publisher `P53`), so a bare OpenAlex ID that resolves nothing is searched as a name next, under `entity_type` when given, and the notice names both outcomes; a real ID still resolves with its one request. Under `entity_type: "keywords"` the shape is searched as a keyword name from the start
+- `filters` narrows autocomplete only and requires `entity_type` — a name query passing `filters` without it is rejected before any request (`filters_without_entity_type`). On an identifier lookup they're ignored and named in a notice; a name search that matches nothing under `filters` echoes them and suggests loosening them first
 - With `entity_type` set, OpenAlex autocomplete fails on a name over 1,000 characters; that failure is reported once as `query_too_long` with advice to shorten the name, not retried as an outage
 - Reports OpenAlex daily-budget cost and remaining balance
 
@@ -88,8 +90,8 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 ### `openalex_get_citation_graph` <sub>tool</sub>
 
 - `direction` sets the edge: `cites` (works citing the seed), `cited_by` (the seed's own reference list), `related_to` (OpenAlex's algorithmic related works, ~8-30 typical, may be empty)
-- `seed_id` accepts an OpenAlex ID, DOI, or PMID (PMCID recognized but resolves nothing); validated against a live lookup first, so a non-existent seed fails as `NotFound` rather than returning an empty graph
-- Stacks with `filters`/`sort`/`select` to narrow the graph; `filters` cannot set `cites`/`cited_by`/`related_to`, nor an alias of one such as `cited_works` — those keys are reserved for `direction`
+- `seed_id` accepts an OpenAlex work ID (bare, or its OpenAlex record-page or API URL), DOI, or PMID (PMCID recognized but resolves nothing); validated against a live lookup first, so a non-existent seed fails as `NotFound` rather than returning an empty graph, and the ID of another entity type fails as `id_type_mismatch` before any upstream call
+- Stacks with `filters`/`sort`/`select` (`author_list` included) to narrow the graph; `filters` cannot set `cites`/`cited_by`/`related_to`, nor an alias of one such as `cited_works` — those keys are reserved for `direction`
 - Cursor pagination, up to 100 results per page (default 25)
 - The same 64,000-byte response budget and 100-authorship cap disclosure as `openalex_search_entities`; works cut from a page are named in `omitted` with the `openalex_search_entities` call that returns them, in OpenAlex's order
 - Reports OpenAlex daily-budget cost, covering both the seed-validation lookup and the graph page, plus remaining balance
@@ -100,6 +102,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 
 - Lists every valid field name for an entity type + context (`filter`, `group_by`, `select`) — the complete pool, never truncated
 - `group_by` is the filter set minus what OpenAlex rejects as an aggregation key: raw date fields, `.search`/`.search.exact` operators, `from_*`/`to_*` range modifiers, and a per-entity-type set found by grouping every listed field against the live API — decimal scores such as `fwci`, several source year fields, `display_name`, and external-ID fields among them
+- `created_date`, `updated_date`, and their `from_`/`to_` forms are listed filters that OpenAlex serves only on a paid plan; without one, a filter on them fails on its first request as `upstream_plan_required`, with no retry
 - Optional `query` reorders results by name similarity without dropping any field — a nested value's parent object stays reachable further down the list
 - Backed by a generated field catalog — no live API calls
 
@@ -117,7 +120,7 @@ Scholarly catalog data from [OpenAlex](https://openalex.org) — 270M+ works, 90
 
 - Arguments: `topic` required
 - Returns one user message walking a 7-step quantitative workflow: resolve the topic ID, volume trends, top contributors (institutions/countries/journals), open access rate, funding sources, most-cited works, emerging fronts
-- The funding step groups by `awards.funder_id` (resolve names via `openalex_resolve_name`) or `awards.funder_display_name` for readable labels in a single hop
+- The funding step groups by `funders.id`, which counts every work that lists a funder and labels each group with the funder's name; `awards.*` fields stay the route for grant-level questions such as award numbers
 
 ## Features
 
@@ -125,9 +128,9 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 OpenAlex-specific:
 
-- Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex and PubMed/PubMed Central URLs); a PMCID normalizes but resolves nothing since OpenAlex indexes none
+- Typed API client with automatic ID normalization (DOI, ORCID, ROR, PMID, PMCID, ISSN, OpenAlex record-page and API URLs over `http`, `https`, or no scheme, PubMed/PubMed Central URLs); a PMCID normalizes but resolves nothing since OpenAlex indexes none
 - Keyless by default — an optional API key raises rate and daily-budget limits, and an optional `mailto` identifies the caller to OpenAlex's polite pool
-- HTTP status codes mapped to specific MCP error classes (400 → InvalidParams, 422 → ValidationError, 429 → RateLimited) with upstream messages surfaced
+- HTTP status codes mapped to specific MCP error classes (400 → InvalidParams, or ServiceUnavailable when a semantic search's query embedding failed upstream; 422 → ValidationError; 429 → RateLimited, or Forbidden when the 429 refuses a paid-plan filter) with upstream messages surfaced
 - Timeout-aware request retries and cancellation support via `AbortSignal`
 
 Agent-friendly output:
@@ -136,13 +139,13 @@ Agent-friendly output:
 - Effective-query echo — search, trends, and citation-graph responses echo the criteria that actually ran, so an empty result is diagnosable without re-reading the request
 - Discriminated output contracts — typed error reasons (`entity_not_found`, `upstream_budget_exhausted`, `semantic_per_page_cap`, `reserved_filter_key`, and more) each carrying an explicit recovery hint
 - Response shaping — abstracts are reconstructed from OpenAlex's inverted-index encoding into plaintext, and `display_name` stays `null` for untitled or paratext records instead of being backfilled
-- Clean provider text — OpenAlex passes titles, abstracts, and names through unsanitized; HTML entities are decoded against the full WHATWG table, comments and HTML/JATS/MathML formatting tags are removed, CDATA wrappers and IOP's `<?CDATA …?>` math markers are unwrapped with their TeX kept, and a double-escaped line break (a literal `\n`) becomes a space; literal text such as `A < B` and TeX such as `\nu` is kept. Identifier and URL fields (`id`, `doi`, `ids`, `orcid`, `ror`, `issn`, `*_url`, lineages) are returned exactly as OpenAlex stores them, so each one resolves when passed back. The text output escapes that text for Markdown, so a stray `*`, `<tag>`, or `[x](y)` renders as written; IDs, and URLs that render as links, stay byte-identical
+- Clean provider text — OpenAlex passes titles, abstracts, and names through unsanitized; HTML entities are decoded against the full WHATWG table, comments and HTML/JATS/MathML formatting tags are removed, CDATA wrappers and IOP's `<?CDATA …?>` math markers are unwrapped with their TeX kept, MathType equation blobs (`% MathType!MTEF!…!44A1!`) are removed while the TeX that restates them stays, and a double-escaped line break (a literal `\n`) becomes a space; literal text such as `A < B`, `95% CI`, and TeX such as `\nu` is kept. Identifier and URL fields (`id`, `doi`, `ids`, `orcid`, `ror`, `issn`, `*_url`, lineages) are returned exactly as OpenAlex stores them, so each one resolves when passed back. The text output escapes that text for Markdown, so a stray `*`, `<tag>`, or `[x](y)` renders as written; IDs, and URLs that render as links, stay byte-identical
 
 ## Getting started
 
 ### Public Hosted Instance
 
-A public instance is available at `https://openalex.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+A public instance is available at `https://openalex.caseyjhand.com/mcp` — no installation required. Point an MCP client that supports remote servers at it via Streamable HTTP (Claude Desktop adds remote servers under Customize > Connectors > Add custom connector; its `claude_desktop_config.json` holds local servers only):
 
 ```json
 {
