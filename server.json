@@ -18,18 +18,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.8.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
       "environmentVariables": [
         {
           "name": "OPENALEX_API_KEY",
@@ -66,19 +56,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/openalex-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.8.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "OPENALEX_API_KEY",
           "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
