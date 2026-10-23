@@ -6,22 +6,33 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
+import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { joinNotices } from '@/mcp-server/tools/response-budget.js';
-import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
+import { getOpenAlexService, isBooleanGroupBy } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
 /** Disclosure for a works group_by over `authorships.countries` (see the handler). */
 const COUNTRIES_CAP_NOTICE =
   'OpenAlex builds authorships.countries groups from only the first 100 authorships of each work, so a country that appears only past position 100 on a large collaboration is not counted. Group by authorships.institutions.country_code to count every authorship.';
 
+/** Upstream cursors can wrap even after a short page; callers own the stopping decision. */
+const KEY_ORDER_GUIDANCE =
+  "OpenAlex can wrap a key-ordered walk to earlier groups. Stop when a page's first key repeats an earlier key, or when a page is short or empty.";
+
 export const analyzeTrendsTool = tool('openalex_analyze_trends', {
-  description:
-    'Aggregate OpenAlex entities into groups and count them. Use for trend analysis (group works by publication_year), distribution analysis (group by oa_status, type, country), and comparative analysis (group by institution or topic). Combine with filters to scope the analysis. Returns up to 200 groups per page — use cursor pagination for fields with many distinct values.',
+  description: `Aggregate OpenAlex entities into groups and count them. Use for trend analysis (group works by publication_year), distribution analysis (group by oa_status, type, country), and comparative analysis (group by institution or topic). Combine with filters to scope the analysis. Returns up to 200 groups per page — use order "key" and cursor pagination for fields with many distinct values. ${KEY_ORDER_GUIDANCE}`,
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/analyze-trends.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   errors: [
+    {
+      reason: 'unmatched_quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent unquoted has an unmatched double quote.',
+      recovery: 'Pair double quotes used for a search phrase, or remove the stray quote.',
+      thrownBy: 'service',
+    },
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
@@ -172,41 +183,37 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .min(1)
       .describe(
-        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". The native ":include_unknown" suffix also enables include_unknown, even when the boolean is false; passing both adds the suffix once. OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
       ),
     filters: z
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Filter criteria (same syntax as openalex_search_entities filters). Narrows the population before aggregation. Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare \'search\' filter key. Example: group works by year filtered to a specific topic.',
+        'Filter record object, using the same value syntax as openalex_search_entities; native string input is unavailable here. Narrows the population before aggregation. Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare \'search\' filter key. Example: group works by year filtered to a specific topic.',
       ),
     include_unknown: z
       .boolean()
       .default(false)
       .describe(
-        'Add a group for entities with no value for the grouped field. Hidden by default. That group carries `is_unknown: true`; OpenAlex keys it -111 or -111.0 on numeric fields, "unknown" on text fields and under order "key", and an ID ending in /unknown on ID fields — a sentinel, not a measured value. The key is not a filter value: passing -111 as a filter matches a numeric range, not the entities with no value. Boolean fields have no separate group — a missing value counts as false.',
+        'Add a group for entities with no value for the grouped field. Hidden by default unless group_by has the native ":include_unknown" suffix, which enables this setting even when the boolean is false; passing both adds the suffix once. That group carries `is_unknown: true`; OpenAlex keys it -111 or -111.0 on numeric fields, "unknown" on text fields and under order "key", and an ID ending in /unknown on ID fields — a sentinel, not a measured value. The key is not a filter value: passing -111 as a filter matches a numeric range, not the entities with no value. Boolean fields have no separate group — a missing value counts as false.',
       ),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .max(200)
+    per_page: pageSizeSchema(200)
       .default(200)
       .describe(
-        'Maximum groups per page (1-200). Default 200 (the upstream cap). A real top-N knob when order is count (the default) — reduce to return only the highest-count groups.',
+        'Maximum groups per page. Default 200 (the upstream cap); positive integers above 200 clamp to 200 with a notice unless OPENALEX_CLAMP_PER_PAGE=false restores rejection. A real top-N knob in count order without a cursor (the default) — reduce to return only the highest-count groups.',
       ),
     order: z
       .enum(['count', 'key'])
       .optional()
       .describe(
-        'Sort order for groups. Omit or pass "count" (default) to return the top-N groups by count descending — no further pages. Pass "key" to enumerate all distinct values in key-ascending order with cursor pagination. Use "key" only when you need a full traversal; most analysis calls want "count".',
+        `Sort order for groups. Without a cursor, omit or pass "count" (default) to return the top-N groups by count descending — no further pages. Pass "key" to enumerate distinct values in key-ascending order with cursor pagination. Boolean fields keep count order even with "key" and do not support cursor pagination. A supplied cursor selects key order even if order is omitted or "count". ${KEY_ORDER_GUIDANCE}`,
       ),
     cursor: z
       .string()
       .min(1)
       .optional()
       .describe(
-        'Pagination cursor from a previous response. Only relevant when order is "key" — count-descending results have no next page. Pass the next_cursor from the previous response to advance. Omit it on the first call — an empty string is rejected, since a supplied-but-blank cursor is a caller mistake rather than a request for the first page.',
+        `Pagination cursor from a previous response. A supplied cursor selects key order even if order is omitted or "count". Pass the next_cursor from the previous response to advance, subject to the stop conditions below. Omit it on the first call — an empty string is rejected, since a supplied-but-blank cursor is a caller mistake rather than a request for the first page. ${KEY_ORDER_GUIDANCE}`,
       ),
   }),
   output: z.object({
@@ -217,7 +224,9 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         next_cursor: z
           .string()
           .nullable()
-          .describe('Cursor for next page of groups. null if no more groups.'),
+          .describe(
+            `Upstream continuation cursor; null when OpenAlex supplies none. A non-null cursor does not guarantee unseen groups. ${KEY_ORDER_GUIDANCE}`,
+          ),
       })
       .describe('Aggregation metadata.'),
     groups: z
@@ -229,8 +238,9 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
               .describe('Group key (OpenAlex ID or raw value), exactly as OpenAlex returns it.'),
             key_display_name: z
               .string()
+              .nullable()
               .describe(
-                'Human-readable group label as plain text, with HTML entities decoded and markup removed.',
+                'Human-readable group label as plain text, with HTML entities decoded and markup removed; null when OpenAlex supplies no label. Text output uses the group key when the label is null.',
               ),
             count: z.number().describe('Number of entities in this group.'),
             is_unknown: z
@@ -252,7 +262,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     echo: z
       .string()
       .describe(
-        'Compact echo of the input criteria (entity_type, group_by, filters) — surfaces what was actually requested when no groups are returned.',
+        'Compact echo of the criteria (entity_type, group_by, filters) and effective include_unknown and order settings — surfaces what was actually requested when no groups are returned.',
       ),
     totalCount: z
       .number()
@@ -261,7 +271,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no groups (recovery suggestions), when a `cursor` continuation returns none because the traversal is already finished, when the page is full and more groups likely exist (truncation signal with narrowing advice), or when works are grouped by authorships.countries, which OpenAlex counts from only the first 100 authorships of each work. Absent otherwise.',
+        'Guidance notice. Set when per_page was clamped (requested and applied sizes), on every effective key-order call (upstream wrap warning and stopping conditions), when a first call returns no groups (recovery suggestions), when a cursor continuation returns none because the traversal is already finished, when a count-order page is full and more groups likely exist (truncation signal with narrowing advice), or when works are grouped by authorships.countries, which OpenAlex counts from only the first 100 authorships of each work. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -294,6 +304,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
   },
 
   async handler(input, ctx) {
+    const pageSize = clampPageSize(input.per_page, 200, 'openalex_analyze_trends', ctx);
     const service = getOpenAlexService();
     const result = await service.analyze(
       {
@@ -301,7 +312,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
         groupBy: input.group_by,
         filters: input.filters,
         includeUnknown: input.include_unknown,
-        perPage: input.per_page,
+        perPage: pageSize.applied,
         order: input.order,
         cursor: input.cursor,
       },
@@ -315,11 +326,14 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       groupCount: result.groups.length,
     });
 
-    const echo = buildAnalyzeEcho(input);
+    const keyOrder =
+      input.cursor !== undefined || (input.order === 'key' && !isBooleanGroupBy(input.group_by));
+    const echo = buildAnalyzeEcho(input, keyOrder);
     ctx.enrich({ echo, totalCount: result.meta.count });
 
     // `notice` is last-wins, so every sentence is collected and set once.
     const notices: string[] = [];
+    if (pageSize.notice) notices.push(pageSize.notice);
 
     // An empty page on a `cursor` continuation means the key-ascending traversal already
     // enumerated every group, so there is nothing left to remove or regroup. On a first call
@@ -331,17 +345,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
           ? `No groups returned for ${echo}. Try removing filters or grouping by a different field.`
           : `Pagination exhausted for ${echo} — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping.`,
       );
-    } else if (input.order === 'key') {
-      // Key-ascending traversal: omitted groups sit beyond the cursor, not in a count tail, so
-      // the count-bound notice below would be false here (it would name the smallest keys as the
-      // "top by count"). The honest signal is whether OpenAlex returned a next_cursor; page-fill
-      // is irrelevant in this mode.
-      if (result.meta.next_cursor) {
-        notices.push(
-          `Showing ${result.groups.length} groups in key-ascending order. Pass the returned \`next_cursor\` to continue the traversal.`,
-        );
-      }
-    } else if (result.groups.length === input.per_page) {
+    }
+    if (keyOrder) {
+      // A cursor selects key order regardless of `order`; upstream can wrap without suppressing it.
+      notices.push(
+        result.groups.length === 0
+          ? KEY_ORDER_GUIDANCE
+          : `Showing ${result.groups.length} groups in key-ascending order. ${KEY_ORDER_GUIDANCE}${result.meta.next_cursor ? ' Otherwise, pass the returned `next_cursor` to continue the traversal.' : ''}`,
+      );
+    } else if (result.groups.length > 0 && result.groups.length === pageSize.applied) {
       // Count-desc (the default): the page is filled to the limit, so more distinct groups likely
       // exist. The omitted groups all have counts ≤ the smallest group shown, so we can bound the
       // gap even though OpenAlex exposes no total group count.
@@ -378,12 +390,15 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
 
   format: (result) => {
     const heading = `${result.meta.count} total entities across ${result.meta.groups_count ?? result.groups.length} groups on this page`;
+    const footer = result.meta.next_cursor
+      ? `\n\nUpstream next_cursor: \`${result.meta.next_cursor}\`. ${KEY_ORDER_GUIDANCE}`
+      : '';
 
     if (result.groups.length === 0) {
       return [
         {
           type: 'text',
-          text: `No groups found. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})`,
+          text: `No groups found. (count=${result.meta.count}, groups_count=${result.meta.groups_count ?? 0})${footer}`,
         },
       ];
     }
@@ -400,9 +415,6 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       : result.groups;
 
     const lines = renderOrder.map((g) => `${renderGroupLabel(g)}: ${g.count}`);
-    const footer = result.meta.next_cursor
-      ? `\n\n*More groups available — next_cursor: \`${result.meta.next_cursor}\`*`
-      : '';
     return [
       {
         type: 'text',
@@ -418,7 +430,7 @@ function isTimeSeriesGrouping(groups: ReadonlyArray<{ key: string }>): boolean {
   return groups.length > 1 && groups.every((g) => YEAR_OR_DATE_PATTERN.test(g.key));
 }
 
-type Group = { key: string; key_display_name: string; is_unknown?: true | undefined };
+type Group = { key: string; key_display_name: string | null; is_unknown?: true | undefined };
 
 /**
  * The label a group line opens with. The unknown bucket is named as such — its key is a
@@ -429,28 +441,38 @@ type Group = { key: string; key_display_name: string; is_unknown?: true | undefi
 function renderGroupLabel(g: Group): string {
   const key = escapeMarkdown(g.key);
   if (g.is_unknown) {
-    const redundant =
-      g.key_display_name === g.key || g.key_display_name.toLowerCase() === 'unknown';
-    const label = redundant ? '' : `, label ${escapeMarkdown(g.key_display_name)}`;
+    const label =
+      g.key_display_name === null ||
+      g.key_display_name === g.key ||
+      g.key_display_name.toLowerCase() === 'unknown'
+        ? ''
+        : `, label ${escapeMarkdown(g.key_display_name)}`;
     return `unknown (no value; key ${key}${label})`;
   }
+  if (g.key_display_name === null) return escapeMarkdown(g.key, 'line-start');
   const display = escapeMarkdown(g.key_display_name, 'line-start');
   return g.key === g.key_display_name ? display : `${display} (${key})`;
 }
 
 /** The request as one line: caller text is JSON-encoded, so a line break in it stays escaped. */
-function buildAnalyzeEcho(input: {
-  entity_type: string;
-  group_by: string;
-  filters?: Record<string, string> | undefined;
-  include_unknown?: boolean | undefined;
-  order?: 'count' | 'key' | undefined;
-}): string {
+function buildAnalyzeEcho(
+  input: {
+    entity_type: string;
+    group_by: string;
+    filters?: Record<string, string> | undefined;
+    include_unknown?: boolean | undefined;
+    order?: 'count' | 'key' | undefined;
+    cursor?: string | undefined;
+  },
+  keyOrder: boolean,
+): string {
   const parts = [`entity_type=${input.entity_type}`, `group_by=${JSON.stringify(input.group_by)}`];
   if (input.filters && Object.keys(input.filters).length > 0) {
     parts.push(`filters=${JSON.stringify(input.filters)}`);
   }
-  if (input.include_unknown) parts.push('include_unknown=true');
-  if (input.order) parts.push(`order=${input.order}`);
+  if (input.include_unknown || input.group_by.endsWith(':include_unknown'))
+    parts.push('include_unknown=true');
+  if (keyOrder) parts.push('order=key');
+  else if (input.order) parts.push('order=count');
   return parts.join(' | ');
 }

@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import {
   fitRecordsToBudget,
@@ -53,6 +54,13 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/citation-graph.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   errors: [
+    {
+      reason: 'unmatched_quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent unquoted has an unmatched double quote.',
+      recovery: 'Pair double quotes used for a search phrase, or remove the stray quote.',
+      thrownBy: 'service',
+    },
     {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
@@ -226,7 +234,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Additional filters to narrow the graph, same syntax as openalex_search_entities. Example: publication_year=">2020", is_oa="true". Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, authorships.institutions.geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Do not include cites/cited_by/related_to, nor an alias of one such as cited_works — those keys are set by the `direction` parameter.',
+        'Additional filter record object to narrow the graph, using the same value syntax as openalex_search_entities; native string input is unavailable here. Example: publication_year=">2020", is_oa="true". Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, authorships.institutions.geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. Filters are checked before the seed lookup. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Do not include cites/cited_by/related_to, nor an alias of one such as cited_works — those keys are set by the `direction` parameter.',
       ),
     sort: z
       .string()
@@ -240,14 +248,10 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .describe(
         'OpenAlex work field names to return. Always returned: id, display_name. Defaults to the curated works select if omitted. `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Large projections may be cut to fit the response budget (`omitted`, `windows`).',
       ),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
+    per_page: pageSizeSchema(100)
       .default(25)
       .describe(
-        'Results per page (1-100). Default 25. A budget-cut page returns fewer (`omitted`).',
+        'Results per page. Default 25; positive integers above 100 clamp to 100 with a notice unless OPENALEX_CLAMP_PER_PAGE=false restores rejection. A budget-cut page returns fewer (`omitted`).',
       ),
     cursor: z
       .string()
@@ -266,7 +270,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         per_page: z
           .number()
           .describe(
-            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
+            'Page size OpenAlex echoed for this request — the applied per_page after clamping, not the number of records returned. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
           ),
         next_cursor: z
           .string()
@@ -315,7 +319,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when no edges are returned — a first call suggests verifying the seed_id, broadening filters, or trying a different direction; a `cursor` continuation says the walk is already past its last edge instead — when the response budget cut works, windowed an array, or ran over, and when a work carries exactly 100 authorships or author_list entries (possibly capped). Absent otherwise.',
+        'Guidance notice. Set when per_page was clamped (requested and applied sizes), when no edges are returned — a first call suggests verifying the seed_id, broadening filters, or trying a different direction; a cursor continuation says the walk is already past its last edge — when the response budget cut works, windowed an array, or ran over, and when a work carries exactly 100 authorships or author_list entries (possibly capped). Absent otherwise.',
       ),
     budget: z
       .object({
@@ -393,6 +397,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
       );
     }
     const workId = seedRecord.id.replace(OPENALEX_URL_PREFIX, '');
+    const pageSize = clampPageSize(input.per_page, 100, 'openalex_get_citation_graph', ctx);
 
     const mergedFilters: Record<string, string> = {
       ...(input.filters ?? {}),
@@ -405,7 +410,7 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
         filters: mergedFilters,
         sort: input.sort,
         select: input.select,
-        perPage: input.per_page,
+        perPage: pageSize.applied,
         cursor: input.cursor,
       },
       ctx,
@@ -444,11 +449,11 @@ export const getCitationGraphTool = tool('openalex_get_citation_graph', {
           echo,
           totalCount: result.meta.count,
           totalLabel: 'Total Edges',
-          notice: joinNotices([emptyNotice, budgetNotice]),
+          notice: joinNotices([pageSize.notice, emptyNotice, budgetNotice]),
         }),
     });
 
-    const notice = joinNotices([emptyNotice, page.notice]);
+    const notice = joinNotices([pageSize.notice, emptyNotice, page.notice]);
     if (notice) ctx.enrich.notice(notice);
 
     return { meta, results: page.results, ...page.disclosure };

@@ -22,6 +22,20 @@
       "version": "0.9.0",
       "environmentVariables": [
         {
+          "name": "OPENALEX_CLAMP_PER_PAGE",
+          "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "OPENALEX_FILTER_STRING_INPUT",
+          "description": "Accept unambiguous native filter strings on search_entities. Set false to require record objects.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "OPENALEX_API_KEY",
           "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
           "format": "string",
@@ -59,6 +73,20 @@
       "runtimeHint": "npx",
       "version": "0.9.0",
       "environmentVariables": [
+        {
+          "name": "OPENALEX_CLAMP_PER_PAGE",
+          "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "OPENALEX_FILTER_STRING_INPUT",
+          "description": "Accept unambiguous native filter strings on search_entities. Set false to require record objects.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
         {
           "name": "MCP_TRANSPORT_TYPE",
           "description": "Selects the HTTP transport.",

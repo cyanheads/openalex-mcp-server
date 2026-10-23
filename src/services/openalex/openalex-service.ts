@@ -65,6 +65,13 @@ const BOOLEAN_GROUP_BY_FIELDS = new Set([
   'has_fulltext',
 ]);
 
+/** Whether this aggregation keeps count order, ignoring the native unknown-bucket suffix. */
+export function isBooleanGroupBy(groupBy: string): boolean {
+  const suffix = ':include_unknown';
+  const baseField = groupBy.endsWith(suffix) ? groupBy.slice(0, -suffix.length) : groupBy;
+  return BOOLEAN_GROUP_BY_FIELDS.has(baseField);
+}
+
 /** One upstream filter clause: the canonical key and the value it constrains. */
 type FilterClause = [key: string, value: string];
 
@@ -91,7 +98,8 @@ type FilterClause = [key: string, value: string];
  * operator — a `+`, or a space on a key where words mean AND — sent as the AND it spells. A value
  * that puts that operator beside a `|` throws `mixed_and_or_in_filter_value`, since OpenAlex drops
  * every `|` alternative that ANDs more than one value; a value sent double-quoted that carries a
- * `"` of its own throws `quote_in_filter_value`. Every throw runs before any request.
+ * `"` of its own throws `quote_in_filter_value`. A value left unquoted with an unmatched `"`
+ * throws `unmatched_quote_in_filter_value`. Every throw runs before any request.
  * `autocomplete()` sends its filters without `translateFilters()`, so the conversion lives here
  * rather than there.
  *
@@ -935,7 +943,8 @@ function translateFilters(
 /**
  * The `filter` parameter a search or group_by over `filters` sends: keys translated, then each
  * clause built by `buildFilterString()`, whose pre-flight throws (`comma_in_filter_value`,
- * `invalid_country_code`, `mixed_and_or_in_filter_value`, `quote_in_filter_value`) it shares.
+ * `invalid_country_code`, `mixed_and_or_in_filter_value`, `quote_in_filter_value`,
+ * `unmatched_quote_in_filter_value`) it shares.
  * Exported so a tool that spends a request before its search — the citation graph's seed lookup —
  * can run those checks first and fail without one.
  */
@@ -1834,9 +1843,9 @@ class OpenAlexService {
   async analyze(params: AnalyzeParams, ctx: Context): Promise<AnalyzeResult> {
     const queryParams: Record<string, string> = {};
 
-    queryParams.group_by = params.includeUnknown
-      ? `${params.groupBy}:include_unknown`
-      : params.groupBy;
+    const baseField = params.groupBy.replace(/:include_unknown$/, '');
+    const includeUnknown = params.includeUnknown === true || baseField !== params.groupBy;
+    queryParams.group_by = includeUnknown ? `${baseField}:include_unknown` : baseField;
 
     if (hasEntries(params.filters)) {
       queryParams.filter = buildSearchFilter(params.entityType, params.filters);
@@ -1855,9 +1864,7 @@ class OpenAlexService {
     //   - key-asc (order: "key"): send cursor=* on the first page. OpenAlex returns groups
     //     in key-ascending order and emits a `next_cursor` for full enumeration.
     //   - subsequent pages: forward the caller-supplied cursor as-is.
-    const baseField = params.groupBy.replace(/:include_unknown$/, '');
-    const isBooleanGroupBy = BOOLEAN_GROUP_BY_FIELDS.has(baseField);
-    const keyAscOrder = !isBooleanGroupBy && params.order === 'key';
+    const keyAscOrder = !isBooleanGroupBy(baseField) && params.order === 'key';
 
     if (params.cursor) {
       queryParams.cursor = params.cursor;
@@ -1888,7 +1895,7 @@ class OpenAlexService {
         groups_count: data.meta.groups_count ?? data.group_by.length,
         next_cursor: data.meta.next_cursor ?? null,
       },
-      groups: data.group_by.map((group) => normalizeGroup(group, params.includeUnknown === true)),
+      groups: data.group_by.map((group) => normalizeGroup(group, includeUnknown)),
     };
   }
 

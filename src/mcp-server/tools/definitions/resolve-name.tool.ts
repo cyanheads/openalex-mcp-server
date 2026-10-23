@@ -98,6 +98,13 @@ export const resolveNameTool = tool('openalex_resolve_name', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   errors: [
     {
+      reason: 'unmatched_quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent unquoted has an unmatched double quote.',
+      recovery: 'Pair double quotes used for a search phrase, or remove the stray quote.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'filters_without_entity_type',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A name `query` passed `filters` without `entity_type`. Filter fields belong to one entity type, and a name search across every type takes no filters.',
@@ -264,7 +271,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .record(z.string(), z.string())
       .optional()
       .describe(
-        'Narrow autocomplete results with filters, in the openalex_search_entities filter syntax. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
+        'Narrow autocomplete results with a filter record object, using the openalex_search_entities value syntax; native string input is unavailable here. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
       ),
   }),
   output: z.object({

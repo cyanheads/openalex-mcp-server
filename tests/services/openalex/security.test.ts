@@ -12,6 +12,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { parseNativeFilters } from '@/services/openalex/filter-values.js';
 import { nodeTypes, nonAutolinks, renderedText } from '../../helpers/markdown.js';
 
 const API_KEY = 'operator@example.com';
@@ -1443,6 +1444,74 @@ describe('Security — filter clauses are rewritten in linear time (gh #107, #10
   );
 });
 
+describe('Filter grammar scanners use linear CPU time', () => {
+  const shapes: [string, (size: number) => string, 'sent' | 'invalid_filter_string'][] = [
+    ['a long plain value', (n) => `type:${'x'.repeat(n)}`, 'sent'],
+    [
+      'repeated openers without a closer',
+      (n) => `title.search:"${'('.repeat(n)}`,
+      'invalid_filter_string',
+    ],
+    [
+      'nested openers and quotes',
+      (n) => `title.search:${build('("', n)}"`,
+      'invalid_filter_string',
+    ],
+    ['one ending line break', (n) => `title.search:${'x'.repeat(n)}\n`, 'sent'],
+    ['line breaks throughout', (n) => `title.search:${build('x\n', n)}`, 'sent'],
+    ['quoted comma runs', (n) => `title.search:"${build('x,', n)}"`, 'sent'],
+  ];
+
+  it.each(shapes)('native clauses: %s', (_label, make, expected) => {
+    const outcome = (input: string) => {
+      try {
+        const filters = parseNativeFilters(input);
+        expect(Object.keys(filters)).toHaveLength(1);
+        return 'sent';
+      } catch (error) {
+        return (error as { data?: { reason?: string } }).data?.reason ?? String(error);
+      }
+    };
+    for (const size of [5_000, 20_000, 80_000]) expect(outcome(make(size))).toBe(expected);
+    expectLinearCpuTime(5_000, (size) => {
+      const input = make(size);
+      expect(outcome(input)).toBe(expected);
+      return cpuMsPerCall(() => {
+        try {
+          parseNativeFilters(input);
+        } catch (error) {
+          if ((error as { data?: { reason?: string } }).data?.reason !== 'invalid_filter_string')
+            throw error;
+        }
+      }, input);
+    });
+  });
+
+  it.each([
+    ['repeated unclosed openers', (n: number) => `"${'('.repeat(n)}`],
+    ['nested openers', (n: number) => `${build('("', n)}"`],
+    ['ending line break', (n: number) => `"${'x'.repeat(n)}\n`],
+    ['line breaks throughout', (n: number) => `"${build('x\n', n)}`],
+  ])('unquoted values: %s', async (_label, make) => {
+    const { buildFilterString } = await import('@/services/openalex/openalex-service.js');
+    const refuse = (value: string) => {
+      try {
+        buildFilterString([['title.search', value]]);
+        return 'sent';
+      } catch (error) {
+        return (error as { data?: { reason?: string } }).data?.reason ?? String(error);
+      }
+    };
+    for (const size of [5_000, 20_000, 80_000])
+      expect(refuse(make(size))).toBe('unmatched_quote_in_filter_value');
+    expectLinearCpuTime(5_000, (size) => {
+      const value = make(size);
+      expect(refuse(value)).toBe('unmatched_quote_in_filter_value');
+      return cpuMsPerCall(refuse, value);
+    });
+  });
+});
+
 /**
  * A plan-gated filter's HTTP 429 names the refused clause — `The "<filter>:<value>" filter is
  * part of daily sync…` — and that clause is the caller's own filter key and value, so the read
@@ -1726,6 +1795,47 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     expect(rendered).toContain('| Pub <genus> &lt;');
   });
 
+  it('analyze_trends: null-label fallback keys stay literal on both surfaces (gh #119)', async () => {
+    const groups = [
+      { key: '# Heading *key*', key_display_name: null, count: 2 },
+      { key: '[ref]: http://x.test', key_display_name: null, count: 1 },
+      { key: 'https://openalex.org/languages/unknown', key_display_name: null, count: 3 },
+    ];
+    vi.mocked(globalThis.fetch).mockImplementationOnce(async () =>
+      Response.json({
+        meta: { count: 6, groups_count: 3 },
+        group_by: groups,
+      }),
+    );
+    const { analyzeTrendsTool } = await import(
+      '@/mcp-server/tools/definitions/analyze-trends.tool.js'
+    );
+    const result = await runToolContract(analyzeTrendsTool, {
+      entity_type: 'works',
+      group_by: 'language:include_unknown',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      groups: [
+        { key: '# Heading *key*', key_display_name: null, count: 2 },
+        { key: '[ref]: http://x.test', key_display_name: null, count: 1 },
+        {
+          key: 'https://openalex.org/languages/unknown',
+          key_display_name: null,
+          count: 3,
+          is_unknown: true,
+        },
+      ],
+    });
+    const markdown = contentText(result);
+    expectInertMarkdown(markdown);
+    expect(nodeTypes(markdown)).not.toContain('heading');
+    const rendered = renderedText(markdown);
+    expect(rendered).toContain('# Heading *key*: 2');
+    expect(rendered).toContain('[ref]: http://x.test: 1');
+    expect(rendered).toContain('unknown (no value; key https://openalex.org/languages/unknown): 3');
+  });
+
   it('analyze_trends: labels at the line start stay text; keys stay byte-identical', async () => {
     const { analyzeTrendsTool } = await import(
       '@/mcp-server/tools/definitions/analyze-trends.tool.js'
@@ -1827,7 +1937,6 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
 
   const ESCAPE_CASES: [string, (size: number) => string][] = [
     ['underscore runs', (n) => build('_', n)],
-    ['entity-like & runs', (n) => build('&amp', n)],
     ['< before letters', (n) => build('<a', n)],
     ['](  pairs', (n) => build('](', n)],
     ['backslash runs', (n) => build('\\', n)],
@@ -1860,6 +1969,40 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
       expect(t80k).toBeLessThan(100);
     }
   });
+
+  /**
+   * Thread CPU time excludes scheduler delays from the ratio. It covers 64× growth,
+   * with an outcome and absolute bound at every doubling, including 5k, 20k, 80k, and 320k.
+   */
+  const CPU_ESCAPE_CASES: [string, (size: number) => string, (size: number) => string][] = [
+    ['entity-like & runs', (n) => build('&amp', n), (n) => build('&amp', n)],
+    ['nested < openers', (n) => '<a'.repeat(n / 2), (n) => '\\<a'.repeat(n / 2)],
+    [
+      'entity-like runs ending in a line break',
+      (n) => `${build('&amp', n - 1)}\n`,
+      (n) => `${build('&amp', n - 1)} `,
+    ],
+    [
+      'entity-like runs with breaks throughout',
+      (n) => build('&amp\n', n),
+      (n) => build('&amp ', n),
+    ],
+  ];
+
+  it.each(CPU_ESCAPE_CASES)(
+    'escapeMarkdown: %s',
+    { timeout: 30_000 },
+    async (_label, make, expected) => {
+      const { escapeMarkdown } = await import('@/mcp-server/tools/escape-markdown.js');
+      for (const position of ['inline', 'line-start', 'heading'] as const) {
+        expectLinearCpuTime(5_000, (size) => {
+          const input = make(size);
+          expect(escapeMarkdown(input, position)).toBe(expected(size));
+          return cpuMsPerCall((s) => escapeMarkdown(s, position), input);
+        });
+      }
+    },
+  );
 });
 
 /**

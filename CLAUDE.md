@@ -42,6 +42,8 @@ No resources — entity lookups need `select` for payload control, which fits to
 | `OPENALEX_API_KEY` | No | OpenAlex account API key, sent as `api_key=` (free from https://openalex.org/settings/api); omit for anonymous access |
 | `OPENALEX_MAILTO` | No | Email sent as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key |
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
+| `OPENALEX_FILTER_STRING_INPUT` | No | Default: `true`; accept unambiguous native filter strings on `openalex_search_entities`; `false` restores record-only input. Strict boolean parsing rejects invalid values. |
+| `OPENALEX_CLAMP_PER_PAGE` | No | Default: `true`; clamp positive integer `per_page` to 100 for search/citation and 200 for analysis, with a notice, log, and counter. `false` restores rejecting advertised maxima. Strict boolean parsing; semantic cap 50 and sample maxima still reject. |
 
 **Session mode:** `createApp({ sessionMode: 'stateless' })` in `src/index.ts` — no tool gates on `ctx.requestInput`, so every call completes in one round trip. An explicit `MCP_SESSION_MODE` still overrides it; `.env.example` and the `Dockerfile` set the same value. No service holds a watcher, socket, or ref'd timer, so there is no `teardown` hook.
 
@@ -189,6 +191,8 @@ async handler(input, ctx) {
 
 **Declare contracts inline on each tool, even when similar across tools.** The contract is part of the tool's documented public surface — reading one tool definition file should give the full picture. Don't extract a shared `errors[]` constant; per-tool repetition is the intended cost of locality.
 
+Native-filter parser failures raised during schema preprocessing carry explicit recovery guidance: the handler boundary has not run yet, so handler-contract hint filling cannot supply it.
+
 The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Three service throws set their own `recovery: { hint }`, which wins over the fill: the PMCID 404, since the generic "verify the ID" recovery would send the caller back to retry an identifier OpenAlex never indexes; `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone); and `upstream_unavailable` on a semantic search — including the HTTP 400 `Failed to embed query:` and `Semantic search is not configured` bodies, relabelled from caller errors to that outage — whose hint adds the keyword-search fallback the generic outage recovery cannot name. One status is read past its code: an HTTP 429 whose body `error` is `Plan upgrade required` — a filter OpenAlex serves only on a paid plan — is thrown as `Forbidden` with `upstream_plan_required` and `retryable: false` under a message of the server's own, so it fails on its first request — no wait clears a plan gate. Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_with_page`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, and `slice_field_not_array` on `openalex_search_entities`; `reserved_filter_key` and the seed-lookup `entity_not_found` on `openalex_get_citation_graph`; `filters_without_entity_type` on `openalex_resolve_name`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
@@ -210,12 +214,12 @@ See framework CLAUDE.md for the full auto-classification table and all available
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # OPENALEX_API_KEY, OPENALEX_MAILTO, OPENALEX_BASE_URL
+    server-config.ts                    # OpenAlex API access and input compatibility switches
   services/
     openalex/
       openalex-service.ts               # API client (init/accessor pattern)
       types.ts                          # Domain types
-      filter-values.ts                  # Filter values as OpenAlex reads them: country/language codes, quoted multi-word names, `+` as AND
+      filter-values.ts                  # Native filter-string parsing and filter values: country/language codes, quoted phrases, `+` as AND
       iso-codes.json                    # ISO 3166-1 / 639-2 lookups (generated by scripts/generate-iso-codes.ts)
       provider-text.ts                  # Cleanup of provider text: entities, markup, MathType blobs
       html-entities.json                # WHATWG named-entity table provider-text.ts decodes against
@@ -229,6 +233,7 @@ src/
       render-entity-record.ts           # Entity records as content[] markdown
       render-budget.ts                  # The budget trailer line
       response-budget.ts                # 64,000-byte response budget and its disclosures
+      page-size.ts                      # Configurable page-size validation and disclosed clamping
     tools/definitions/
       search-entities.tool.ts           # openalex_search_entities
       analyze-trends.tool.ts            # openalex_analyze_trends

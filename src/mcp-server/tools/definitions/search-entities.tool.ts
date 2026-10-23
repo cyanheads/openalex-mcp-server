@@ -5,6 +5,9 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { ATTR_MCP_TOOL_NAME, createCounter } from '@cyanheads/mcp-ts-core/utils';
+import { getServerConfig } from '@/config/server-config.js';
+import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import {
   type BudgetDisclosure,
@@ -18,7 +21,7 @@ import {
   overBudgetOutputSchema,
   windowsOutputSchema,
 } from '@/mcp-server/tools/response-budget.js';
-import { quoteCallerText } from '@/services/openalex/filter-values.js';
+import { parseNativeFilters, quoteCallerText } from '@/services/openalex/filter-values.js';
 import { getOpenAlexService, selectRecordKey } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -26,6 +29,36 @@ const SEMANTIC_PER_PAGE_CAP = 50;
 const SAMPLE_MAX = 100;
 /** What `meta.count` counts, in the rendered header. */
 const RESULT_NOUN = 'result(s)';
+
+const canonicalFilters = z.record(z.string(), z.string());
+const { $schema: _schema, ...filterProjection } = z.toJSONSchema(canonicalFilters, { io: 'input' });
+/** Provenance belongs to the parsed call; only the canonical record is sent to the service. */
+const normalizedFilters = z
+  .preprocess(
+    (raw, ctx) => {
+      /**
+       * Leave JSON-object representations to the framework's existing record repair. Report
+       * canonical paths so repairs target caller fields rather than the internal wrapper.
+       */
+      const converted =
+        typeof raw === 'string' &&
+        !raw.trimStart().startsWith('{') &&
+        getServerConfig().filterStringInput;
+      const parsed = canonicalFilters.safeParse(converted ? parseNativeFilters(raw) : raw);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) ctx.addIssue({ ...issue });
+        return z.NEVER;
+      }
+      return { value: parsed.data, converted };
+    },
+    z.object({ value: canonicalFilters, converted: z.boolean() }),
+  )
+  .meta({ ...filterProjection, properties: undefined, required: undefined });
+const filterStringConversions = createCounter(
+  'openalex.filter_string.conversions',
+  'Native filter strings converted to records',
+  '{conversion}',
+);
 
 type SearchEchoInput = {
   entity_type: string;
@@ -97,11 +130,34 @@ function isContinuationPage(input: {
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. Responses cap at 64,000 bytes per surface unless the least a call can return is larger (`over_budget`); `omitted` and `windows` give the calls that continue a cut, and `slice` pages a long array.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Filters take a record object; an unambiguous native string such as "issn:0920-8542" is also accepted when enabled and disclosed in `notice`. Native clauses split on commas outside paired double quotes and the first colon; duplicate keys and bare fragments are rejected. Any filter value sent unquoted must have paired double quotes; balanced search phrases remain valid. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. Responses cap at 64,000 bytes per surface unless the least a call can return is larger (`over_budget`); `omitted` and `windows` give the calls that continue a cut, and `slice` pages a long array.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   errors: [
+    {
+      reason: 'invalid_filter_string',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A native filter string has an incomplete clause or unmatched double quotes.',
+      recovery:
+        'Pass filters as a record object with one key per field, and pair any double quotes in search phrases.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'duplicate_filter_string_key',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A native filter string repeats an exact key.',
+      recovery:
+        'A filters record object holds one key per field; combine alternatives with "|", or run separate calls.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'unmatched_quote_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A filter value sent unquoted has an unmatched double quote.',
+      recovery: 'Pair double quotes used for a search phrase, or remove the stray quote.',
+      thrownBy: 'service',
+    },
     {
       reason: 'semantic_per_page_cap',
       code: JsonRpcErrorCode.ValidationError,
@@ -362,8 +418,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .describe(
         `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity over a query-dependent candidate set whose size \`meta.count\` reports, at ~1 req/sec, up to ${SEMANTIC_PER_PAGE_CAP} per page, and paginated with \`page\` rather than \`cursor\`.`,
       ),
-    filters: z
-      .record(z.string(), z.string())
+    filters: normalizedFilters
       .optional()
       .describe(
         'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate ("us+gb"); inside a `.search` value, a DOI, a date (a timestamp\'s "+00:00" offset), a URL field such as landing_page_url, an exactly matched name (display_name, awards.funder_display_name — "C++", "Erasmus+"), a biblio field (issue "1+2"), or awards.funder_award_id, "+" is a literal character. A value cannot mix "|" with an AND operator — a "+", or a space between values on an ID, code, or `language` key (a space inside a language name is part of the name, and a country field never reads a space as AND) — OpenAlex splits it on "|" first and drops every alternative that ANDs more than one value, so such a value is rejected; put the AND in a second key instead ("institutions.country_code": "US" beside "authorships.institutions.country_code": "DE|FR" on works). On a field matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, biblio fields), a space is part of the value: "New York", "!New York", and "New York|Boston" match as written, but quotes around one "|" alternative make that alternative match nothing. A comma is part of such a value too ("University of California, Berkeley" on raw_affiliation_strings): a value holding one is sent as one quoted phrase, its "+" a literal character. A value sent as a quoted phrase cannot contain a double quote of its own. A multi-word value there cannot be ANDed with another ("New York+Boston" matches nothing); to require two funders or institutions, AND their IDs (awards.funder_id, authorships.institutions.id). Country fields (keys ending in country_code, country_codes, or countries) take ISO 3166-1 alpha-2 codes ("DE"): an alpha-3 code ("DEU"), numeric code ("276"), or English name ("Germany", "South Korea") is converted, "UK" becomes "GB", and a value that cannot be a country code is rejected. A space there is part of a name, never a separator: "South Korea|Japan" ORs two countries, and "DE US" is rejected. `language` takes ISO 639-1 codes ("en"): an ISO 639-2 code ("eng") or English name ("English") is converted. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
@@ -380,14 +435,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .describe(
         'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. Large projections may be cut to fit the response budget (`omitted`, `windows`). Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
       ),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
+    per_page: pageSizeSchema(100)
       .default(25)
       .describe(
-        'Results per page (1-100). Default 25. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The cap applies to searches only; an `id` lookup returns its one record regardless of both. A budget-cut page returns fewer (`omitted`).',
+        'Results per page. Default 25; positive integers above 100 clamp to 100 with a notice unless OPENALEX_CLAMP_PER_PAGE=false restores rejection. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The semantic cap checks the requested size. An `id` lookup ignores page size, and `sample` overrides it. A budget-cut page returns fewer (`omitted`).',
       ),
     cursor: z
       .string()
@@ -435,7 +486,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       })
       .optional()
       .describe(
-        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. Walks any partial array, including a possibly capped 100-entry `authorships` or `author_list`.',
+        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. A 100-author list cap can be continued on the singleton; at 5,000 stored authors the byline remains possibly capped, but `next` is null once stored entries are exhausted.',
       ),
   }),
   output: z.object({
@@ -449,7 +500,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         per_page: z
           .number()
           .describe(
-            'Page size OpenAlex echoed for this request — the requested per_page, not the number of records returned. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
+            'Page size OpenAlex echoed for this request — the applied per_page after clamping or sample override, not the number of records returned. A singleton reports 1. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
           ),
         next_cursor: z
           .string()
@@ -502,7 +553,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when a first call returns no results (echoes the criteria and suggests how to broaden), when a paginated call ran past its last page (says the traversal is finished instead of advising a broader query), when an `id` lookup was passed search criteria it does not apply (names them), on every semantic search to disclose that `meta.count` is a candidate total rather than a match total, when the response budget cut records, windowed an array, or ran over, when a list record carries exactly 100 authorships or author_list entries (possibly capped), when a `slice` offset is past the end of its array, and when `slice` was passed with `select`, which it replaces. Absent otherwise.',
+        'Guidance notice. Set when per_page was clamped (requested and applied sizes), a native filter string was converted, a first call has no matches, a continuation is exhausted, an id lookup ignores search criteria, semantic search reports a candidate total, the response budget cut records, windowed an array, or ran over, an author array is possibly capped (100 list entries or 5,000 stored singleton entries), a slice offset is past the end, or slice replaces select. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -534,7 +585,13 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     budget: { render: renderBudgetTrailer },
   },
 
-  async handler(input, ctx) {
+  async handler(parsedInput, ctx) {
+    const { filters: normalized, ...rest } = parsedInput;
+    const input = { ...rest, filters: normalized?.value };
+    if (normalized?.converted) {
+      ctx.log.info('Converted native filter string', { tool: 'openalex_search_entities' });
+      filterStringConversions.add(1, { [ATTR_MCP_TOOL_NAME]: 'openalex_search_entities' });
+    }
     // A form client sends an empty `slice.field` for an unset slice; an empty field is no slice.
     const slice = input.slice?.field ? input.slice : undefined;
     if (slice && !input.id) {
@@ -651,6 +708,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       }
     }
 
+    const pageSize =
+      input.id || input.sample !== undefined
+        ? { applied: input.per_page, notice: undefined }
+        : clampPageSize(input.per_page, 100, 'openalex_search_entities', ctx);
     const service = getOpenAlexService();
     const result = await service.search(
       {
@@ -661,7 +722,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         filters: input.filters,
         sort: input.sort,
         select: slice ? [slice.field] : input.select,
-        perPage: input.per_page,
+        perPage: pageSize.applied,
         cursor: input.cursor,
         page: input.page,
         sample: input.sample,
@@ -682,6 +743,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     ctx.enrich({ echo, totalCount: result.meta.count });
 
     const notices: string[] = [];
+    if (pageSize.notice) notices.push(pageSize.notice);
+    if (normalized?.converted) {
+      notices.push('Converted native filter string to a filters record object.');
+    }
 
     // An `id` lookup always returns its one record or throws, so it never reaches the
     // empty-results notice — the two branches are exclusive, and the dropped-parameter

@@ -27,6 +27,8 @@
         "OPENALEX_API_KEY": "${user_config.OPENALEX_API_KEY}",
         "OPENALEX_MAILTO": "${user_config.OPENALEX_MAILTO}",
         "OPENALEX_BASE_URL": "${user_config.OPENALEX_BASE_URL}",
+        "OPENALEX_FILTER_STRING_INPUT": "${user_config.OPENALEX_FILTER_STRING_INPUT}",
+        "OPENALEX_CLAMP_PER_PAGE": "${user_config.OPENALEX_CLAMP_PER_PAGE}",
         "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
@@ -66,6 +68,20 @@
       "title": "Log Level",
       "description": "Minimum log level (debug, info, notice, warning, error, crit, alert, emerg).",
       "default": "info",
+      "required": false
+    },
+    "OPENALEX_CLAMP_PER_PAGE": {
+      "type": "string",
+      "title": "Clamp page size",
+      "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+      "default": "true",
+      "required": false
+    },
+    "OPENALEX_FILTER_STRING_INPUT": {
+      "type": "string",
+      "title": "Native filter string input",
+      "description": "Accept unambiguous native filter strings on search_entities. Set false to require record objects.",
+      "default": "true",
       "required": false
     }
   }

@@ -42,6 +42,72 @@ export function quoteCallerText(text: string): string {
   return JSON.stringify(text.length > ECHO_MAX_CHARS ? `${text.slice(0, ECHO_MAX_CHARS)}…` : text);
 }
 
+/** Parse native clauses without splitting quoted commas or colons inside a value. */
+export function parseNativeFilters(input: string): Record<string, string> {
+  const filters: Record<string, string> = Object.create(null);
+  let quoted = false;
+  let start = 0;
+  let colon = -1;
+  for (let index = 0; index <= input.length; index++) {
+    const char = input[index];
+    if (char === '"') quoted = !quoted;
+    if (char === ':' && colon === -1 && !quoted) colon = index;
+    if (index !== input.length && (char !== ',' || quoted)) continue;
+    if (quoted) {
+      throw validationError(
+        'Native filter string has unmatched double quotes. Pair the quotes, or pass filters as a record object with one key per field.',
+        {
+          reason: 'invalid_filter_string',
+          recovery: {
+            hint: 'Pass filters as a record object with one key per field, and pair any double quotes in search phrases.',
+          },
+        },
+      );
+    }
+    const key = input.slice(start, colon === -1 ? start : colon).trim();
+    if (colon < start || key.length === 0) {
+      throw validationError(
+        'Each native filter clause needs a nonempty key followed by a colon. Pass filters as a record object with one key per field.',
+        {
+          reason: 'invalid_filter_string',
+          recovery: {
+            hint: 'Pass filters as a record object with one key per field, and pair any double quotes in search phrases.',
+          },
+        },
+      );
+    }
+    if (Object.hasOwn(filters, key)) {
+      throw validationError(
+        'Native filter string repeats a key. A filters record object holds one key per field; combine alternatives with "|", or run separate calls.',
+        {
+          reason: 'duplicate_filter_string_key',
+          filterKey: key,
+          recovery: {
+            hint: 'A filters record object holds one key per field; combine alternatives with "|", or run separate calls.',
+          },
+        },
+      );
+    }
+    filters[key] = input.slice(colon + 1, index);
+    start = index + 1;
+    colon = -1;
+  }
+  return filters;
+}
+
+/** Reject an unpaired quote only on values that remain unquoted on the upstream wire. */
+function assertPairedQuotes(key: string, value: string): void {
+  let quoted = false;
+  for (let index = value.indexOf('"'); index !== -1; index = value.indexOf('"', index + 1))
+    quoted = !quoted;
+  if (quoted) {
+    throw validationError(
+      `Filter ${quoteCallerText(key)} value has an unmatched double quote. Pair double quotes used for a search phrase, or remove the stray quote.`,
+      { reason: 'unmatched_quote_in_filter_value', filterKey: key },
+    );
+  }
+}
+
 /**
  * Reject a double-quoted value, `sent` exactly as the clause sends it, when a `"` sits inside its
  * outer pair (a leading `!` aside). OpenAlex ends a quoted phrase at the next `"` with no escape
@@ -307,6 +373,7 @@ export function upstreamFilterValue(key: string, value: string): string {
     assertNoInteriorQuote(key, converted);
     return converted;
   }
+  assertPairedQuotes(key, converted);
   if (keepsPlusLiteral(field)) return converted;
   return converted.replaceAll('+', ' ');
 }

@@ -15,9 +15,10 @@ import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
 
 const mockAnalyze = vi.fn<() => Promise<AnalyzeResult>>();
 
-vi.mock('@/services/openalex/openalex-service.js', () => ({
-  getOpenAlexService: () => ({ analyze: mockAnalyze }),
-}));
+vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/openalex/openalex-service.js')>();
+  return { ...actual, getOpenAlexService: () => ({ analyze: mockAnalyze }) };
+});
 
 const { analyzeTrendsTool } = await import('@/mcp-server/tools/definitions/analyze-trends.tool.js');
 
@@ -25,6 +26,57 @@ const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]
   createCoreMockContext({ ...options, errors: analyzeTrendsTool.errors });
 
 describe('analyzeTrendsTool', () => {
+  it('uses the applied limit for a filled aggregation page and retains country guidance', async () => {
+    mockAnalyze.mockResolvedValue({
+      meta: { count: 200, groups_count: 200, next_cursor: null },
+      groups: Array.from({ length: 200 }, (_, n) => ({
+        key: String(n),
+        key_display_name: null,
+        count: 1,
+      })),
+    });
+    const result = await runToolContract(analyzeTrendsTool, {
+      entity_type: 'works',
+      group_by: 'authorships.countries',
+      per_page: 250,
+    });
+    expect(result.isError).toBeFalsy();
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('using per_page 200');
+    expect(notice).toContain('Showing the top 200 groups by count');
+    expect(notice).toContain('first 100 authorships');
+    expect(
+      result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+    ).toContain(notice);
+  });
+
+  it('clamps an oversized page and joins the empty-result notice on both surfaces', async () => {
+    mockAnalyze.mockResolvedValue({
+      meta: { count: 0, groups_count: 0, next_cursor: null },
+      groups: [],
+    });
+    const result = await runToolContract(analyzeTrendsTool, {
+      entity_type: 'works',
+      group_by: 'publication_year',
+      per_page: 250,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(mockAnalyze).toHaveBeenCalledWith(
+      expect.objectContaining({ perPage: 200 }),
+      expect.anything(),
+    );
+    expect(result.structuredContent).toMatchObject({
+      notice: expect.stringContaining(
+        'per_page 250 exceeds the maximum of 200; using per_page 200.',
+      ),
+    });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('per_page 250 exceeds the maximum of 200; using per_page 200.');
+    expect(text).toContain('No groups returned');
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -134,14 +186,14 @@ describe('analyzeTrendsTool', () => {
     expect(mockAnalyze).toHaveBeenCalledWith(expect.objectContaining({ perPage: 25 }), ctx);
   });
 
-  it('rejects per_page outside 1-200', () => {
+  it('admits oversized positive pages while rejecting zero', () => {
     expect(() =>
       analyzeTrendsTool.input.parse({
         entity_type: 'works',
         group_by: 'publication_year',
         per_page: 201,
       }),
-    ).toThrow();
+    ).not.toThrow();
     expect(() =>
       analyzeTrendsTool.input.parse({
         entity_type: 'works',
@@ -384,7 +436,7 @@ describe('analyzeTrendsTool', () => {
       expect(notice).not.toMatch(/omitted group/);
     });
 
-    it('suppresses the notice on order:"key" when the traversal is complete (no next_cursor)', async () => {
+    it('keeps the stop guidance on order:"key" when no next_cursor is supplied (gh #108)', async () => {
       const groups = Array.from({ length: 5 }, (_, i) => ({
         key: `${1990 + i}`,
         key_display_name: `${1990 + i}`,
@@ -403,7 +455,7 @@ describe('analyzeTrendsTool', () => {
       });
 
       await analyzeTrendsTool.handler(input, ctx);
-      expect(getEnrichment(ctx).notice).toBeUndefined();
+      expect(getEnrichment(ctx).notice).toContain('short or empty');
     });
 
     it('still emits the count-bound notice when order is explicitly "count" and the page is full', async () => {
@@ -995,12 +1047,295 @@ describe('analyzeTrendsTool', () => {
     });
   });
 
+  describe('aggregation contracts through the real service', () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    beforeEach(async () => {
+      fetchMock.mockReset();
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockAnalyze.mockImplementation((...args: unknown[]) =>
+        service.analyze(...(args as Parameters<typeof service.analyze>)),
+      );
+    });
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    function reply(groups: unknown[], count: number, nextCursor: string | null = null) {
+      fetchMock.mockImplementationOnce(async () =>
+        Response.json({
+          meta: { count, groups_count: groups.length, next_cursor: nextCursor },
+          group_by: groups,
+        }),
+      );
+    }
+
+    it.each(['count', undefined] as const)(
+      'uses effective key order with a cursor and order %s (gh #41)',
+      async (order) => {
+        reply(
+          [
+            { key: '1007', key_display_name: '1007', count: 1 },
+            { key: '1019', key_display_name: '1019', count: 1 },
+            { key: '1400', key_display_name: '1400', count: 2188 },
+          ],
+          328395448,
+          'IjE0MDAi',
+        );
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: 'publication_year',
+          per_page: 3,
+          order,
+          cursor: '*',
+        });
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('cursor')).toBe('*');
+        const structured = result.structuredContent as AnalyzeResult & {
+          echo: string;
+          notice: string;
+        };
+        expect(structured.meta.next_cursor).toBe('IjE0MDAi');
+        expect(structured.groups.map((g) => g.key)).toEqual(['1007', '1019', '1400']);
+        expect(structured.echo).toContain('order=key');
+        for (const surface of [structured.notice, textOf(result)]) {
+          expect(surface).toContain('key-ascending order');
+          expect(surface).not.toContain('top 3 groups by count');
+          expect(surface).not.toContain('omitted group has count');
+        }
+      },
+    );
+
+    it.each(['has_doi', 'has_doi:include_unknown'])(
+      'reports effective count order for boolean field %s (gh #41)',
+      async (groupBy) => {
+        const groups = [
+          { key: 'true', key_display_name: 'true', count: 2 },
+          { key: 'false', key_display_name: 'false', count: 1 },
+        ];
+        reply(groups, 3);
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: groupBy,
+          order: 'key',
+          per_page: 2,
+        });
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.has('cursor')).toBe(
+          false,
+        );
+        expect(result.structuredContent).toMatchObject({
+          groups,
+          echo: expect.stringContaining('order=count'),
+          notice: expect.stringContaining('top 2 groups by count'),
+        });
+        expect(textOf(result)).toContain('true: 2\nfalse: 1');
+        expect(textOf(result)).not.toContain('key-ascending');
+        expect(textOf(result)).not.toContain('wrap');
+      },
+    );
+
+    it.each([undefined, false, true])(
+      'normalizes the suffix with include_unknown=%s once (gh #75)',
+      async (includeUnknown) => {
+        reply(
+          [
+            { key: '2026', key_display_name: '2026', count: 8898 },
+            { key: '-111', key_display_name: '-111', count: 230 },
+          ],
+          148899,
+        );
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: 'publication_year:include_unknown',
+          include_unknown: includeUnknown,
+          filters: { 'title.search': 'groundwater' },
+        });
+        expect(result.isError).toBeFalsy();
+        const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+        expect(url.searchParams.get('group_by')).toBe('publication_year:include_unknown');
+        const structured = result.structuredContent as AnalyzeResult & { echo: string };
+        expect(structured.groups[1]).toEqual({
+          key: '-111',
+          key_display_name: '-111',
+          count: 230,
+          is_unknown: true,
+        });
+        expect(structured.echo).toContain('include_unknown=true');
+        expect(textOf(result)).toContain('unknown (no value; key -111): 230');
+        expect(textOf(result)).toContain('include_unknown=true');
+      },
+    );
+
+    it.each([
+      [
+        [{ key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 58044 }],
+        ['https://openalex.org/languages/ceb: 58044'],
+      ],
+      [
+        [
+          { key: 'https://openalex.org/languages/en', key_display_name: 'English', count: 140942 },
+          { key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 8 },
+          { key: 'https://openalex.org/languages/中文', key_display_name: null, count: 6 },
+        ],
+        [
+          'English (https://openalex.org/languages/en): 140942',
+          'https://openalex.org/languages/ceb: 8',
+          'https://openalex.org/languages/中文: 6',
+        ],
+      ],
+      [
+        [{ key: 'unknown', key_display_name: null, count: 230, is_unknown: true }],
+        ['unknown (no value; key unknown): 230'],
+      ],
+    ] as const)(
+      'preserves nullable labels and every group through both surfaces: %j (gh #119)',
+      async (groups, lines) => {
+        // Values captured from language distributions; the null unknown fixture covers the independent flag.
+        reply([...groups], 148899);
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: 'works',
+          group_by: 'language',
+          include_unknown: true,
+        });
+        expect(result.isError).toBeFalsy();
+        expect((result.structuredContent as AnalyzeResult).groups).toEqual(groups);
+        const content = textOf(result);
+        for (const line of lines) {
+          expect(content).toContain(line);
+        }
+        expect(content).not.toContain('null');
+      },
+    );
+
+    it.each(['key', 'count', undefined] as const)(
+      'warns on every effective key page with order %s without suppressing its cursor (gh #108)',
+      async (order) => {
+        let nextInputCursor = '*';
+        for (const [groups, cursor] of [
+          [
+            [
+              { key: 'aa', key_display_name: 'Afar', count: 2 },
+              { key: 'ab', key_display_name: 'Abkhaz', count: 1 },
+            ],
+            'ImFiIg==',
+          ],
+          [[{ key: '영어', key_display_name: null, count: 1 }], 'Ilx1YzYwMVx1YzViNCI='],
+          [[{ key: 'aa', key_display_name: 'Afar', count: 2 }], 'ImFhIg=='],
+          [[], 'ImVtcHR5Ig=='],
+          [[], null],
+        ] as const) {
+          reply([...groups], 100, cursor);
+          const result = await runToolContract(analyzeTrendsTool, {
+            entity_type: 'works',
+            group_by: 'language',
+            order,
+            cursor: nextInputCursor,
+            per_page: 2,
+          });
+          expect(result.isError).toBeFalsy();
+          const structured = result.structuredContent as AnalyzeResult & { notice: string };
+          expect(structured.meta.next_cursor).toBe(cursor);
+          if (cursor !== null) expect(textOf(result)).toContain(cursor);
+          expect(structured.groups).toEqual(groups);
+          expect(new URL(String(fetchMock.mock.lastCall?.[0])).searchParams.get('cursor')).toBe(
+            nextInputCursor,
+          );
+          if (cursor !== null) nextInputCursor = cursor;
+          for (const surface of [structured.notice, textOf(result)]) {
+            expect(surface).toContain('wrap');
+            expect(surface).toContain('first key repeats');
+            expect(surface).toContain('short or empty');
+          }
+        }
+      },
+    );
+
+    it('preserves malformed-cursor rejection and its declared recovery on both surfaces', async () => {
+      fetchMock.mockImplementationOnce(async () =>
+        Response.json({ error: 'Pagination error.', message: 'Invalid cursor' }, { status: 400 }),
+      );
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'language',
+        cursor: 'malformed-cursor',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'upstream_invalid_params_other',
+            recovery: { hint: expect.stringContaining('adjust the request') },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('Invalid cursor');
+      expect(textOf(result)).toContain('upstream_invalid_params_other');
+      expect(textOf(result)).toContain('adjust the request');
+    });
+
+    it('keeps key_display_name required while accepting null (gh #119)', () => {
+      expect(
+        analyzeTrendsTool.output.safeParse({
+          meta: { count: 1, groups_count: 1, next_cursor: null },
+          groups: [{ key: 'ceb', count: 1 }],
+        }).success,
+      ).toBe(false);
+      expect(
+        analyzeTrendsTool.output.safeParse({
+          meta: { count: 1, groups_count: 1, next_cursor: null },
+          groups: [{ key: 'ceb', key_display_name: null, count: 1 }],
+        }).success,
+      ).toBe(true);
+    });
+
+    it('warns about wrap and stopping in every continuation description (gh #108)', () => {
+      for (const description of [
+        analyzeTrendsTool.description,
+        analyzeTrendsTool.input.shape.order.description,
+        analyzeTrendsTool.input.shape.cursor.description,
+        analyzeTrendsTool.output.shape.meta.shape.next_cursor.description,
+      ]) {
+        expect(description).toContain('wrap');
+        expect(description).toContain('first key repeats');
+        expect(description).toContain('short or empty');
+      }
+    });
+  });
+
   /**
    * The filter path is shared by every filter-taking tool; this proves the tool reaches it with
    * the caller's filters and that the request carries what the service built, as sent. The
    * value table itself lives in the service suite.
    */
   describe('filters on the wire through the real service (gh #107, #101)', () => {
+    it.each(['title.search', 'abstract.search.exact', 'type'])(
+      'rejects an unmatched quote on %s before any request',
+      async (key) => {
+        const { result, fetchMock } = await run({ [key]: 'graph "neural' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'unmatched_quote_in_filter_value',
+              recovery: { hint: expect.stringContaining('Pair') },
+            },
+          },
+        });
+        expect(textOf(result)).toContain('unmatched_quote_in_filter_value');
+        expect(textOf(result)).toContain('Pair');
+      },
+    );
     afterEach(() => {
       vi.unstubAllGlobals();
     });

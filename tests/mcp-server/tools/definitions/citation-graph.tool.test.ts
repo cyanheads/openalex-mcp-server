@@ -63,6 +63,32 @@ function lookupResponse(workId: string): SearchResult {
 }
 
 describe('getCitationGraphTool', () => {
+  it('clamps an oversized page and joins the empty-result notice on both surfaces', async () => {
+    mockSearch
+      .mockResolvedValueOnce(lookupResponse('W1'))
+      .mockResolvedValueOnce({ meta: { count: 0, per_page: 100, next_cursor: null }, results: [] });
+    const result = await runToolContract(getCitationGraphTool, {
+      seed_id: 'W1',
+      direction: 'cites',
+      per_page: 150,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(mockSearch).toHaveBeenLastCalledWith(
+      expect.objectContaining({ perPage: 100 }),
+      expect.anything(),
+    );
+    expect(result.structuredContent).toMatchObject({
+      notice: expect.stringContaining(
+        'per_page 150 exceeds the maximum of 100; using per_page 100.',
+      ),
+    });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('per_page 150 exceeds the maximum of 100; using per_page 100.');
+    expect(text).toContain('No edges');
+  });
+
   beforeEach(() => {
     // Reset, not clear: a test that rejects before the service drops once-values it queued.
     vi.resetAllMocks();
@@ -951,6 +977,25 @@ describe('getCitationGraphTool', () => {
    * value table itself lives in the service suite.
    */
   describe('filters on the wire through the real service (gh #107, #101)', () => {
+    it.each(['title.search', 'abstract.search.exact', 'type'])(
+      'rejects an unmatched quote on %s before the seed lookup',
+      async (key) => {
+        const { result, fetchMock } = await run({ [key]: 'graph "neural' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'unmatched_quote_in_filter_value',
+              recovery: { hint: expect.stringContaining('Pair') },
+            },
+          },
+        });
+        expect(textOf(result)).toContain('unmatched_quote_in_filter_value');
+        expect(textOf(result)).toContain('Pair');
+      },
+    );
     afterEach(() => {
       vi.unstubAllGlobals();
     });

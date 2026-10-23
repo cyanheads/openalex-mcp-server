@@ -20,6 +20,14 @@ const ServerConfigSchema = z.object({
       'Optional email sent upstream as mailto= to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from and not a substitute for the API key',
     ),
   baseUrl: z.string().url().default('https://api.openalex.org').describe('OpenAlex API base URL'),
+  filterStringInput: z
+    .stringbool()
+    .default(true)
+    .describe('Accept unambiguous native filter strings on openalex_search_entities'),
+  clampPerPage: z
+    .stringbool()
+    .default(true)
+    .describe('Clamp oversized per_page values to each tool maximum, with a notice'),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -31,6 +39,8 @@ export function getServerConfig(): ServerConfig {
     apiKey: 'OPENALEX_API_KEY',
     mailto: 'OPENALEX_MAILTO',
     baseUrl: 'OPENALEX_BASE_URL',
+    filterStringInput: 'OPENALEX_FILTER_STRING_INPUT',
+    clampPerPage: 'OPENALEX_CLAMP_PER_PAGE',
   });
   return _config;
 }

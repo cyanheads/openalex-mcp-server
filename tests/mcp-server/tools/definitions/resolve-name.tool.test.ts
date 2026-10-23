@@ -1604,6 +1604,25 @@ describe('resolveNameTool', () => {
    * sent. The value table itself lives in the service suite.
    */
   describe('filters on the wire through the real service (gh #107, #101)', () => {
+    it.each(['title.search', 'abstract.search.exact', 'type'])(
+      'rejects an unmatched quote on %s before any request',
+      async (key) => {
+        const { result, fetchMock } = await run({ [key]: 'graph "neural' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'unmatched_quote_in_filter_value',
+              recovery: { hint: expect.stringContaining('Pair') },
+            },
+          },
+        });
+        expect(textOf(result)).toContain('unmatched_quote_in_filter_value');
+        expect(textOf(result)).toContain('Pair');
+      },
+    );
     afterEach(() => {
       vi.unstubAllGlobals();
     });

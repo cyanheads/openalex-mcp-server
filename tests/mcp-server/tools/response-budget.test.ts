@@ -315,6 +315,121 @@ describe('response budget helper (gh #72, #73)', () => {
   describe('possibly-capped author arrays (gh #102)', () => {
     const measureFrame = constantFrame(1_000, 1_000);
 
+    it.each(['authorships', 'author_list'])(
+      'discloses a tiny whole 5,000-entry %s on both wire surfaces',
+      async (field) => {
+        mockSearch.mockResolvedValue({
+          meta: { count: 1, per_page: 1, next_cursor: null },
+          results: [{ id: 'W1', display_name: null, [field]: Array(5000).fill(null) }],
+        });
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W1',
+          select: [field],
+        });
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          windows: [{ field, total: 5000, shown: 5000, possibly_capped: true, next: null }],
+          notice: expect.stringContaining('stored entries'),
+        });
+        const text = result.content
+          .map((block) => (block.type === 'text' ? block.text : ''))
+          .join('\n');
+        expect(text).toContain('5,000');
+        expect(text).toContain('snapshots cannot recover');
+        expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(64_000);
+        expect(utf8Bytes(text)).toBeLessThanOrEqual(64_000);
+      },
+    );
+
+    it('discloses both selected author fields at the storage ceiling when budget-windowed', () => {
+      const record = { ...workWithAuthorList(1, 5000), authorships: authorships(5000) };
+      const page = fitRecordsToBudget({
+        records: [record],
+        entityType: 'works',
+        path: 'lookup',
+        select: ['authorships', 'author_list'],
+        measureFrame,
+      });
+      expect(page.disclosure.windows).toHaveLength(2);
+      expect(page.disclosure.windows?.map((window) => window.field).sort()).toEqual([
+        'author_list',
+        'authorships',
+      ]);
+      for (const window of page.disclosure.windows ?? []) {
+        expect(window).toMatchObject({ offset: 0, total: 5000, possibly_capped: true });
+        expect(window.shown).toBeGreaterThan(0);
+        expect(window.shown).toBeLessThan(5000);
+        expect(window.next?.arguments).toMatchObject({
+          slice: { field: window.field, offset: window.shown },
+        });
+      }
+      expect(page.notice).toContain('stored entries');
+    });
+
+    it.each(['authorships', 'author_list'])(
+      'keeps a below-ceiling singleton %s certain',
+      (field) => {
+        const page = fitRecordsToBudget({
+          records: [{ id: 'W1', display_name: null, [field]: Array(4999).fill(null) }],
+          entityType: 'works',
+          path: 'lookup',
+          select: [field],
+          measureFrame,
+        });
+        expect(page.disclosure.windows).toBeUndefined();
+        expect(page.notice).toBeUndefined();
+      },
+    );
+
+    it.each(['authorships', 'author_list'])(
+      'discloses a whole singleton %s at the storage ceiling',
+      (field) => {
+        const page = fitRecordsToBudget({
+          records: [{ id: 'W1', display_name: null, [field]: Array(5000).fill(null) }],
+          entityType: 'works',
+          path: 'lookup',
+          select: [field],
+          measureFrame,
+        });
+        expect(page.results[0]?.[field]).toHaveLength(5000);
+        expect(page.disclosure.windows).toEqual([
+          {
+            id: 'W1',
+            field,
+            offset: 0,
+            shown: 5000,
+            total: 5000,
+            possibly_capped: true,
+            next: null,
+          },
+        ]);
+        expect(page.notice).toContain('5,000');
+        expect(page.notice).toContain('stored');
+      },
+    );
+
+    it.each(['authorships', 'author_list'])('keeps capped singleton %s slices finite', (field) => {
+      const record = { id: 'W1', display_name: null, [field]: Array(5000).fill(null) };
+      for (const [offset, shown] of [
+        [4999, 1],
+        [5000, 0],
+        [5001, 0],
+      ]) {
+        const page = fitSliceToBudget({
+          record,
+          field,
+          offset: offset!,
+          entityType: 'works',
+          measureFrame,
+        });
+        expect(page.disclosure.windows).toEqual([
+          { id: 'W1', field, offset, shown, total: 5000, possibly_capped: true, next: null },
+        ]);
+        expect(page.notice).toContain('5,000');
+      }
+    });
+
     const capWindowFor = (record: EntityRecord, field: string) => ({
       id: bareId(record.id),
       field,

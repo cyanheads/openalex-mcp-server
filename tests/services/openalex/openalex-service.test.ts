@@ -8,6 +8,7 @@ import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { parseNativeFilters } from '@/services/openalex/filter-values.js';
 import { DEFAULT_SELECT, type EntityType } from '@/services/openalex/types.js';
 
 /** The `structuredContent.error` a failed tool call returns. */
@@ -2490,6 +2491,44 @@ describe('OpenAlexService', () => {
 
   // --- Country and language filter values (gh #101) ---
 
+  describe('native filter clauses', () => {
+    it.each([
+      ['issn:0920-8542', { issn: '0920-8542' }],
+      ['doi:https://doi.org/10.1136/bmj.n160', { doi: 'https://doi.org/10.1136/bmj.n160' }],
+      [
+        'title.search:"graph, neural",type:article',
+        { 'title.search': '"graph, neural"', type: 'article' },
+      ],
+      [
+        'title.search:"graph neural" networks,type:article',
+        { 'title.search': '"graph neural" networks', type: 'article' },
+      ],
+      ['type: article ', { type: ' article ' }],
+      ['type:', { type: '' }],
+      ['__proto__:value,constructor:other', { ['__proto__']: 'value', constructor: 'other' }],
+      ['year:2020,publication_year:2024', { year: '2020', publication_year: '2024' }],
+    ])('preserves %j', (input, expected) => {
+      expect(parseNativeFilters(input)).toEqual(expected);
+    });
+
+    it.each([
+      ['type:article,type:book', 'duplicate_filter_string_key'],
+      ['title.search:graph, rag', 'invalid_filter_string'],
+      ['title.search:"graph,neural', 'invalid_filter_string'],
+      ['type:article,,year:2024', 'invalid_filter_string'],
+      ['type:article,   :value', 'invalid_filter_string'],
+    ])('refuses %j with a typed record-form recovery', (input, reason) => {
+      expect(() => parseNativeFilters(input)).toThrow(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            reason,
+            recovery: { hint: expect.stringContaining('record object') },
+          }),
+        }),
+      );
+    });
+  });
+
   /**
    * OpenAlex country fields hold ISO 3166-1 alpha-2 codes and `language` holds ISO 639-1 codes;
    * any other spelling still gets HTTP 200 and matches nothing (or, negated, everything). Each
@@ -3652,7 +3691,9 @@ describe('OpenAlexService', () => {
   // --- Unknown group_by bucket (gh #75) ---
 
   describe('unknown group_by bucket (gh #75)', () => {
-    function respondWithGroups(groups: { key: string; key_display_name: string; count: number }[]) {
+    function respondWithGroups(
+      groups: { key: string; key_display_name: string | null; count: number }[],
+    ) {
       vi.mocked(globalThis.fetch).mockImplementation(() =>
         Promise.resolve(
           new Response(JSON.stringify({ meta: { count: 100 }, group_by: groups }), {
@@ -3694,6 +3735,44 @@ describe('OpenAlexService', () => {
         createMockContext(),
       );
       expect(result.groups.every((g) => !('is_unknown' in g))).toBe(true);
+    });
+
+    it.each([undefined, false, true])(
+      'combines the native suffix with includeUnknown=%s (gh #75)',
+      async (includeUnknown) => {
+        respondWithGroups([
+          { key: '-111', key_display_name: '-111', count: 230 },
+          { key: '2026', key_display_name: '2026', count: 8898 },
+        ]);
+        const service = await getService();
+        const result = await service.analyze(
+          { entityType: 'works', groupBy: 'publication_year:include_unknown', includeUnknown },
+          createMockContext(),
+        );
+        expect(lastFetchUrl().searchParams.get('group_by')).toBe(
+          'publication_year:include_unknown',
+        );
+        expect(result.groups).toEqual([
+          { key: '-111', key_display_name: '-111', count: 230, is_unknown: true },
+          { key: '2026', key_display_name: '2026', count: 8898 },
+        ]);
+      },
+    );
+
+    it('preserves null labels on an unknown bucket and a known group (gh #119)', async () => {
+      respondWithGroups([
+        { key: 'unknown', key_display_name: null, count: 230 },
+        { key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 58044 },
+      ]);
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'language:include_unknown' },
+        createMockContext(),
+      );
+      expect(result.groups).toEqual([
+        { key: 'unknown', key_display_name: null, count: 230, is_unknown: true },
+        { key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 58044 },
+      ]);
     });
 
     it('flags nothing on a page with no unknown bucket', async () => {
@@ -4953,6 +5032,28 @@ describe('OpenAlexService', () => {
   // --- Analyze ---
 
   describe('analyze', () => {
+    it('preserves a required null language label before tool output validation (gh #119)', async () => {
+      routeFetch({
+        '/works': () =>
+          jsonResponse({
+            meta: { count: 58044, groups_count: 1 },
+            group_by: [
+              { key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 58044 },
+            ],
+          }),
+      });
+      const service = await getService();
+      const result = await service.analyze(
+        { entityType: 'works', groupBy: 'language', filters: { language: 'ceb' }, perPage: 2 },
+        createMockContext(),
+      );
+      expect(result.groups).toEqual([
+        { key: 'https://openalex.org/languages/ceb', key_display_name: null, count: 58044 },
+      ]);
+      expect(result.meta).toEqual({ count: 58044, groups_count: 1, next_cursor: null });
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+    });
+
     it('sets group_by param', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(

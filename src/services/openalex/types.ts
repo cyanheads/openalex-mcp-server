@@ -121,7 +121,9 @@ export interface AnalyzeParams {
   /**
    * Sort order for groups. Omit (or `"count"`) for count-descending — the top-N groups by
    * count, matching OpenAlex's native default. Pass `"key"` to enumerate all distinct values
-   * in key-ascending order with cursor pagination.
+   * in key-ascending order with cursor pagination. Boolean fields keep count order and do not
+   * support cursor pagination. A supplied cursor selects key order when upstream accepts it.
+   * OpenAlex can wrap to earlier groups; stop on a repeated first key or a short/empty page.
    */
   order?: 'count' | 'key' | undefined;
   perPage?: number | undefined;
@@ -165,7 +167,8 @@ export interface GroupRecord {
    */
   is_unknown?: true;
   key: string;
-  key_display_name: string;
+  /** Null when OpenAlex has no display label; the group key remains available. */
+  key_display_name: string | null;
 }
 
 export interface AutocompleteRecord {

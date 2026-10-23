@@ -16,6 +16,7 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clampPageSize } from '@/mcp-server/tools/page-size.js';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
 import {
@@ -29,6 +30,20 @@ import {
 } from '../../../helpers/openalex-records.js';
 
 const mockSearch = vi.fn<() => Promise<SearchResult>>();
+const mockConfig = vi.hoisted(() => ({
+  apiKey: '',
+  baseUrl: 'https://api.openalex.org',
+  mailto: '',
+  filterStringInput: true,
+  clampPerPage: true,
+}));
+const conversionMetrics = vi.hoisted(() => ({ add: vi.fn() }));
+const clampMetrics = vi.hoisted(() => ({ add: vi.fn() }));
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
+  createCounter: (name: string) =>
+    name === 'openalex.per_page.clamps' ? clampMetrics : conversionMetrics,
+}));
 
 /**
  * Only the service accessor is faked. `normalizeId` stays real, so the id cases can check the
@@ -44,7 +59,7 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
 
 /** A keyless server, for the one case that runs the real service (the budget 429). */
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: () => ({ apiKey: '', baseUrl: 'https://api.openalex.org', mailto: '' }),
+  getServerConfig: () => ({ ...mockConfig }),
 }));
 
 const {
@@ -62,8 +77,150 @@ const createMockContext = (options?: Parameters<typeof createCoreMockContext>[0]
   createCoreMockContext({ ...options, errors: searchEntitiesTool.errors });
 
 describe('searchEntitiesTool', () => {
+  it.each([
+    ['openalex_search_entities', 100],
+    ['openalex_get_citation_graph', 100],
+    ['openalex_analyze_trends', 200],
+  ] as const)('counts and logs every effective clamp for %s', (tool, maximum) => {
+    const ctx = createMockContext();
+    const log = vi.spyOn(ctx.log, 'info');
+    expect(clampPageSize(1000, maximum, tool, ctx)).toEqual({
+      applied: maximum,
+      notice: `per_page 1000 exceeds the maximum of ${maximum}; using per_page ${maximum}.`,
+    });
+    expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+      'mcp.tool.name': tool,
+      'openalex.per_page.maximum': maximum,
+    });
+    expect(log).toHaveBeenCalledExactlyOnceWith('Clamped per_page', {
+      tool,
+      requested: 1000,
+      applied: maximum,
+    });
+    expect(clampPageSize(maximum, maximum, tool, ctx)).toEqual({
+      applied: maximum,
+      notice: undefined,
+    });
+    mockConfig.clampPerPage = false;
+    expect(clampPageSize(1000, maximum, tool, ctx)).toEqual({ applied: 1000, notice: undefined });
+    expect(clampMetrics.add).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it('budgets a clamp alongside filter conversion, list cap and window notices', async () => {
+    mockSearch.mockResolvedValue({
+      meta: { count: 1, per_page: 100, next_cursor: null },
+      results: [
+        workWithAuthorships(1, 100, (n) => ({
+          ...authorship(n),
+          raw_affiliation_strings: ['Institute '.repeat(100)],
+        })),
+      ],
+    });
+    const result = await runToolContract(searchEntitiesTool, {
+      entity_type: 'works',
+      filters: 'type:article',
+      select: ['authorships'],
+      per_page: 150,
+    });
+    expect(result.isError).toBeFalsy();
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('using per_page 100');
+    expect(notice).toContain('Converted native filter string');
+    expect(notice).toContain('windowed');
+    expect(notice).toContain('exactly 100');
+    expect(
+      result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+    ).toContain(notice);
+    expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(64_000);
+    expect(contentTextBytes(result.content)).toBeLessThanOrEqual(64_000);
+  });
+
+  it('logs and counts one actual clamp with only bounded metric attributes', async () => {
+    mockSearch.mockResolvedValue(sampleResult);
+    const ctx = createMockContext();
+    const log = vi.spyOn(ctx.log, 'info');
+    await searchEntitiesTool.handler(
+      searchEntitiesTool.input.parse({ entity_type: 'works', per_page: 1_000_000 }),
+      ctx,
+    );
+    expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+      'mcp.tool.name': 'openalex_search_entities',
+      'openalex.per_page.maximum': 100,
+    });
+    expect(log).toHaveBeenCalledWith('Clamped per_page', {
+      tool: 'openalex_search_entities',
+      requested: 1_000_000,
+      applied: 100,
+    });
+    expect(log.mock.calls.filter(([message]) => message === 'Clamped per_page')).toHaveLength(1);
+  });
+
+  it.each([
+    { id: 'W1', search_mode: 'semantic' as const, per_page: 150 },
+    { sample: 10, per_page: 150 },
+    { per_page: 100 },
+  ])('does not disclose or count an unused clamp: %j', async (args) => {
+    mockSearch.mockResolvedValue(sampleResult);
+    const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', ...args });
+    expect(result.isError).toBeFalsy();
+    expect(clampMetrics.add).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('using per_page');
+  });
+
+  it.each([51, 150])(
+    'preserves the requested semantic cap at %i on both surfaces',
+    async (per_page) => {
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'graph',
+        search_mode: 'semantic',
+        per_page,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'semantic_per_page_cap',
+            recovery: { hint: expect.stringContaining('50') },
+          },
+        },
+      });
+      expect(JSON.stringify(result.content)).toContain('semantic_per_page_cap');
+      expect(mockSearch).not.toHaveBeenCalled();
+      expect(clampMetrics.add).not.toHaveBeenCalled();
+    },
+  );
+  it('clamps an oversized page and joins the empty-result notice on both surfaces', async () => {
+    mockSearch.mockResolvedValue({
+      meta: { count: 0, per_page: 100, next_cursor: null },
+      results: [],
+    });
+    const result = await runToolContract(searchEntitiesTool, {
+      entity_type: 'works',
+      per_page: 150,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ perPage: 100 }),
+      expect.anything(),
+    );
+    expect(result.structuredContent).toMatchObject({
+      notice: expect.stringContaining(
+        'per_page 150 exceeds the maximum of 100; using per_page 100.',
+      ),
+    });
+    const text = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('per_page 150 exceeds the maximum of 100; using per_page 100.');
+    expect(text).toContain('No matches');
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mockConfig.filterStringInput = true;
+    mockConfig.clampPerPage = true;
   });
 
   const sampleResult: SearchResult = {
@@ -1668,7 +1825,7 @@ describe('searchEntitiesTool', () => {
     const contentText = (result: { content?: { type: string; text?: string }[] }) =>
       (result.content ?? []).map((block) => block.text ?? '').join('\n');
 
-    async function run(filters: Record<string, string>) {
+    async function run(filters: Record<string, unknown> | string) {
       const fetchMock = vi.fn((input: unknown) => {
         const url = new URL(String(input));
         return url.hostname === 'api.openalex.org' && url.pathname === '/works'
@@ -1703,6 +1860,249 @@ describe('searchEntitiesTool', () => {
       expect(result.isError).toBeFalsy();
       expect(sentFilter()).toBe('filter=authorships.institutions.country_code%3ADE+US');
     });
+
+    it.each([
+      ['title.search', '"graph neural" networks'],
+      ['title.search.exact', '"graph neural" networks'],
+      ['type', '"article"'],
+      ['geo.city', '!"New York"'],
+    ])('preserves balanced quotation for %s', async (key, value) => {
+      const { result, fetchMock } = await run({ [key]: value });
+      expect(result.isError).toBeFalsy();
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+        `${key}:${value}`,
+      );
+    });
+
+    it('converts a native filter string before the service', async () => {
+      const { result, fetchMock } = await run('issn:0920-8542');
+      expect(result.isError).toBeFalsy();
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+        'issn:0920-8542',
+      );
+    });
+
+    it.each([
+      ['title.search', 'graph "neural'],
+      ['abstract.search.exact', 'graph "neural'],
+      ['type', 'ar"ticle'],
+    ])('rejects unmatched quotation in %s before a request', async (key, value) => {
+      const { result, fetchMock } = await run({ [key]: value });
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'unmatched_quote_in_filter_value',
+            recovery: { hint: expect.stringContaining('Pair') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('unmatched_quote_in_filter_value');
+      expect(contentText(result)).toContain('Pair');
+    });
+
+    it('converts native string filters and joins the empty-result notice', async () => {
+      const { result, fetchMock } = await run(
+        'doi:https://doi.org/10.1136/bmj.n160,title.search:"graph, neural"',
+      );
+      expect(result.isError).toBeFalsy();
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+        'doi:https://doi.org/10.1136/bmj.n160,title.search:"graph, neural"',
+      );
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining('Converted native filter string'),
+      });
+      expect(contentText(result)).toContain('Converted native filter string');
+      expect(contentText(result)).toContain('No matches');
+    });
+
+    it.each([
+      ['title.search:graph,title.search:review', 'duplicate_filter_string_key'],
+      ['title.search:graph, rag', 'invalid_filter_string'],
+      ['title.search:graph "neural', 'invalid_filter_string'],
+      ['', 'invalid_filter_string'],
+      [':value', 'invalid_filter_string'],
+      ['type:article,', 'invalid_filter_string'],
+    ])('rejects ambiguous native filters %j without a request', async (filters, reason) => {
+      const { result, fetchMock } = await run(filters);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason, recovery: { hint: expect.stringContaining('record object') } },
+        },
+      });
+      expect(contentText(result)).toContain(reason);
+      expect(contentText(result)).toContain('record object');
+    });
+
+    it('restores record-only validation when conversion is disabled', async () => {
+      mockConfig.filterStringInput = false;
+      const rejected = await run('issn:0920-8542');
+      expect(rejected.result.isError).toBe(true);
+      expect(rejected.fetchMock).not.toHaveBeenCalled();
+      const accepted = await run({ issn: '0920-8542' });
+      expect(accepted.result.isError).toBeFalsy();
+      expect(contentText(accepted.result)).not.toContain('Converted');
+    });
+
+    it.each([true, false])(
+      'retains framework representation repairs with conversion=%s',
+      async (enabled) => {
+        mockConfig.filterStringInput = enabled;
+        for (const filters of [
+          { publication_year: 2020 },
+          '{"publication_year":"2020"}',
+          '  {"publication_year":"2020"}',
+        ]) {
+          const { result, fetchMock } = await run(filters);
+          expect(result.isError).toBeFalsy();
+          expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+            'publication_year:2020',
+          );
+          expect(contentText(result)).not.toContain('Converted native');
+        }
+        // The published framework repairs one representation layer, not JSON plus its values.
+        const nestedRepair = await run('  {"publication_year":2020}');
+        expect(nestedRepair.result.isError).toBe(true);
+        expect(nestedRepair.fetchMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not admit a caller-supplied normalization wrapper or leak wrapper paths', async () => {
+      const forged = await run({ value: { type: 'article' }, converted: true });
+      expect(forged.result.isError).toBe(true);
+      expect(forged.fetchMock).not.toHaveBeenCalled();
+      const invalid = await run({ publication_year: { nested: true } });
+      expect(invalid.result.isError).toBe(true);
+      expect(contentText(invalid.result)).toContain('filters.publication_year');
+      expect(contentText(invalid.result)).not.toContain('filters.value.publication_year');
+    });
+
+    it('preserves record value bytes and distinct aliases that AND upstream', async () => {
+      const { result, fetchMock } = await run(
+        'year:2020,publication_year:2024,title.search: graph  neural ',
+      );
+      expect(result.isError).toBeFalsy();
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+        'publication_year:2020,publication_year:2024,title.search: graph  neural ',
+      );
+    });
+
+    it('advertises the canonical record schema in both JSON Schema modes', () => {
+      const canonical = z.record(z.string(), z.string()).optional();
+      for (const io of ['input', 'output'] as const) {
+        const schema = z.toJSONSchema(searchEntitiesTool.input, { io });
+        const expected = z.toJSONSchema(canonical, { io });
+        const field = schema.properties?.filters;
+        expect(field).toEqual(
+          expect.objectContaining({
+            type: 'object',
+            propertyNames: { type: 'string' },
+            additionalProperties: { type: 'string' },
+          }),
+        );
+        const { description: _description, ...actual } = field as Record<string, unknown>;
+        const { $schema: _schema, ...projection } = expected;
+        expect(actual).toEqual(projection);
+        expect(schema.required).not.toContain('filters');
+      }
+    });
+
+    it('keeps conversion provenance isolated across concurrent canonical and alias calls', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+      const aliasArgs = { entity_type: 'works' as const, filter: 'type:article' };
+      const results = await Promise.all([
+        runToolContract(searchEntitiesTool, aliasArgs),
+        runToolContract(searchEntitiesTool, { entity_type: 'works', filters: { type: 'article' } }),
+        runToolContract(searchEntitiesTool, { entity_type: 'works', filters: 'type:article' }),
+      ]);
+      for (const [index, result] of results.entries()) {
+        expect(result.isError).toBeFalsy();
+        expect(contentText(result).includes('Converted native filter string')).toBe(index !== 1);
+        expect(
+          String((result.structuredContent as { notice?: string })?.notice).includes(
+            'Converted native filter string',
+          ),
+        ).toBe(index !== 1);
+      }
+      const conflictArgs = {
+        entity_type: 'works' as const,
+        filter: 'type:article',
+        filters: { type: 'book' },
+      };
+      const conflict = await runToolContract(searchEntitiesTool, conflictArgs);
+      expect(conflict.isError).toBe(true);
+    });
+
+    it('logs successful conversion and counts it without caller values in attributes', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 25, next_cursor: null },
+        results: [{ id: 'W1', display_name: null }],
+      });
+      const ctx = createMockContext();
+      const log = vi.spyOn(ctx.log, 'info');
+      await searchEntitiesTool.handler(
+        searchEntitiesTool.input.parse({ entity_type: 'works', filters: 'type:article' }),
+        ctx,
+      );
+      expect(log).toHaveBeenCalledWith('Converted native filter string', {
+        tool: 'openalex_search_entities',
+      });
+      expect(conversionMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+        'mcp.tool.name': 'openalex_search_entities',
+      });
+    });
+
+    it.each([
+      ['pagination', { cursor: 'past-end' }, [], 'Pagination exhausted'],
+      [
+        'possibly capped array',
+        {},
+        [{ id: 'W1', display_name: null, authorships: authorships(100) }],
+        'author list may be longer',
+      ],
+      [
+        'slice past end',
+        { id: 'W1', slice: { field: 'referenced_works', offset: 3 } },
+        [{ id: 'W1', display_name: null, referenced_works: ['W2'] }],
+        'past the end',
+      ],
+    ])(
+      'joins conversion with %s and accounting on both surfaces',
+      async (_label, extra, records, existingNotice) => {
+        mockSearch.mockImplementation(async (...args: unknown[]) => {
+          const [, ctx] = args as [SearchParams, Context];
+          ctx.enrich({ budget: { costUsd: 0.001, remainingUsd: 0.999, resetsInSeconds: 10 } });
+          return {
+            meta: { count: records.length, per_page: 25, next_cursor: null },
+            results: records,
+          };
+        });
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          filters: 'type:article',
+          ...extra,
+        });
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          notice: expect.stringContaining('Converted native filter string'),
+          budget: { costUsd: 0.001, remainingUsd: 0.999 },
+        });
+        expect(String((result.structuredContent as { notice?: string })?.notice)).toContain(
+          existingNotice,
+        );
+        expect(contentText(result)).toContain(existingNotice);
+        expect(contentText(result)).toContain('Converted native filter string');
+        expect(contentText(result)).toContain('0.001');
+      },
+    );
 
     it('sends a comma in a .search.exact value quoted rather than refusing it (gh #113)', async () => {
       const { result, sentFilter } = await run({ 'title.search.exact': 'cats, dogs' });
@@ -2044,6 +2444,81 @@ describe('searchEntitiesTool', () => {
         orcid:
           i % 3 === 0 ? `https://orcid.org/0000-0002-0000-${String(i).padStart(4, '0')}` : null,
       }));
+
+    it.each(['authorships', 'author_list'])(
+      'walks every stored singleton %s entry with cap uncertainty and finite continuation',
+      async (field) => {
+        const fetchMock = await useRealService([upstreamWork(1, 5000)]);
+        type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
+        let args: SearchArgs | undefined = {
+          entity_type: 'works',
+          id: 'W3000000001',
+          select: [field],
+        };
+        const seen: string[] = [];
+        let calls = 0;
+        while (args && calls < 100) {
+          const result = await runToolContract(searchEntitiesTool, args);
+          expect(result.isError).toBeFalsy();
+          expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(64_000);
+          expect(contentTextBytes(result.content)).toBeLessThanOrEqual(64_000);
+          const structured = result.structuredContent as Structured;
+          const window = structured.windows?.[0];
+          expect(window).toMatchObject({
+            field,
+            offset: seen.length,
+            total: 5000,
+            possibly_capped: true,
+          });
+          expect(window?.shown).toBeGreaterThan(0);
+          const text = textOf(result);
+          expect(text).toContain('5,000');
+          expect(text).toContain('stored entries');
+          expect(structured.notice).toContain('snapshots cannot recover');
+          if (window?.next) expect(text).toContain(JSON.stringify(window.next.arguments));
+          const items = structured.results[0]?.[field] as Record<string, unknown>[];
+          const renderedAuthors = [
+            ...text.matchAll(/^- \[(\d+)\] (?:author\.)?id: (https:\/\/openalex\.org\/A\d+),/gm),
+          ].map((match) => [Number(match[1]), match[2]]);
+          expect(renderedAuthors).toEqual(
+            Array.from({ length: items.length }, (_, index) => [
+              seen.length + index,
+              `https://openalex.org/A${9_000_000 + seen.length + index}`,
+            ]),
+          );
+          for (const item of items)
+            seen.push(
+              String(field === 'author_list' ? item.id : (item.author as { id: string }).id),
+            );
+          args = window?.next?.arguments as SearchArgs | undefined;
+          calls++;
+        }
+        expect(calls).toBeGreaterThan(2);
+        expect(calls).toBeLessThan(100);
+        expect(seen).toHaveLength(5000);
+        expect(new Set(seen).size).toBe(5000);
+        expect(seen[0]).toBe('https://openalex.org/A9000000');
+        expect(seen.at(-1)).toBe('https://openalex.org/A9004999');
+        expect(seen).toEqual(
+          Array.from({ length: 5000 }, (_, index) => `https://openalex.org/A${9_000_000 + index}`),
+        );
+        const past = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W3000000001',
+          slice: { field, offset: 5001 },
+          select: ['doi'],
+        });
+        expect(past.isError).toBeFalsy();
+        expect(past.structuredContent).toMatchObject({
+          results: [{ [field]: [] }],
+          windows: [{ offset: 5001, total: 5000, shown: 0, possibly_capped: true, next: null }],
+          notice: expect.stringContaining('past the end'),
+        });
+        expect(textOf(past)).toContain('5,000');
+        expect(textOf(past)).toContain('`select` was not applied');
+        expect(fetchMock).toHaveBeenCalledTimes(calls + 1);
+      },
+    );
 
     it.each([
       ['list', { filters: { 'title.search': 'collaboration' } }],
