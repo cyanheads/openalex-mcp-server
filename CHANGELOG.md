@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.10.0](changelog/0.10.x/0.10.0.md) — 2026-10-22 · ⚠️ Breaking
+
+Preserve nullable aggregation labels, correct filter handling, and disclose pagination and author-storage limits.
+
 ## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-10-18 · ⚠️ Breaking
 
 Filter values reach OpenAlex as it reads them (AND with +, country and language codes, quoted names), mixed OR/AND values are rejected up front, identifiers route to the record they name, and provider-text cleanup converges in one pass.

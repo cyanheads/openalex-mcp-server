@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-10-18 12:54:32
+Generated on: 2026-10-23 06:37:22
 
 ```text
 openalex-mcp-server/
@@ -25,6 +25,7 @@ openalex-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.10.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -160,6 +161,7 @@ openalex-mcp-server/
 │   │       │   ├── resolve-name.tool.ts
 │   │       │   └── search-entities.tool.ts
 │   │       ├── escape-markdown.ts
+│   │       ├── page-size.ts
 │   │       ├── render-budget.ts
 │   │       ├── render-entity-record.ts
 │   │       └── response-budget.ts
