@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openalex-mcp-server",
+  "version": "0.10.0",
+  "description": "Access the OpenAlex academic research catalog — 270M+ publications — via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/openalex-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/openalex-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "openalex",
+    "academic-research",
+    "academic-search",
+    "bibliometrics",
+    "bun",
+    "citation-analysis",
+    "literature-search",
+    "scholarly-data",
+    "scholarly-research",
+    "stdio",
+    "streamable-http",
+    "typescript"
+  ]
+}
