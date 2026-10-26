@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { clampPageSize } from '@/mcp-server/tools/page-size.js';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
+import { renderedText as readMarkdown } from '../../../helpers/markdown.js';
 import {
   authorship,
   authorships,
@@ -571,8 +572,11 @@ describe('searchEntitiesTool', () => {
    * dropped-parameter notice. (gh #83, #85)
    */
   describe('sample conflicts (gh #83, #85)', () => {
+    /** The `content[]` text a client reads, through a CommonMark parse. */
     const renderedText = (blocks: { type: string; text?: string }[] | undefined) =>
-      (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n');
+      readMarkdown(
+        (blocks ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : '')).join('\n'),
+      );
 
     const single: SearchResult = {
       meta: { count: 1, per_page: 1, next_cursor: null },
@@ -2196,8 +2200,8 @@ describe('searchEntitiesTool', () => {
           },
         },
       });
-      expect(contentText(result)).toContain('mixes "|" (OR) with an AND operator');
-      expect(contentText(result)).toContain('mixed_and_or_in_filter_value');
+      expect(readMarkdown(contentText(result))).toContain('mixes "|" (OR) with an AND operator');
+      expect(readMarkdown(contentText(result))).toContain('mixed_and_or_in_filter_value');
     });
 
     it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {
@@ -2880,7 +2884,8 @@ describe('searchEntitiesTool', () => {
           },
         },
       });
-      const rendered = renderedText(result.content);
+      // Error text is escaped in content[]; read it back through a CommonMark parse.
+      const rendered = readMarkdown(renderedText(result.content));
       expect(rendered).toContain('remove `page`');
       expect(rendered).toContain('sample_with_page');
       expect(mockSearch).not.toHaveBeenCalled();

@@ -263,15 +263,43 @@ function joinTrailerFields(fields: readonly string[]): string {
 }
 
 /**
+ * Byte-exact copy of the framework's inline code span (`codeSpan` in mcp-ts-core's formatting
+ * utils, which the package does not export), the form a one-line trailer string takes: the
+ * fence runs one backtick past the value's longest backtick run, and a space pads each side when
+ * a backtick touches an end or the value both begins and ends with a space. The echo is always
+ * one line — caller text in it is JSON-encoded — so the fenced-block form never applies here.
+ */
+function codeSpan(value: string): string {
+  let longestRun = 0;
+  for (const [run] of value.matchAll(/`+/g)) longestRun = Math.max(longestRun, run.length);
+  const fence = '`'.repeat(longestRun + 1);
+  const pad =
+    value.startsWith('`') ||
+    value.endsWith('`') ||
+    (value.startsWith(' ') && value.endsWith(' ') && /[^ ]/.test(value))
+      ? ' '
+      : '';
+  return `${fence}${pad}${value}${pad}${fence}`;
+}
+
+/**
  * The enrichment trailer's bytes, minus the service-written `budget` line. Fields render as the
- * framework renders them for these tools: `echo` under its `Query` label, `totalCount` under
- * `totalLabel`, and `notice` as a block quote, joined after a leading blank line.
+ * framework renders them for these tools: `echo` as a code span under its `Query` label,
+ * `totalCount` under `totalLabel`, and `notice` as a block quote with every line quoted, joined
+ * after a leading blank line.
  */
 export function trailerTextBytes(enrichment: PageEnrichment): number {
   const fields = [
-    `**Query:** ${enrichment.echo}`,
+    `**Query:** ${codeSpan(enrichment.echo)}`,
     `**${enrichment.totalLabel}:** ${enrichment.totalCount}`,
-    ...(enrichment.notice === undefined ? [] : [`> ${enrichment.notice}`]),
+    ...(enrichment.notice === undefined
+      ? []
+      : [
+          enrichment.notice
+            .split(/\r\n|\r|\n/)
+            .map((line) => (line === '' ? '>' : `> ${line}`))
+            .join('\n'),
+        ]),
   ];
   return utf8Bytes(`\n\n${joinTrailerFields(fields)}`);
 }

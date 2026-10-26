@@ -686,12 +686,11 @@ describe('Security — the search echo keeps caller text on one line', () => {
     const { echo } = result.structuredContent as { echo: string };
     expect(echo).toContain(rendered);
     expect(echo).not.toMatch(/[\r\n]/);
-    const lines = (result.content ?? [])
-      .map((b) => ('text' in b ? b.text : ''))
-      .join('\n')
-      .split(/\r?\n|\r/);
-    expect(lines).toContain(`**Query:** ${echo}`);
-    expect(lines.some((line) => line.trimStart().startsWith('# Injected'))).toBe(false);
+    const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
+    expect(renderedText(text).split('\n')).toContain(`Query: ${echo}`);
+    expect(text.split(/\r?\n|\r/).some((line) => line.trimStart().startsWith('# Injected'))).toBe(
+      false,
+    );
   });
 });
 
@@ -724,8 +723,9 @@ describe('Security — graph, trend, and refusal echoes keep caller text on one 
 
   const textOf = (result: { content?: { type: string; text?: string }[] }) =>
     (result.content ?? []).map((b) => b.text ?? '').join('\n');
+  /** The lines a client reads, through a CommonMark parse. */
   const linesOf = (result: { content?: { type: string; text?: string }[] }) =>
-    textOf(result).split(/\r?\n|\r/);
+    renderedText(textOf(result)).split('\n');
   const forgesHeading = (text: string) =>
     text.split(/\r?\n|\r/).some((line) => line.trimStart().startsWith('# Injected'));
   const emptyPage = { meta: { count: 0, per_page: 25, next_cursor: null }, results: [] };
@@ -756,7 +756,7 @@ describe('Security — graph, trend, and refusal echoes keep caller text on one 
     expect(echo).toContain(rendered);
     expect(echo).not.toMatch(/[\r\n]/);
     expect(notice).toContain(rendered);
-    expect(linesOf(result)).toContain(`**Query:** ${echo}`);
+    expect(linesOf(result)).toContain(`Query: ${echo}`);
     expect(forgesHeading(textOf(result))).toBe(false);
   });
 
@@ -777,7 +777,7 @@ describe('Security — graph, trend, and refusal echoes keep caller text on one 
     expect(echo).toContain('group_by="type\\n# Injected group_by"');
     expect(echo).not.toMatch(/[\r\n]/);
     expect(notice).toContain('group_by="type\\n# Injected group_by"');
-    expect(linesOf(result)).toContain(`**Query:** ${echo}`);
+    expect(linesOf(result)).toContain(`Query: ${echo}`);
     expect(forgesHeading(textOf(result))).toBe(false);
   });
 
@@ -861,7 +861,7 @@ describe('Security — a refused country segment stays quoted on one line (gh #1
       error: { message: string; data: Record<string, unknown> };
     };
     const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
-    expect(text.split('\n')).toContain(`Error: ${error.message}`);
+    expect(renderedText(text).split('\n')).toContain(`Error: ${error.message}`);
     return { error, text };
   }
 
@@ -921,7 +921,7 @@ describe('Security — a key refused for a comma stays quoted on one line (gh #1
       error: { message: string; data: Record<string, unknown> };
     };
     const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
-    expect(text.split('\n')).toContain(`Error: ${error.message}`);
+    expect(renderedText(text).split('\n')).toContain(`Error: ${error.message}`);
     return { error, text };
   }
 
@@ -972,7 +972,7 @@ describe('Security — a key refused for mixing "|" with "+" stays quoted on one
       error: { message: string; data: Record<string, unknown> };
     };
     const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
-    expect(text.split('\n')).toContain(`Error: ${error.message}`);
+    expect(renderedText(text).split('\n')).toContain(`Error: ${error.message}`);
     return { error, text };
   }
 
@@ -1025,7 +1025,7 @@ describe('Security — a value refused for a stray double quote never reaches th
       error: { message: string; data: Record<string, unknown> };
     };
     const text = (result.content ?? []).map((b) => ('text' in b ? b.text : '')).join('\n');
-    expect(text.split('\n')).toContain(`Error: ${error.message}`);
+    expect(renderedText(text).split('\n')).toContain(`Error: ${error.message}`);
     return { error, text };
   }
 
@@ -1681,9 +1681,18 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
       .join('\n\n');
   }
 
-  /** Parse-level checks shared by every tool: nothing but text structure, links only autolinks. */
-  function expectInertMarkdown(markdown: string) {
-    expect(nodeTypes(markdown).filter((t) => !ALLOWED_NODES.has(t))).toEqual([]);
+  /**
+   * Parse-level checks shared by every tool: nothing but text structure, links only autolinks.
+   * The one code span is the trailer's query echo, which the framework renders as a code literal
+   * so caller text reads back as written; provider text never forms one.
+   */
+  function expectInertMarkdown(result: { content: unknown[]; structuredContent?: unknown }) {
+    const markdown = contentText(result);
+    const { echo } = result.structuredContent as { echo?: string };
+    const types = nodeTypes(markdown);
+    expect(types.filter((t) => t === 'inlineCode')).toHaveLength(echo === undefined ? 0 : 1);
+    if (echo !== undefined) expect(markdown).toContain(`Query:** \`${echo}\``);
+    expect(types.filter((t) => t !== 'inlineCode' && !ALLOWED_NODES.has(t))).toEqual([]);
     expect(nonAutolinks(markdown)).toEqual([]);
   }
 
@@ -1712,7 +1721,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     expect(record.keywords[0].display_name).toBe('Fish <Actinopterygii>');
 
     const markdown = contentText(result);
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     const rendered = renderedText(markdown);
     expect(rendered).toContain(`\n${NORMALIZED.display_name}\n`);
     expect(rendered).toContain(`display_name: Fish <Actinopterygii>`);
@@ -1748,7 +1757,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
 
     const markdown = contentText(result);
     expect(markdown).not.toContain('MathType');
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     const rendered = renderedText(markdown);
     expect(rendered).toContain('\nLines $x$ and surfaces\n');
     expect(rendered).toContain(`Abstract: ${abstract}`);
@@ -1770,7 +1779,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     expect(record.abstract).toBe(NORMALIZED.abstract);
 
     const markdown = contentText(result);
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     const rendered = renderedText(markdown);
     expect(rendered).toContain(`\n${NORMALIZED.display_name}\n`);
     expect(rendered).toContain(`Abstract: ${NORMALIZED.abstract}`);
@@ -1789,7 +1798,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     });
 
     const markdown = contentText(result);
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     const rendered = renderedText(markdown);
     expect(rendered).toContain('**Bold** &constructor; (source)');
     expect(rendered).toContain('| Pub <genus> &lt;');
@@ -1828,7 +1837,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
       ],
     });
     const markdown = contentText(result);
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     expect(nodeTypes(markdown)).not.toContain('heading');
     const rendered = renderedText(markdown);
     expect(rendered).toContain('# Heading *key*: 2');
@@ -1853,7 +1862,7 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
     ]);
 
     const markdown = contentText(result);
-    expectInertMarkdown(markdown);
+    expectInertMarkdown(result);
     const rendered = renderedText(markdown);
     expect(rendered).toContain(
       '# Journal &constructor; *Ann* <genus> (https://openalex.org/S1): 2',

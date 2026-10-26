@@ -13,6 +13,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
+import { renderedText as readMarkdown } from '../../../helpers/markdown.js';
 import {
   contentTextBytes,
   defaultWork,
@@ -1162,8 +1163,8 @@ describe('getCitationGraphTool', () => {
           },
         },
       });
-      expect(textOf(result)).toContain('mixes "|" (OR) with an AND operator');
-      expect(textOf(result)).toContain('mixed_and_or_in_filter_value');
+      expect(readMarkdown(textOf(result))).toContain('mixes "|" (OR) with an AND operator');
+      expect(readMarkdown(textOf(result))).toContain('mixed_and_or_in_filter_value');
     });
 
     it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {

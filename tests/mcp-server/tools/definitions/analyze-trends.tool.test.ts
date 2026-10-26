@@ -1473,8 +1473,8 @@ describe('analyzeTrendsTool', () => {
           },
         },
       });
-      expect(textOf(result)).toContain('mixes "|" (OR) with an AND operator');
-      expect(textOf(result)).toContain('mixed_and_or_in_filter_value');
+      expect(renderedText(textOf(result))).toContain('mixes "|" (OR) with an AND operator');
+      expect(renderedText(textOf(result))).toContain('mixed_and_or_in_filter_value');
     });
 
     it('declares mixed_and_or_in_filter_value as a service-thrown ValidationError', () => {

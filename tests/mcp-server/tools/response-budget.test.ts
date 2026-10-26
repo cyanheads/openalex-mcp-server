@@ -177,8 +177,9 @@ describe('response budget helper (gh #72, #73)', () => {
         entity_type: 'works',
         query: 'alpha\n- beta',
       });
-      // The echo JSON-encodes the query, so the break stays escaped on the echo's one line.
-      expect(expectModelled(result, 'Total')).toContain('query="alpha\\n- beta"\n**Total:**');
+      // The echo JSON-encodes the query, so the break stays escaped inside the echo's one-line
+      // code span.
+      expect(expectModelled(result, 'Total')).toContain('query="alpha\\n- beta"`\n**Total:**');
     });
 
     it('matches on a citation-graph page, with and without a notice', async () => {

@@ -10,6 +10,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseNativeFilters } from '@/services/openalex/filter-values.js';
 import { DEFAULT_SELECT, type EntityType } from '@/services/openalex/types.js';
+import { renderedText } from '../../helpers/markdown.js';
 
 /** The `structuredContent.error` a failed tool call returns. */
 interface ErrorEnvelope {
@@ -6793,9 +6794,10 @@ describe('OpenAlexService', () => {
             },
           });
 
-          const text = (result.content ?? [])
-            .map((block) => ('text' in block ? block.text : ''))
-            .join('\n');
+          // The text a client reads, through a CommonMark parse.
+          const text = renderedText(
+            (result.content ?? []).map((block) => ('text' in block ? block.text : '')).join('\n'),
+          );
           expect(text).toContain(`Error: ${CREATED_MESSAGE}`);
           expect(text).toContain(`Recovery: ${recovery}`);
           expect(text).toContain('(reason upstream_plan_required · not retryable)');
