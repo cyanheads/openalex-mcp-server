@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.10.1](changelog/0.10.x/0.10.1.md) — 2026-10-25
+
+mcp-ts-core 0.13.18: query echoes render as code spans, error text in content[] escapes Markdown, invalid framework config fails startup naming the variable, and the root Agent Plugins pair ships.
+
 ## [0.10.0](changelog/0.10.x/0.10.0.md) — 2026-10-22 · ⚠️ Breaking
 
 Preserve nullable aggregation labels, correct filter handling, and disclose pagination and author-storage limits.
