@@ -11,8 +11,8 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AutocompleteResult, EntityType } from '@/services/openalex/types.js';
-import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
+import type { AutocompleteEntityType, AutocompleteResult } from '@/services/openalex/types.js';
+import { nodeTypes, nonAutolinks, renderedText } from '../../../helpers/markdown.js';
 
 const mockAutocomplete = vi.fn<() => Promise<AutocompleteResult>>();
 const mockResolveIdentifier = vi.fn<() => Promise<AutocompleteResult>>();
@@ -446,8 +446,11 @@ describe('resolveNameTool', () => {
         });
 
         expect(notice).not.toMatch(/[\r\n]/);
-        expect(notice).toContain('"Cambridge\\n# Injected query"');
-        expect(notice).toContain('filters={"display_name.search":"a \\"b\\"\\n# Injected filter"}');
+        // The notice is Markdown (gh #127): the JSON echo reads back as written once rendered.
+        expect(renderedText(`> ${notice}`)).toContain(
+          '"Cambridge\\n# Injected query" among institutions with filters={"display_name.search":"a \\"b\\"\\n# Injected filter"}.',
+        );
+        expect(text).toContain(`> ${notice}`);
         expect(text.split('\n').some((line) => line.trimStart().startsWith('# Injected'))).toBe(
           false,
         );
@@ -1010,7 +1013,7 @@ describe('resolveNameTool', () => {
       return fetchMock;
     }
 
-    async function call(args: { query: string; entity_type?: EntityType }) {
+    async function call(args: { query: string; entity_type?: AutocompleteEntityType }) {
       const result = await runToolContract(resolveNameTool, args);
       expect(result.isError).toBeFalsy();
       const structured = result.structuredContent as AutocompleteResult & { notice?: string };
@@ -1046,7 +1049,10 @@ describe('resolveNameTool', () => {
       async (entityType, query, id) => {
         const fetchMock = await useRealService();
 
-        const { ids, notice } = await call({ query, entity_type: entityType as EntityType });
+        const { ids, notice } = await call({
+          query,
+          entity_type: entityType as AutocompleteEntityType,
+        });
 
         expect(ids).toEqual([id]);
         expect(notice).toBeUndefined();
@@ -1121,7 +1127,7 @@ describe('resolveNameTool', () => {
 
       const { ids } = await call({
         query,
-        ...(entityType ? { entity_type: entityType as EntityType } : {}),
+        ...(entityType ? { entity_type: entityType as AutocompleteEntityType } : {}),
       });
 
       expect(ids).toEqual(['https://openalex.org/F4320306076']);
@@ -1355,7 +1361,7 @@ describe('resolveNameTool', () => {
 
     async function call(args: {
       query: string;
-      entity_type?: EntityType;
+      entity_type?: AutocompleteEntityType;
       filters?: Record<string, string>;
     }) {
       const result = await runToolContract(resolveNameTool, args);
@@ -1777,6 +1783,206 @@ describe('resolveNameTool', () => {
     });
   });
 
+  /**
+   * A notice is authored Markdown: the framework quotes it into `content[]` and escapes nothing,
+   * so every caller value a notice repeats is escaped in the handler. Both surfaces carry the
+   * same string, the caller's text reads back exactly as sent, and authored code spans stay
+   * live. (gh #127)
+   */
+  describe('caller text in notices (gh #127)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /** The trailer's `>` lines, and the string they quote with the markers stripped. */
+    const quotedNotice = (text: string) => {
+      const lines = text.split('\n').filter((line) => line.startsWith('>'));
+      return {
+        markdown: lines.join('\n'),
+        quoted: lines.map((line) => line.replace(/^> ?/, '')).join('\n'),
+      };
+    };
+
+    /** Run `args`, then check the notice against `expected`, the text a reader must see. */
+    async function expectNoticeReadsBack(
+      args: { query: string } & Record<string, unknown>,
+      expected: string,
+      allowed: readonly string[] = [],
+    ) {
+      const result = await runToolContract(resolveNameTool, args as { query: string });
+      expect(result.isError).toBeFalsy();
+      const { notice } = result.structuredContent as { notice?: string };
+      const { markdown, quoted } = quotedNotice(contentText(result));
+      expect(quoted).toBe(notice);
+      const markup = ['emphasis', 'strong', 'delete', 'html', 'inlineCode'].filter(
+        (type) => !allowed.includes(type),
+      );
+      expect(nodeTypes(markdown).filter((t) => markup.includes(t))).toEqual([]);
+      expect(nonAutolinks(markdown)).toEqual([]);
+      expect(renderedText(markdown)).toBe(expected);
+      return result;
+    }
+
+    const hostile = 'zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>';
+    const filters = { 'display_name.search': '<i>a</i> *b* `c` ~d~' };
+    const filtersEcho = '{"display_name.search":"<i>a</i> *b* `c` ~d~"}';
+    const ror = 'https://ror.org/02jbv0t02 [x](https://evil.test) _emph_';
+
+    it.each([
+      [
+        'a name miss',
+        { query: hostile, entity_type: 'institutions', filters },
+        { autocomplete: { results: [] } },
+        `No matches for "${hostile}" among institutions with filters=${filtersEcho}. Loosen or drop filters first — they may exclude the match — then try a shorter name or alternate spelling.`,
+      ],
+      [
+        'an identifier miss',
+        { query: '10.9999/zq[x](https://evil.test)_emph_<b>t</b>' },
+        { identifier: { results: [] } },
+        'No work in OpenAlex for DOI "10.9999/zq[x](https://evil.test)_emph_<b>t</b>". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.',
+      ],
+      [
+        'an identifier miss holding a URL',
+        { query: 'https://doi.org/10.1002/a_b*c~d' },
+        { identifier: { results: [] } },
+        'No work in OpenAlex for DOI "https://doi.org/10.1002/a_b*c~d". An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.',
+      ],
+      [
+        'a bare-ID miss searched as a name under filters',
+        { query: 'S999999999', entity_type: 'sources', filters },
+        { identifier: { results: [], nameFallback: {} } },
+        `No source in OpenAlex for OpenAlex ID "S999999999", and as a name it matched nothing among sources with filters=${filtersEcho}. Loosen or drop filters first — they may exclude the match — then try a shorter name or alternate spelling.`,
+      ],
+      [
+        'the "Resolved … by" notice',
+        { query: ror, filters: { country_code: 'US' } },
+        { identifier: { results: [harvard] } },
+        `Resolved "${ror}" by ROR — it identifies an institution, a funder, or a publisher directly, so filters did not apply.`,
+      ],
+      [
+        'failed ROR lookups',
+        { query: ror },
+        { identifier: { results: [harvard], failedEntityTypes: ['funders', 'publishers'] } },
+        `The funder and publisher lookups failed upstream, so any funder or publisher record for ROR "${ror}" is missing from these results — call again to complete them.`,
+      ],
+    ] as const)(
+      'reads the caller text back as sent in %s',
+      async (_label, args, reply, expected) => {
+        // The table is `as const`, so its read-only reply is cast to the mutable result type.
+        if ('autocomplete' in reply) {
+          mockAutocomplete.mockResolvedValue(reply.autocomplete as unknown as AutocompleteResult);
+        } else {
+          mockResolveIdentifier.mockResolvedValue(
+            reply.identifier as unknown as AutocompleteResult,
+          );
+        }
+
+        await expectNoticeReadsBack(args, expected);
+      },
+    );
+
+    /**
+     * Awards have no autocomplete, and an award record carries none of the activity stats a
+     * match reports, so an award ID or URL is never looked up — no request, no result, and a
+     * notice naming the `openalex_search_entities` call that opens it. (gh #125)
+     */
+    describe('award IDs (gh #125)', () => {
+      const openAward = 'openalex_search_entities {"entity_type":"awards","id":"G417894356"}';
+      const g3Source = {
+        id: 'https://openalex.org/S4210186826',
+        external_id: 'https://portal.issn.org/resource/ISSN/2160-1836',
+        display_name: 'G3 Genes Genomes Genetics',
+        entity_type: 'source',
+        cited_by_count: 120000,
+        works_count: 4800,
+        hint: 'Oxford University Press',
+      };
+
+      it.each([
+        [{ query: 'G417894356' }],
+        [{ query: 'https://openalex.org/G417894356' }],
+        [{ query: 'https://openalex.org/awards/G417894356' }],
+        [{ query: 'https://api.openalex.org/awards/G417894356' }],
+        [{ query: 'https://openalex.org/awards/G417894356', entity_type: 'works' }],
+        [{ query: 'G417894356', filters: { 'funder.id': 'F4320306076' } }],
+      ] as const)(
+        'sends no request for %o and points at openalex_search_entities',
+        async (args) => {
+          const { requests } = await routeToRealService(() => undefined);
+
+          const result = await expectNoticeReadsBack(
+            args,
+            `"${args.query}" is an OpenAlex award ID; this tool resolves no awards — OpenAlex has no award autocomplete — so nothing was looked up. Open the award with ${openAward}; to find an award by title or grant number instead, call it with entity_type "awards" and a query or the funder_award_id filter, narrowed by funder.id.`,
+            ['inlineCode'],
+          );
+
+          expect(requests()).toEqual([]);
+          expect((result.structuredContent as AutocompleteResult).results).toEqual([]);
+          expect(contentText(result)).toContain('No matches found.');
+        },
+      );
+
+      it('keeps the authored call a code span, so it copies without escapes', async () => {
+        await routeToRealService(() => undefined);
+        const result = await runToolContract(resolveNameTool, { query: 'G417894356' });
+        expect(contentText(result)).toContain(
+          '`openalex_search_entities` `{"entity_type":"awards","id":"G417894356"}`',
+        );
+      });
+
+      it('searches a bare G… shape under entity_type as a name of that type ("G3" is a journal)', async () => {
+        const { requests } = await routeToRealService((url) =>
+          url.pathname === '/autocomplete/sources' && url.searchParams.get('q') === 'G3'
+            ? jsonResponse({ results: [g3Source] })
+            : undefined,
+        );
+
+        const result = await runToolContract(resolveNameTool, {
+          query: 'G3',
+          entity_type: 'sources',
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(requests()).toEqual(['/autocomplete/sources?q=G3']);
+        const structured = result.structuredContent as AutocompleteResult & { notice?: string };
+        expect(structured.results).toEqual([g3Source]);
+        expect(structured.notice).toBeUndefined();
+        expect(contentText(result)).toContain('**G3 Genes Genomes Genetics** (source)');
+      });
+
+      it('adds the award pointer when that name search misses', async () => {
+        const { requests } = await routeToRealService((url) =>
+          url.pathname === '/autocomplete/funders' ? jsonResponse({ results: [] }) : undefined,
+        );
+
+        await expectNoticeReadsBack(
+          { query: 'G417894356', entity_type: 'funders' },
+          `No matches for "G417894356" among funders. Try a shorter name, alternate spelling, or omit entity_type to search across all types. "G417894356" is also shaped like an OpenAlex award ID — open the award with ${openAward}.`,
+          ['inlineCode'],
+        );
+        expect(requests()).toEqual(['/autocomplete/funders?q=G417894356']);
+      });
+
+      it('takes only the eight autocomplete entity types', () => {
+        expect(
+          resolveNameTool.input.safeParse({ query: 'groundwater', entity_type: 'awards' }).success,
+        ).toBe(false);
+        expect(z.toJSONSchema(resolveNameTool.input).properties?.entity_type).toMatchObject({
+          enum: [
+            'works',
+            'authors',
+            'sources',
+            'institutions',
+            'topics',
+            'keywords',
+            'publishers',
+            'funders',
+          ],
+        });
+      });
+    });
+  });
+
   describe('format', () => {
     const text = (result: AutocompleteResult) => {
       const blocks = resolveNameTool.format?.(result) ?? [];
@@ -1851,6 +2057,34 @@ describe('resolveNameTool', () => {
       expect(rendered).toContain('Fish <Actinopterygii> (institution)');
       // The identifier line reads byte-identical in the raw Markdown.
       expect(output).toContain('https://openalex.org/S1 | https://doi.org/10.1000/a_b_ |');
+    });
+
+    it('reads a multi-line or space-edged name and hint back intact on content[] (gh #128)', async () => {
+      const results: AutocompleteResult['results'] = [
+        {
+          id: 'https://openalex.org/A5149007440',
+          display_name: 'Wichmann, Arthur,\n    b. 1851.',
+          entity_type: 'author',
+          external_id: null,
+          cited_by_count: 0,
+          works_count: 3,
+          hint: 'Line one\r\n- not a list\n# not a heading',
+        },
+        { ...harvard, display_name: ' Harvard University ' },
+      ];
+      mockAutocomplete.mockResolvedValue({ results });
+
+      const result = await runToolContract(resolveNameTool, { query: 'Wichmann' });
+
+      expect(result.structuredContent).toMatchObject({ results });
+      const output = contentText(result);
+      const allowed = new Set(['paragraph', 'text', 'strong', 'break', 'link']);
+      expect(nodeTypes(output).filter((t) => !allowed.has(t))).toEqual([]);
+      const rendered = renderedText(output);
+      expect(rendered).toContain(
+        'Wichmann, Arthur,\n    b. 1851. (author)\nhttps://openalex.org/A5149007440 | 0 citations | 3 works | Line one\n- not a list\n# not a heading',
+      );
+      expect(rendered).toContain(' Harvard University  (institution)');
     });
   });
 });

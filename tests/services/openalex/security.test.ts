@@ -1989,12 +1989,49 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
     [
       'entity-like runs ending in a line break',
       (n) => `${build('&amp', n - 1)}\n`,
-      (n) => `${build('&amp', n - 1)} `,
+      (n) => `${build('&amp', n - 1)}&#10;`,
     ],
     [
       'entity-like runs with breaks throughout',
       (n) => build('&amp\n', n),
-      (n) => build('&amp ', n),
+      (n) =>
+        `${Array(n / 5)
+          .fill('&amp')
+          .join('\\\n')}&#10;`,
+    ],
+    // gh #128: multi-line text.
+    [
+      'one long line ending in a line break',
+      (n) => `${build('§1 x', n - 2)}\ny`,
+      (n) => `${build('§1 x', n - 2)}\\\ny`,
+    ],
+    [
+      'whitespace-only lines with CRLF breaks throughout',
+      (n) => build('  \r\n', n),
+      (n) =>
+        `${Array(n / 4)
+          .fill('&#32;&#32;')
+          .join('\\\n')}&#10;`,
+    ],
+    [
+      'a whitespace run inside a line',
+      (n) => `x${' '.repeat(n - 2)}y`,
+      (n) => `x${' '.repeat(n - 2)}y`,
+    ],
+    [
+      'whitespace runs at both edges',
+      (n) => `${' '.repeat(n / 2)}x${' '.repeat(n / 2 - 1)}`,
+      (n) => `${'&#32;'.repeat(n / 2)}x${'&#32;'.repeat(n / 2 - 1)}`,
+    ],
+    [
+      'a dash run that is no underline, opening a line',
+      (n) => `a\n${'-'.repeat(n - 3)}x`,
+      (n) => `a\\\n${'-'.repeat(n - 3)}x`,
+    ],
+    [
+      'a delimiter-row run that is no row, opening a line',
+      (n) => `a\n${build('| :', n - 3)}x`,
+      (n) => `a\\\n${build('| :', n - 3)}x`,
     ],
   ];
 

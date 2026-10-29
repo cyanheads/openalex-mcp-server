@@ -23,7 +23,7 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_CLAMP_PER_PAGE",
-          "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+          "description": "Clamp oversized count inputs (per_page, semantic-search per_page, sample, slice.limit) to their caps with a notice. Set false to reject them instead.",
           "format": "string",
           "isRequired": false,
           "default": "true"
@@ -75,7 +75,7 @@
       "environmentVariables": [
         {
           "name": "OPENALEX_CLAMP_PER_PAGE",
-          "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+          "description": "Clamp oversized count inputs (per_page, semantic-search per_page, sample, slice.limit) to their caps with a notice. Set false to reject them instead.",
           "format": "string",
           "isRequired": false,
           "default": "true"

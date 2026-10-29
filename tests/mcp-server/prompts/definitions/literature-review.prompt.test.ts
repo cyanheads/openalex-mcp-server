@@ -67,15 +67,16 @@ describe('literatureReviewPrompt', () => {
   });
 
   /**
-   * The detail lookup selects `author_list`, which the 64,000-byte response budget windows on a
-   * large collaboration; the step has to name the `slice` call that pages the rest, on the same
-   * compact field. (gh #72, #102)
+   * The detail lookup selects `author_list`, which an `id` lookup returns whole — thousands of
+   * entries on a large collaboration. The step names the count-based `slice` call that pages it
+   * on the same compact field, and the `windows` entry that continues it. (gh #102, #131)
    */
-  it('names slice for paging a windowed author_list array', async () => {
+  it('names a count-based slice for paging a long author_list', async () => {
     const detail = step(await generatedText(), '**Identify key papers**');
     expect(detail).toContain('["abstract", "author_list", "primary_location"]');
-    expect(detail).toContain('slice: {"field": "author_list"');
+    expect(detail).toContain('slice: {"field": "author_list", "offset": 0, "limit": 100}');
     expect(detail).toContain('windows');
+    expect(detail).not.toMatch(/comes back as a window|64,000|budget/);
   });
 
   it('keeps authorships as the choice for affiliations (gh #102)', async () => {

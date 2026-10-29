@@ -33,7 +33,7 @@ Use the OpenAlex tools to build a quantitative profile:
 
 4. **Open access** — Group by oa_status. What fraction is freely available?
 
-5. **Funding** — Group by funders.id to identify major funders. It counts every work that lists a funder and labels each group with the funder's name. For grant-level questions such as award numbers, use the awards.* fields.
+5. **Funding** — Group by funders.id to identify major funders. It counts every work that lists a funder and labels each group with the funder's name. For grants, group the topic's works by awards.id, which ranks grants by how many of those works each funded; few awards carry a topic of their own, so an awards search filtered by topic finds only those few. Open the top G… IDs with openalex_search_entities (entity_type "awards", id) for amounts, dates, and lead investigators; amount_usd is missing on many awards, so a sum covers only the awards that carry it. Filter works by awards.id to reach one grant's funded outputs.
 
 6. **Impact** — Search for the most-cited works (sort by -cited_by_count). Get details on the top 5.
 

@@ -3,7 +3,11 @@
  * @module services/openalex/types
  */
 
-export const ENTITY_TYPES = [
+/**
+ * The entity types OpenAlex autocompletes by name: `/autocomplete/<type>` serves each, and
+ * cross-entity `/autocomplete` returns matches of these types only.
+ */
+export const AUTOCOMPLETE_ENTITY_TYPES = [
   'works',
   'authors',
   'sources',
@@ -13,6 +17,15 @@ export const ENTITY_TYPES = [
   'publishers',
   'funders',
 ] as const;
+
+export type AutocompleteEntityType = (typeof AUTOCOMPLETE_ENTITY_TYPES)[number];
+
+/**
+ * Every entity type the server reads. `awards` (grants, keyed by `G…` IDs) has list, filter,
+ * group_by, and by-ID endpoints but no autocomplete — `/autocomplete/awards` 404s — so it sits
+ * outside `AUTOCOMPLETE_ENTITY_TYPES`.
+ */
+export const ENTITY_TYPES = [...AUTOCOMPLETE_ENTITY_TYPES, 'awards'] as const;
 
 export type EntityType = (typeof ENTITY_TYPES)[number];
 
@@ -82,6 +95,23 @@ export const DEFAULT_SELECT: Record<EntityType, string[]> = {
   keywords: ['id', 'display_name', 'works_count', 'cited_by_count'],
   publishers: ['id', 'display_name', 'works_count', 'cited_by_count', 'country_codes'],
   funders: ['id', 'display_name', 'works_count', 'cited_by_count', 'country_code'],
+  /**
+   * Awards carry no `cited_by_count` or `works_count`. `description` (several KB) and
+   * `funded_outputs` (at most 100 work IDs, however many the award funded) stay out; the full
+   * output set is works filtered by `awards.id`.
+   */
+  awards: [
+    'id',
+    'display_name',
+    'funder',
+    'funder_award_id',
+    'amount_usd',
+    'start_date',
+    'end_date',
+    'lead_investigator',
+    'institution_awarded',
+    'funded_outputs_count',
+  ],
 };
 
 export interface SearchParams {
@@ -139,7 +169,7 @@ export interface AnalyzeResult {
 }
 
 export interface AutocompleteParams {
-  entityType?: EntityType | undefined;
+  entityType?: AutocompleteEntityType | undefined;
   filters?: Record<string, string> | undefined;
   query: string;
 }

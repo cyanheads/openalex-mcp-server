@@ -9,7 +9,11 @@ import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/err
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseNativeFilters } from '@/services/openalex/filter-values.js';
-import { DEFAULT_SELECT, type EntityType } from '@/services/openalex/types.js';
+import {
+  type AutocompleteEntityType,
+  DEFAULT_SELECT,
+  type EntityType,
+} from '@/services/openalex/types.js';
 import { renderedText } from '../../helpers/markdown.js';
 
 /** The `structuredContent.error` a failed tool call returns. */
@@ -175,6 +179,7 @@ describe('OpenAlexService', () => {
       'keywords',
       'publishers',
       'funders',
+      'awards',
     ] as const;
 
     it('returns non-empty filter and select arrays for every entity type', async () => {
@@ -241,6 +246,23 @@ describe('OpenAlexService', () => {
       expect(catalog.sources.select).toEqual(expect.arrayContaining(['apc_usd_by_year']));
       expect(catalog.institutions.filter).toEqual(expect.arrayContaining(['geo.city']));
       expect(catalog.keywords.filter).toEqual(expect.arrayContaining(['topics.id']));
+    });
+
+    it('carries the awards field lists (gh #125)', async () => {
+      const { getFieldCatalog } = await import('@/services/openalex/openalex-service.js');
+      const { awards } = getFieldCatalog();
+      expect(awards.filter).toEqual(
+        expect.arrayContaining([
+          'funder.id',
+          'funder_award_id',
+          'id',
+          'primary_topic.id',
+          'research_scope.is_research',
+          'start_year',
+        ]),
+      );
+      expect(awards.filter).not.toContain('openalex');
+      expect(awards.select).toEqual(expect.arrayContaining(DEFAULT_SELECT.awards));
     });
 
     it('suggests a recovered field for a near-miss upstream rejects (gh #104)', async () => {
@@ -620,7 +642,7 @@ describe('OpenAlexService', () => {
   // --- Identifier shape → entity type inference (gh #50) ---
 
   describe('inferIdentifier', () => {
-    async function infer(query: string, requested?: EntityType) {
+    async function infer(query: string, requested?: AutocompleteEntityType) {
       const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
       return inferIdentifier(query, requested);
     }
@@ -659,6 +681,7 @@ describe('OpenAlexService', () => {
       ['T10159', 'topics'],
       ['P4310320595', 'publishers'],
       ['F4320332161', 'funders'],
+      ['G417894356', 'awards'],
     ])('derives %s → %s from the native ID letter', async (query, entityType) => {
       expect(await infer(query)).toEqual({
         entityTypes: [entityType],
@@ -815,7 +838,6 @@ describe('OpenAlexService', () => {
 
     it.each([
       ['C71924100', 'the deprecated Concepts entity'],
-      ['G12345', 'an entity type this server does not model'],
       ['K12345', 'a shape OpenAlex never emits — keyword IDs are slugs (gh #68)'],
     ])('does not route %s — %s', async (query) => {
       // No endpoint answers these, so routing them would turn a name search into a 404.
@@ -1485,6 +1507,10 @@ describe('OpenAlexService', () => {
       ['sources', 'P4310320990', 'publisher', 'publishers'],
       ['works', 'S137773608', 'source', 'sources'],
       ['works', 'T10159', 'topic', 'topics'],
+      ['works', 'G417894356', 'award', 'awards'],
+      ['funders', 'https://openalex.org/awards/G417894356', 'award', 'awards'],
+      ['awards', 'W2741809807', 'work', 'works'],
+      ['awards', 'F4320306076', 'funder', 'funders'],
     ])(
       'rejects entity_type %s with %s before any request',
       async (entityType, id, noun, ownType) => {
@@ -1576,6 +1602,153 @@ describe('OpenAlexService', () => {
         code: JsonRpcErrorCode.NotFound,
         data: { reason: 'entity_not_found' },
       });
+    });
+  });
+
+  // --- Awards entity type (gh #125) ---
+
+  describe('awards (gh #125)', () => {
+    const AWARD = {
+      id: 'https://openalex.org/G417894356',
+      display_name: 'CAREER: Groundwater flow',
+      funder_award_id: '2234213',
+      amount_usd: 749210,
+      start_date: '2023-03-15',
+      end_date: '2028-02-29',
+    };
+
+    it.each([
+      ['a bare ID', 'G417894356', '/awards/G417894356'],
+      ['a lowercase ID', 'g417894356', '/awards/g417894356'],
+      ['the short URL', 'https://openalex.org/G417894356', '/awards/G417894356'],
+      ['the record URL', 'https://openalex.org/awards/G417894356', '/awards/G417894356'],
+      ['the API URL', 'https://api.openalex.org/awards/G417894356', '/awards/G417894356'],
+    ])('looks an award up by %s with the default projection', async (_label, id, path) => {
+      routeFetch({ [path]: () => jsonResponse(AWARD) });
+      const service = await getService();
+
+      const result = await service.search({ entityType: 'awards', id }, createMockContext());
+
+      expect(result).toEqual({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [AWARD],
+      });
+      expect(lastFetchUrl().pathname).toBe(path);
+      expect(lastFetchUrl().searchParams.get('select')).toBe(DEFAULT_SELECT.awards.join(','));
+    });
+
+    it('projects neither the description nor the funded_outputs array by default', () => {
+      expect(DEFAULT_SELECT.awards).not.toContain('description');
+      expect(DEFAULT_SELECT.awards).not.toContain('funded_outputs');
+      expect(DEFAULT_SELECT.awards).not.toContain('cited_by_count');
+      expect(DEFAULT_SELECT.awards).toContain('funded_outputs_count');
+    });
+
+    function filterParam(): string {
+      return lastFetchUrl().searchParams.get('filter') ?? '';
+    }
+
+    /**
+     * Awards have no `openalex` filter (HTTP 400), and their `id` filter matches only the
+     * `https://openalex.org/G…` URL: a bare `G…`, either case, returns `count: 0` with no error.
+     */
+    it.each([
+      ['a bare ID', 'G417894356', 'id:https://openalex.org/G417894356'],
+      ['a lowercase ID', 'g417894356', 'id:https://openalex.org/G417894356'],
+      ['the short URL', 'https://openalex.org/G417894356', 'id:https://openalex.org/G417894356'],
+      [
+        'the record URL',
+        'https://openalex.org/awards/G417894356',
+        'id:https://openalex.org/G417894356',
+      ],
+      [
+        'an OR of two IDs, one a URL, spaced around the pipe',
+        'G417894356 | https://api.openalex.org/awards/g3618239412',
+        'id:https://openalex.org/G417894356|https://openalex.org/G3618239412',
+      ],
+    ])(
+      'sends an awards id filter given as %s under id, as the URL',
+      async (_label, value, sent) => {
+        const service = await getService();
+        await service.search({ entityType: 'awards', filters: { id: value } }, createMockContext());
+        expect(filterParam()).toBe(sent);
+      },
+    );
+
+    it('leaves a non-ID awards id value as written', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'awards', filters: { id: 'https://openalex.org/fields/17' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('id:https://openalex.org/fields/17');
+    });
+
+    it('keeps the openalex rewrite for an award ID filtered on works', async () => {
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', filters: { id: 'G417894356' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('openalex:G417894356');
+    });
+
+    it('sends the URL-form id filter on an awards group_by too', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        jsonResponse({ meta: { count: 1, groups_count: 1 }, group_by: [] }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'awards', groupBy: 'start_year', filters: { id: 'G417894356' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().pathname).toBe('/awards');
+      expect(filterParam()).toBe('id:https://openalex.org/G417894356');
+    });
+
+    it.each([
+      ['research_scope.is_research', false],
+      ['has_parent_award', false],
+      ['start_year', true],
+      ['funder.id', true],
+    ])('under order "key", groups awards by %s with cursor sent: %s', async (groupBy, cursor) => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        jsonResponse({ meta: { count: 0 }, group_by: [] }),
+      );
+      const service = await getService();
+      await service.analyze({ entityType: 'awards', groupBy, order: 'key' }, createMockContext());
+      expect(lastFetchUrl().searchParams.has('cursor')).toBe(cursor);
+    });
+
+    it('lists the eight autocomplete types, without awards', async () => {
+      const { AUTOCOMPLETE_ENTITY_TYPES, ENTITY_TYPES } = await import(
+        '@/services/openalex/types.js'
+      );
+      expect(AUTOCOMPLETE_ENTITY_TYPES).toEqual([
+        'works',
+        'authors',
+        'sources',
+        'institutions',
+        'topics',
+        'keywords',
+        'publishers',
+        'funders',
+      ]);
+      expect(ENTITY_TYPES).toEqual([...AUTOCOMPLETE_ENTITY_TYPES, 'awards']);
+    });
+
+    it('drops an award row from cross-entity autocomplete, as it drops other unmodelled types', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        jsonResponse({
+          results: [
+            { id: 'https://openalex.org/G1', display_name: 'Grant', entity_type: 'award' },
+            { id: 'https://openalex.org/F1', display_name: 'Funder', entity_type: 'funder' },
+          ],
+        }),
+      );
+      const service = await getService();
+      const { results } = await service.autocomplete({ query: 'grant' }, createMockContext());
+      expect(results.map((r) => r.entity_type)).toEqual(['funder']);
     });
   });
 
@@ -4329,18 +4502,35 @@ describe('OpenAlexService', () => {
     const populationUrl = (): URL =>
       findFetchUrl((u) => !u.searchParams.has('sample') && u.searchParams.get('per_page') === '1');
 
-    it('passes sample as a query param and aligns per_page to it', async () => {
+    /**
+     * OpenAlex pages a seeded draw with `page` + `per_page`, so the page size is the tool's
+     * `per_page`, never pinned to `sample`. (gh #124)
+     */
+    it('sends sample with the caller per_page, not pinned to the sample size', async () => {
       const service = await getService();
-      await service.search({ entityType: 'works', sample: 7 }, createMockContext());
+      await service.search({ entityType: 'works', sample: 300, perPage: 100 }, createMockContext());
       const url = sampleUrl();
-      expect(url.searchParams.get('sample')).toBe('7');
-      expect(url.searchParams.get('per_page')).toBe('7');
+      expect(url.searchParams.get('sample')).toBe('300');
+      expect(url.searchParams.get('per_page')).toBe('100');
     });
 
-    it('omits cursor on the sample request (single-page contract)', async () => {
+    it('sends page and seed on a seeded sample page, and never a cursor', async () => {
       const service = await getService();
-      await service.search({ entityType: 'works', sample: 5 }, createMockContext());
+      await service.search(
+        { entityType: 'works', sample: 300, seed: '7', perPage: 100, page: 3 },
+        createMockContext(),
+      );
+      const url = sampleUrl();
+      expect(url.searchParams.get('page')).toBe('3');
+      expect(url.searchParams.get('seed')).toBe('7');
+      expect(url.searchParams.has('cursor')).toBe(false);
+    });
+
+    it('omits page and cursor on a first sample page', async () => {
+      const service = await getService();
+      await service.search({ entityType: 'works', sample: 5, perPage: 5 }, createMockContext());
       expect(sampleUrl().searchParams.has('cursor')).toBe(false);
+      expect(sampleUrl().searchParams.has('page')).toBe(false);
     });
 
     it('passes seed when sample is set', async () => {
@@ -4349,10 +4539,17 @@ describe('OpenAlexService', () => {
       expect(sampleUrl().searchParams.get('seed')).toBe('abc');
     });
 
-    it('overrides caller-supplied per_page when sample is set', async () => {
+    it('keeps page, sample, and seed off the population lookup of a sample page', async () => {
       const service = await getService();
-      await service.search({ entityType: 'works', sample: 5, perPage: 25 }, createMockContext());
-      expect(sampleUrl().searchParams.get('per_page')).toBe('5');
+      await service.search(
+        { entityType: 'works', sample: 300, seed: '7', perPage: 100, page: 2 },
+        createMockContext(),
+      );
+      const head = populationUrl();
+      expect(head.searchParams.has('page')).toBe(false);
+      expect(head.searchParams.has('sample')).toBe(false);
+      expect(head.searchParams.has('seed')).toBe(false);
+      expect(head.searchParams.get('cursor')).toBe('*');
     });
 
     it('does not send sample/seed when sample is undefined', async () => {
@@ -5281,6 +5478,133 @@ describe('OpenAlexService', () => {
       await service.analyze({ entityType: 'works', groupBy: 'is_retracted' }, createMockContext());
       expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
     });
+
+    /**
+     * Every groupable true/false field OpenAlex served on 2026-10-28, each confirmed to answer
+     * `cursor=*` with "Cannot use cursor pagination when grouping fields that return true or
+     * false." (gh #123). The rule is a dotted segment starting `is_` or `has_`, plus two named
+     * fields that carry neither prefix.
+     */
+    const BOOLEAN_GROUP_BY_FIELDS_LIVE = {
+      works: [
+        'authorships.institutions.is_global_south',
+        'authorships.is_corresponding',
+        'best_oa_location.is_accepted',
+        'best_oa_location.is_oa',
+        'best_oa_location.is_published',
+        'best_oa_location.source.is_in_doaj',
+        'best_oa_location.source.is_oa',
+        'citation_normalized_percentile.is_in_top_10_percent',
+        'citation_normalized_percentile.is_in_top_1_percent',
+        'has_abstract',
+        'has_content.grobid_xml',
+        'has_content.pdf',
+        'has_doi',
+        'has_fulltext',
+        'has_oa_accepted_or_published_version',
+        'has_oa_submitted_version',
+        'has_old_authors',
+        'has_orcid',
+        'has_pdf_url',
+        'has_pmcid',
+        'has_pmid',
+        'has_raw_affiliation_strings',
+        'has_references',
+        'institutions.is_global_south',
+        'is_corresponding',
+        'is_oa',
+        'is_paratext',
+        'is_retracted',
+        'is_xpac',
+        'locations.is_accepted',
+        'locations.is_oa',
+        'locations.is_published',
+        'locations.source.has_issn',
+        'locations.source.is_core',
+        'locations.source.is_in_doaj',
+        'locations.source.is_oa',
+        'open_access.is_oa',
+        'primary_location.is_accepted',
+        'primary_location.is_oa',
+        'primary_location.is_published',
+        'primary_location.source.has_issn',
+        'primary_location.source.is_core',
+        'primary_location.source.is_in_doaj',
+        'primary_location.source.is_oa',
+        'mag_only',
+        'open_access.any_repository_has_fulltext',
+      ],
+      authors: ['has_orcid', 'last_known_institutions.is_global_south'],
+      sources: [
+        'has_issn',
+        'is_core',
+        'is_global_south',
+        'is_high_oa_rate',
+        'is_in_doaj',
+        'is_oa',
+        'is_ojs',
+      ],
+      institutions: ['has_ror', 'is_global_south', 'is_super_system'],
+      funders: ['is_global_south'],
+      awards: ['has_parent_award', 'has_recipient_country', 'research_scope.is_research'],
+    };
+    const BOOLEAN_FIELD_CASES = Object.entries(BOOLEAN_GROUP_BY_FIELDS_LIVE).flatMap(
+      ([entityType, fields]) => fields.map((field) => [entityType, field] as const),
+    );
+
+    it.each(BOOLEAN_FIELD_CASES)(
+      'reads %s group_by %s as boolean, bare and with :include_unknown (gh #123)',
+      async (_entityType, field) => {
+        const { isBooleanGroupBy } = await import('@/services/openalex/openalex-service.js');
+        expect(isBooleanGroupBy(field)).toBe(true);
+        expect(isBooleanGroupBy(`${field}:include_unknown`)).toBe(true);
+      },
+    );
+
+    it.each([
+      'publication_year',
+      'primary_topic.field.id',
+      'oa_status',
+      'apc_paid.value_usd',
+      'authorships.institutions.country_code',
+      'type',
+      'funder.id',
+      'start_year',
+    ])('reads %s as non-boolean (gh #123)', async (field) => {
+      const { isBooleanGroupBy } = await import('@/services/openalex/openalex-service.js');
+      expect(isBooleanGroupBy(field)).toBe(false);
+      expect(isBooleanGroupBy(`${field}:include_unknown`)).toBe(false);
+    });
+
+    it.each([
+      ['works', 'has_abstract'],
+      ['works', 'has_content.pdf'],
+      ['works', 'mag_only'],
+      ['works', 'open_access.any_repository_has_fulltext:include_unknown'],
+      ['sources', 'is_in_doaj'],
+    ] as const)(
+      'sends no cursor for %s boolean %s under order "key" (gh #123)',
+      async (entityType, groupBy) => {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+        );
+        const service = await getService();
+        await service.analyze({ entityType, groupBy, order: 'key' }, createMockContext());
+        expect(lastFetchUrl().searchParams.has('cursor')).toBe(false);
+      },
+    );
+
+    it.each(['oa_status', 'apc_paid.value_usd', 'authorships.institutions.country_code'])(
+      'still sends cursor=* for non-boolean %s under order "key" (gh #123)',
+      async (groupBy) => {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          new Response(JSON.stringify({ meta: { count: 0 }, group_by: [] }), { status: 200 }),
+        );
+        const service = await getService();
+        await service.analyze({ entityType: 'works', groupBy, order: 'key' }, createMockContext());
+        expect(lastFetchUrl().searchParams.get('cursor')).toBe('*');
+      },
+    );
   });
 
   // --- Response metrics ---

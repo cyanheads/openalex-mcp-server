@@ -11,7 +11,7 @@ import {
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AnalyzeResult } from '@/services/openalex/types.js';
-import { nodeTypes, renderedText } from '../../../helpers/markdown.js';
+import { nodeTypes, nonAutolinks, renderedText } from '../../../helpers/markdown.js';
 
 const mockAnalyze = vi.fn<() => Promise<AnalyzeResult>>();
 
@@ -778,6 +778,107 @@ describe('analyzeTrendsTool', () => {
       });
       expect(output).toContain('Some Field (https://openalex.org/subfields/some_field_): 3');
     });
+
+    it('reads a multi-line group label, key, and unknown-bucket label back intact (gh #128)', async () => {
+      const groups = [
+        {
+          key: 'https://openalex.org/I1',
+          key_display_name: 'Line one\n- not a list\n    indented ',
+          count: 30,
+        },
+        { key: 'raw key\r\n# not a heading', key_display_name: null, count: 20 },
+        {
+          key: 'Wichmann, Arthur,\n    b. 1851.',
+          key_display_name: 'Wichmann, Arthur,\n    b. 1851.',
+          count: 15,
+        },
+        { key: 'unknown', key_display_name: 'no\n> quote', count: 5, is_unknown: true as const },
+      ];
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 70, groups_count: 4, next_cursor: null },
+        groups,
+      });
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'authorships.institutions.id',
+        include_unknown: true,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const output = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      const blocks = ['list', 'heading', 'blockquote', 'table', 'code', 'thematicBreak'];
+      expect(nodeTypes(output).filter((t) => blocks.includes(t))).toEqual([]);
+      const rendered = renderedText(output);
+      expect(rendered).toContain(
+        'Line one\n- not a list\n    indented  (https://openalex.org/I1): 30',
+      );
+      expect(rendered).toContain('raw key\n# not a heading: 20');
+      expect(rendered).toContain('Wichmann, Arthur,\n    b. 1851.: 15');
+      expect(rendered).toContain('unknown (no value; key unknown, label no\n> quote): 5');
+    });
+  });
+
+  /**
+   * A notice is authored Markdown: the framework quotes it into `content[]` and escapes nothing,
+   * so the echo it repeats is escaped in the handler. Both surfaces carry the same string, and
+   * the caller's text reads back as sent; the `echo` field itself stays raw. (gh #127)
+   */
+  describe('caller text in notices (gh #127)', () => {
+    /** The trailer's `>` lines, and the string they quote with the markers stripped. */
+    const quotedNotice = (text: string) => {
+      const lines = text.split('\n').filter((line) => line.startsWith('>'));
+      return {
+        markdown: lines.join('\n'),
+        quoted: lines.map((line) => line.replace(/^> ?/, '')).join('\n'),
+      };
+    };
+    const hostile = {
+      group_by: 'type <i>x</i> *y*',
+      filters: {
+        'display_name.search': 'zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>',
+        doi: 'https://doi.org/10.1002/a_b*c~d',
+      },
+    };
+    const echo =
+      'entity_type=works | group_by="type <i>x</i> *y*" | filters={"display_name.search":"zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>","doi":"https://doi.org/10.1002/a_b*c~d"}';
+
+    it.each([
+      [
+        'an empty first page',
+        {},
+        `No groups returned for ${echo}. Try removing filters or grouping by a different field.`,
+      ],
+      [
+        'an exhausted cursor page',
+        { cursor: 'next-page' },
+        `Pagination exhausted for ${echo} | order=key — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping. OpenAlex can wrap a key-ordered walk to earlier groups. Stop when a page's first key repeats an earlier key, or when a page is short or empty.`,
+      ],
+    ] as const)('reads the echo back as sent on %s', async (_label, extra, expected) => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 0, groups_count: 0, next_cursor: null },
+        groups: [],
+      });
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        ...hostile,
+        ...extra,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { echo: string; notice?: string };
+      const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      const { markdown, quoted } = quotedNotice(text);
+      expect(quoted).toBe(structured.notice);
+      const markup = ['emphasis', 'strong', 'delete', 'html', 'inlineCode'];
+      expect(nodeTypes(markdown).filter((t) => markup.includes(t))).toEqual([]);
+      expect(nonAutolinks(markdown)).toEqual([]);
+      expect(renderedText(markdown)).toBe(expected);
+      // The echo field is data, raw on both surfaces: a code span in the trailer.
+      expect(structured.echo.startsWith(echo)).toBe(true);
+      expect(renderedText(text)).toContain(`Query: ${structured.echo}`);
+    });
   });
 
   describe('unknown bucket (gh #75)', () => {
@@ -1140,6 +1241,76 @@ describe('analyzeTrendsTool', () => {
         expect(textOf(result)).not.toContain('wrap');
       },
     );
+
+    it.each([
+      ['works', 'has_abstract', { 'primary_topic.id': 'T10398' }],
+      ['sources', 'is_in_doaj', undefined],
+      ['awards', 'research_scope.is_research', { 'funder.id': 'F4320306076' }],
+    ] as const)(
+      'keeps count order for %s boolean %s under order "key", on both surfaces (gh #123)',
+      async (entityType, groupBy, filters) => {
+        const groups = [
+          { key: 'true', key_display_name: 'true', count: 7 },
+          { key: 'false', key_display_name: 'false', count: 3 },
+        ];
+        reply(groups, 10);
+        const result = await runToolContract(analyzeTrendsTool, {
+          entity_type: entityType,
+          group_by: groupBy,
+          order: 'key',
+          ...(filters ? { filters } : {}),
+        });
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.has('cursor')).toBe(
+          false,
+        );
+        const structured = result.structuredContent as AnalyzeResult & {
+          echo: string;
+          notice?: string;
+        };
+        expect(structured.groups).toEqual(groups);
+        expect(structured.echo).toContain('order=count');
+        expect(structured.echo).not.toContain('order=key');
+        expect(structured.notice).toBeUndefined();
+        expect(textOf(result)).toContain('true: 7\nfalse: 3');
+        expect(textOf(result)).toContain('order=count');
+        expect(textOf(result)).not.toContain('key-ascending');
+      },
+    );
+
+    it('groups awards by start_year at /awards, years rendered in order on both surfaces (gh #125)', async () => {
+      const groups = [
+        { key: '2023', key_display_name: '2023', count: 412 },
+        { key: '2021', key_display_name: '2021', count: 388 },
+      ];
+      reply(groups, 2904);
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'awards',
+        group_by: 'start_year',
+        filters: { 'funder.id': 'F4320306076', id: 'G417894356|G3618239412' },
+      });
+      expect(result.isError).toBeFalsy();
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.pathname).toBe('/awards');
+      expect(url.searchParams.get('group_by')).toBe('start_year');
+      expect(url.searchParams.get('filter')).toBe(
+        'funder.id:F4320306076,id:https://openalex.org/G417894356|https://openalex.org/G3618239412',
+      );
+      expect(result.structuredContent).toMatchObject({
+        meta: { count: 2904, groups_count: 2 },
+        groups,
+        echo: expect.stringContaining('entity_type=awards'),
+        totalCount: 2904,
+      });
+      expect(textOf(result)).toContain('2904 total entities across 2 groups');
+      expect(textOf(result)).toContain('2021: 388\n2023: 412');
+    });
+
+    it('names awards groupings in the group_by description (gh #125)', () => {
+      const description = analyzeTrendsTool.input.shape.group_by.description ?? '';
+      expect(description).toContain('Awards: "start_year", "funder.id"');
+      expect(description).toContain('do not sum amount_usd');
+    });
 
     it.each([undefined, false, true])(
       'normalizes the suffix with include_unknown=%s once (gh #75)',

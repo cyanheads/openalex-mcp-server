@@ -19,7 +19,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { clampPageSize } from '@/mcp-server/tools/page-size.js';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
-import { renderedText as readMarkdown } from '../../../helpers/markdown.js';
+import {
+  nodeTypes,
+  nonAutolinks,
+  renderedText as readMarkdown,
+} from '../../../helpers/markdown.js';
 import {
   authorship,
   authorships,
@@ -43,7 +47,7 @@ const clampMetrics = vi.hoisted(() => ({ add: vi.fn() }));
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
   createCounter: (name: string) =>
-    name === 'openalex.per_page.clamps' ? clampMetrics : conversionMetrics,
+    name === 'openalex.count_input.clamps' ? clampMetrics : conversionMetrics,
 }));
 
 /**
@@ -91,7 +95,8 @@ describe('searchEntitiesTool', () => {
     });
     expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
       'mcp.tool.name': tool,
-      'openalex.per_page.maximum': maximum,
+      'openalex.count_input.name': 'per_page',
+      'openalex.count_input.maximum': maximum,
     });
     expect(log).toHaveBeenCalledExactlyOnceWith('Clamped per_page', {
       tool,
@@ -108,15 +113,14 @@ describe('searchEntitiesTool', () => {
     expect(log).toHaveBeenCalledTimes(1);
   });
 
-  it('budgets a clamp alongside filter conversion, list cap and window notices', async () => {
+  it('joins a clamp, filter conversion, and the list cap on a whole record past 64,000 bytes', async () => {
+    const record = workWithAuthorships(1, 100, (n) => ({
+      ...authorship(n),
+      raw_affiliation_strings: ['Institute '.repeat(100)],
+    }));
     mockSearch.mockResolvedValue({
       meta: { count: 1, per_page: 100, next_cursor: null },
-      results: [
-        workWithAuthorships(1, 100, (n) => ({
-          ...authorship(n),
-          raw_affiliation_strings: ['Institute '.repeat(100)],
-        })),
-      ],
+      results: [record],
     });
     const result = await runToolContract(searchEntitiesTool, {
       entity_type: 'works',
@@ -125,16 +129,18 @@ describe('searchEntitiesTool', () => {
       per_page: 150,
     });
     expect(result.isError).toBeFalsy();
-    const notice = (result.structuredContent as { notice: string }).notice;
+    const structured = result.structuredContent as { notice: string; results: EntityRecord[] };
+    expect(structured.results).toEqual([record]);
+    const { notice } = structured;
     expect(notice).toContain('using per_page 100');
     expect(notice).toContain('Converted native filter string');
-    expect(notice).toContain('windowed');
     expect(notice).toContain('exactly 100');
+    expect(notice).not.toContain('windowed');
     expect(
       result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
     ).toContain(notice);
-    expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(64_000);
-    expect(contentTextBytes(result.content)).toBeLessThanOrEqual(64_000);
+    expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeGreaterThan(64_000);
+    expect(contentTextBytes(result.content)).toBeGreaterThan(64_000);
   });
 
   it('logs and counts one actual clamp with only bounded metric attributes', async () => {
@@ -147,7 +153,8 @@ describe('searchEntitiesTool', () => {
     );
     expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
       'mcp.tool.name': 'openalex_search_entities',
-      'openalex.per_page.maximum': 100,
+      'openalex.count_input.name': 'per_page',
+      'openalex.count_input.maximum': 100,
     });
     expect(log).toHaveBeenCalledWith('Clamped per_page', {
       tool: 'openalex_search_entities',
@@ -159,7 +166,7 @@ describe('searchEntitiesTool', () => {
 
   it.each([
     { id: 'W1', search_mode: 'semantic' as const, per_page: 150 },
-    { sample: 10, per_page: 150 },
+    { id: 'W1', sample: 25_000, per_page: 150 },
     { per_page: 100 },
   ])('does not disclose or count an unused clamp: %j', async (args) => {
     mockSearch.mockResolvedValue(sampleResult);
@@ -169,9 +176,36 @@ describe('searchEntitiesTool', () => {
     expect(JSON.stringify(result)).not.toContain('using per_page');
   });
 
-  it.each([51, 150])(
-    'preserves the requested semantic cap at %i on both surfaces',
+  it.each([60, 150])(
+    'clamps a semantic per_page of %i to 50 with a notice on both surfaces',
     async (per_page) => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'graph',
+        search_mode: 'semantic',
+        per_page,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ perPage: 50 }),
+        expect.anything(),
+      );
+      const notice = `per_page ${per_page} exceeds the semantic-search maximum of 50; using per_page 50.`;
+      expect((result.structuredContent as { notice: string }).notice).toContain(notice);
+      expect(JSON.stringify(result.content)).toContain(notice);
+      expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+        'mcp.tool.name': 'openalex_search_entities',
+        'openalex.count_input.name': 'per_page',
+        'openalex.count_input.maximum': 50,
+      });
+    },
+  );
+
+  it.each([51, 100])(
+    'rejects a semantic per_page of %i under OPENALEX_CLAMP_PER_PAGE=false on both surfaces',
+    async (per_page) => {
+      mockConfig.clampPerPage = false;
       const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         query: 'graph',
@@ -192,6 +226,19 @@ describe('searchEntitiesTool', () => {
       expect(clampMetrics.add).not.toHaveBeenCalled();
     },
   );
+
+  it('leaves a semantic per_page of 50 unclamped', async () => {
+    mockSearch.mockResolvedValue(sampleResult);
+    const result = await runToolContract(searchEntitiesTool, {
+      entity_type: 'works',
+      query: 'graph',
+      search_mode: 'semantic',
+      per_page: 50,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.stringify(result)).not.toContain('using per_page');
+    expect(clampMetrics.add).not.toHaveBeenCalled();
+  });
   it('clamps an oversized page and joins the empty-result notice on both surfaces', async () => {
     mockSearch.mockResolvedValue({
       meta: { count: 0, per_page: 100, next_cursor: null },
@@ -456,16 +503,18 @@ describe('searchEntitiesTool', () => {
     );
   });
 
-  it('applies default per_page and search_mode', () => {
+  it('applies the default search_mode and leaves per_page to the handler default', () => {
     const input = searchEntitiesTool.input.parse({
       entity_type: 'works',
       query: 'test',
     });
-    expect(input.per_page).toBe(25);
+    // The handler defaults per_page — 25, or the sample size up to 100 (gh #124).
+    expect(input.per_page).toBeUndefined();
     expect(input.search_mode).toBe('keyword');
   });
 
-  it('rejects per_page > 50 with semantic search before calling upstream', async () => {
+  it('rejects per_page > 50 with semantic search before calling upstream when clamping is off', async () => {
+    mockConfig.clampPerPage = false;
     const ctx = createMockContext({ errors: searchEntitiesTool.errors });
     const input = searchEntitiesTool.input.parse({
       entity_type: 'works',
@@ -477,6 +526,22 @@ describe('searchEntitiesTool', () => {
     await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
       message: expect.stringMatching(/at most 50/i),
       data: expect.objectContaining({ reason: 'semantic_per_page_cap' }),
+    });
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
+
+  it('reports sample_with_semantic for a semantic sample with no per_page when clamping is off', async () => {
+    mockConfig.clampPerPage = false;
+    const ctx = createMockContext({ errors: searchEntitiesTool.errors });
+    const input = searchEntitiesTool.input.parse({
+      entity_type: 'works',
+      query: 'graph neural networks',
+      search_mode: 'semantic',
+      sample: 100,
+    });
+
+    await expect(searchEntitiesTool.handler(input, ctx)).rejects.toMatchObject({
+      data: expect.objectContaining({ reason: 'sample_with_semantic' }),
     });
     expect(mockSearch).not.toHaveBeenCalled();
   });
@@ -541,8 +606,10 @@ describe('searchEntitiesTool', () => {
       expect(mockSearch).not.toHaveBeenCalled();
     });
 
-    it('rejects sample > 100 at the schema layer', () => {
-      expect(() => searchEntitiesTool.input.parse({ entity_type: 'works', sample: 101 })).toThrow();
+    it('accepts the largest sample OpenAlex draws, 10,000', () => {
+      expect(searchEntitiesTool.input.parse({ entity_type: 'works', sample: 10_000 }).sample).toBe(
+        10_000,
+      );
     });
 
     it('rejects sample < 1 at the schema layer', () => {
@@ -562,6 +629,357 @@ describe('searchEntitiesTool', () => {
       const enrichment = getEnrichment(ctx);
       expect(enrichment.echo).toContain('sample=10');
       expect(enrichment.echo).toContain('seed="xyz"');
+    });
+  });
+
+  /**
+   * OpenAlex draws up to 10,000 records per sample and pages a seeded draw with `page` and
+   * `per_page`: pages are disjoint, their union is the draw, and a page past it comes back empty.
+   * `meta.count` stays the population, so the draw is `min(sample, meta.count)`. Unseeded paging,
+   * a sample over 10,000, and `page × per_page` over 10,000 are 400s upstream. (gh #124)
+   */
+  describe('paged samples (gh #124)', () => {
+    const POPULATION = 65_411;
+    const works = (from: number, n: number): EntityRecord[] =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `https://openalex.org/W${from + i}`,
+        display_name: `Work ${from + i}`,
+      }));
+    const pageOf = (records: EntityRecord[], count = POPULATION, per_page = 100): SearchResult => ({
+      meta: { count, per_page, next_cursor: null },
+      results: records,
+    });
+    /** `content[]` text through a CommonMark parse, as a client reads it. */
+    const rendered = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      readMarkdown(result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n'));
+    const noticeOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+    /**
+     * The notice as each surface carries it, as reader-visible text: code-span backticks dropped
+     * from `structuredContent.notice`, as the CommonMark parse drops them from `content[]`.
+     */
+    const both = (result: Awaited<ReturnType<typeof runToolContract>>) => [
+      (noticeOf(result) ?? '').replaceAll('`', ''),
+      rendered(result),
+    ];
+    const seeded = { entity_type: 'works', sample: 300, seed: '7', per_page: 100 } as const;
+
+    it.each([
+      [undefined, 'page: 2'],
+      [2, 'page: 3'],
+    ] as const)(
+      'points a seeded sample page %s with more of the draw at %s',
+      async (page, pointer) => {
+        mockSearch.mockResolvedValue(pageOf(works(((page ?? 1) - 1) * 100, 100)));
+        const result = await runToolContract(searchEntitiesTool, {
+          ...seeded,
+          ...(page && { page }),
+        });
+        expect(result.isError).toBeFalsy();
+        expect(mockSearch).toHaveBeenCalledWith(
+          expect.objectContaining({ sample: 300, seed: '7', perPage: 100, page }),
+          expect.anything(),
+        );
+        expect(noticeOf(result)).toContain(`continue with \`${pointer}\` and the same \`seed\``);
+        for (const text of both(result)) {
+          expect(text).toContain(`continue with ${pointer} and the same seed`);
+          expect(text).toContain('300');
+        }
+      },
+    );
+
+    it('says the draw ends on its last page, with no pointer', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(200, 100)));
+      const result = await runToolContract(searchEntitiesTool, { ...seeded, page: 3 });
+      for (const text of both(result)) {
+        expect(text).toContain('the draw ends on this page');
+        expect(text).not.toMatch(/page: \d/);
+      }
+    });
+
+    it('carries the exhausted advice alone on the empty page past the draw', async () => {
+      mockSearch.mockResolvedValue(pageOf([]));
+      const result = await runToolContract(searchEntitiesTool, { ...seeded, page: 4 });
+      expect(result.isError).toBeFalsy();
+      const notice = noticeOf(result) ?? '';
+      expect(notice).toMatch(/^Pagination exhausted for /);
+      for (const text of [notice, rendered(result)]) {
+        expect(text).toContain('Pagination exhausted');
+        expect(text).not.toContain('draw');
+        expect(text).not.toMatch(/page: \d/);
+      }
+    });
+
+    it.each([
+      [4, 'page: 5'],
+      [5, undefined],
+    ] as const)(
+      'ends a sample larger than its population at ceil(meta.count / per_page): page %i',
+      async (page, pointer) => {
+        mockSearch.mockResolvedValue(pageOf(works((page - 1) * 100, page === 5 ? 46 : 100), 446));
+        const result = await runToolContract(searchEntitiesTool, {
+          ...seeded,
+          sample: 1000,
+          page,
+        });
+        for (const text of both(result)) {
+          expect(text).toContain('446');
+          if (pointer) expect(text).toContain(`continue with ${pointer}`);
+          else expect(text).toContain('the draw ends on this page');
+        }
+      },
+    );
+
+    it.each([
+      ['a sample of 50 with no per_page', { sample: 50 }, 50],
+      ['a sample of 100 with no per_page', { sample: 100, seed: '1' }, 100],
+      ['a sample of 300 with no per_page', { sample: 300, seed: '1' }, 100],
+      ['a search with no sample or per_page', {}, 25],
+      ['a sample with an explicit per_page', { sample: 300, seed: '1', per_page: 25 }, 25],
+    ] as const)('sizes the page for %s', async (_label, extra, perPage) => {
+      mockSearch.mockResolvedValue(pageOf(works(0, Math.min(perPage, 50)), 50));
+      const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', ...extra });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ perPage }),
+        expect.anything(),
+      );
+    });
+
+    it('returns a whole small sample in one call with no notice', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 50)));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 50,
+      });
+      expect((result.structuredContent as { results: unknown[] }).results).toHaveLength(50);
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    it('clamps an oversized per_page under a sample like a search, on both surfaces', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 10), 10));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 10,
+        per_page: 150,
+      });
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ perPage: 100, sample: 10 }),
+        expect.anything(),
+      );
+      const notice = 'per_page 150 exceeds the maximum of 100; using per_page 100.';
+      expect(noticeOf(result)).toContain(notice);
+      expect(rendered(result)).toContain(notice);
+    });
+
+    it('clamps a sample over 10,000 with a notice, logged and counted', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 100)));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 25_000,
+        seed: '1',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ sample: 10_000, perPage: 100 }),
+        expect.anything(),
+      );
+      const notice = 'sample 25000 exceeds the maximum of 10000; using sample 10000.';
+      expect(noticeOf(result)).toContain(notice);
+      expect(rendered(result)).toContain(notice);
+      expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+        'mcp.tool.name': 'openalex_search_entities',
+        'openalex.count_input.name': 'sample',
+        'openalex.count_input.maximum': 10_000,
+      });
+    });
+
+    // Strict mode's schema rejection of `sample` 10,001 is pinned in tests/config/server-config.test.ts,
+    // which loads the schema under each setting of OPENALEX_CLAMP_PER_PAGE.
+
+    it('rejects page on an unseeded sample before the round trip, naming seed', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 100)));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 300,
+        per_page: 100,
+        page: 2,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'sample_page_without_seed',
+            recovery: { hint: expect.stringContaining('`seed`') },
+          },
+        },
+      });
+      const text = rendered(result);
+      expect(text).toContain('sample_page_without_seed');
+      expect(text).toContain('`seed`');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [101, 100],
+      [201, 50],
+      [334, 30],
+    ])(
+      'rejects page %i at per_page %i, past the first 10,000 records, before the round trip',
+      async (page, per_page) => {
+        mockSearch.mockResolvedValue(pageOf(works(0, 1)));
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          sample: 10_000,
+          seed: '7',
+          per_page,
+          page,
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            data: {
+              reason: 'sample_page_too_deep',
+              recovery: { hint: expect.stringContaining('25, 50, or 100') },
+            },
+          },
+        });
+        const text = rendered(result);
+        expect(text).toContain('sample_page_too_deep');
+        expect(text).toContain('25, 50, or 100');
+        expect(text).toContain('10,000');
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      [100, 100],
+      [333, 30],
+    ])('sends page %i at per_page %i, within the first 10,000 records', async (page, per_page) => {
+      mockSearch.mockResolvedValue(pageOf(works(0, per_page), 65_411, per_page));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 10_000,
+        seed: '7',
+        per_page,
+        page,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ page, perPage: per_page }),
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      [332, 'continue with page: 333'],
+      [333, 'Records 9,991–10,000 are reachable only at a per_page that divides 10,000'],
+    ])(
+      'points page %i at per_page 30 only at pages OpenAlex serves: %s',
+      async (page, expected) => {
+        mockSearch.mockResolvedValue(pageOf(works(0, 30), 65_411, 30));
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          sample: 10_000,
+          seed: '7',
+          per_page: 30,
+          page,
+        });
+        for (const text of both(result)) {
+          expect(text).toContain(expected);
+          expect(text).not.toContain('page: 334');
+        }
+      },
+    );
+
+    it('measures depth against the clamped per_page', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 1)));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 10_000,
+        seed: '7',
+        per_page: 500,
+        page: 101,
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'sample_page_too_deep' } },
+      });
+    });
+
+    it('returns page 1 of an unseeded multi-page sample with a notice naming seed', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 100)));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 300,
+      });
+      expect(result.isError).toBeFalsy();
+      for (const text of both(result)) {
+        expect(text).toContain('Pass a seed to fix the draw and walk it with page');
+        expect(text).toContain('300');
+        expect(text).not.toMatch(/page: \d/);
+      }
+    });
+
+    it('leaves an unseeded sample whose draw fits one page without a notice', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(0, 40), 40));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        sample: 300,
+      });
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    it('reports sample_with_semantic, not a page conflict, when a semantic sample pages', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        query: 'groundwater',
+        search_mode: 'semantic',
+        sample: 5,
+        page: 2,
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'sample_with_semantic' } },
+      });
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('drops sample, seed, and page on an id lookup without clamping or rejecting them', async () => {
+      mockSearch.mockResolvedValue(pageOf(works(1, 1), 1, 1));
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W1',
+        sample: 25_000,
+        page: 400,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(clampMetrics.add).not.toHaveBeenCalled();
+      expect(noticeOf(result)).not.toContain('exceeds');
+      expect(noticeOf(result)).toContain('sample');
+    });
+
+    it('declares the two page reasons as handler-local ValidationErrors and retires sample_with_page', () => {
+      for (const reason of ['sample_page_without_seed', 'sample_page_too_deep']) {
+        const entry = searchEntitiesTool.errors?.find((e) => e.reason === reason);
+        expect(entry?.code, reason).toBe(JsonRpcErrorCode.ValidationError);
+        expect(entry).not.toHaveProperty('thrownBy');
+      }
+      expect(searchEntitiesTool.errors?.map((e) => e.reason as string)).not.toContain(
+        'sample_with_page',
+      );
+      const cursor = searchEntitiesTool.errors?.find((e) => e.reason === 'sample_with_cursor');
+      expect(cursor?.recovery).not.toMatch(/single page/i);
+    });
+
+    it('documents sample paging on the sample, seed, page, and per_page descriptions', () => {
+      const { sample, seed, page, per_page } = searchEntitiesTool.input.shape;
+      expect(sample.description).toContain('10,000');
+      expect(sample.description).not.toMatch(/single page only/i);
+      expect(seed.description).toMatch(/page/);
+      expect(page.description).toMatch(/sample/);
+      expect(per_page.description).toMatch(/sample/);
     });
   });
 
@@ -664,23 +1082,6 @@ describe('searchEntitiesTool', () => {
         expect(mockSearch).not.toHaveBeenCalled();
       },
     );
-
-    it('keeps page as the reported conflict when semantic sample also pages', async () => {
-      mockSearch.mockResolvedValue(sampleResult);
-
-      const result = await runToolContract(searchEntitiesTool, {
-        entity_type: 'works',
-        query: 'groundwater',
-        search_mode: 'semantic',
-        sample: 5,
-        page: 2,
-      });
-
-      expect(result.structuredContent).toMatchObject({
-        error: { data: { reason: 'sample_with_page' } },
-      });
-      expect(mockSearch).not.toHaveBeenCalled();
-    });
 
     it.each([
       ['sample and semantic mode', { sample: 5, search_mode: 'semantic', query: 'groundwater' }],
@@ -1699,6 +2100,40 @@ describe('searchEntitiesTool', () => {
       expect(text).toContain('openalex_resolve_name');
     });
 
+    /** The recovery's letter table names every routable letter, awards' `G` included. (gh #125) */
+    it.each([
+      ['works', 'G417894356', 'award', 'awards'],
+      ['awards', 'W2741809807', 'work', 'works'],
+    ])(
+      'fails entity_type %s with %s as id_type_mismatch, its recovery naming G awards',
+      async (entityType, id, noun, ownType) => {
+        const fetchMock = await useRealService({});
+
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: entityType as 'works',
+          id,
+        });
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        const error = (
+          result.structuredContent as {
+            error: { data: { reason: string; recovery: { hint: string } } };
+          }
+        ).error;
+        expect(error.data.reason).toBe('id_type_mismatch');
+        expect(error.data.recovery.hint).toContain('F funders, G awards');
+        const text = contentText(result);
+        expect(text).toContain(`${noun} ID`);
+        expect(text).toContain(`entity_type "${ownType}"`);
+        expect(text).toContain('G awards');
+      },
+    );
+
+    it('lists every entity type and ID letter, awards included, in the descriptions (gh #125)', () => {
+      expect(searchEntitiesTool.description).toContain('publishers, funders, awards)');
+      expect(searchEntitiesTool.input.shape.id.description).toContain('F funders, G awards;');
+    });
+
     it('declares id_type_mismatch as a service-thrown ValidationError', () => {
       const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'id_type_mismatch');
       expect(entry).toMatchObject({
@@ -2328,9 +2763,9 @@ describe('searchEntitiesTool', () => {
 
   /**
    * `author_list` is derived in the service from the `authorships` it requests, before the
-   * response budget runs. These run the real service against an upstream fake that projects
-   * each record to the `select` it receives, as OpenAlex does, so the derivation, the budget,
-   * and the slice handler all see what a caller would.
+   * page is built. These run the real service against an upstream fake that projects each
+   * record to the `select` it receives, as OpenAlex does, so the derivation, the page, and the
+   * slice handler all see what a caller would.
    */
   describe('author_list through the real service (gh #102)', () => {
     afterEach(() => {
@@ -2353,9 +2788,7 @@ describe('searchEntitiesTool', () => {
     type Structured = {
       results: EntityRecord[];
       notice?: string;
-      omitted?: { ids: string[]; next: { tool: string; arguments: Record<string, unknown> } };
       windows?: Window[];
-      over_budget?: boolean;
     };
 
     /** A record as OpenAlex would return it for a comma-joined `select` (all fields without one). */
@@ -2450,31 +2883,48 @@ describe('searchEntitiesTool', () => {
       }));
 
     it.each(['authorships', 'author_list'])(
-      'walks every stored singleton %s entry with cap uncertainty and finite continuation',
+      'returns and walks every stored singleton %s entry with cap uncertainty and finite continuation',
       async (field) => {
         const fetchMock = await useRealService([upstreamWork(1, 5000)]);
+        const whole = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W3000000001',
+          select: [field],
+        });
+        expect(whole.isError).toBeFalsy();
+        expect((whole.structuredContent as Structured).results[0]?.[field]).toHaveLength(5000);
+        expect((whole.structuredContent as Structured).windows).toEqual([
+          {
+            id: 'W3000000001',
+            field,
+            offset: 0,
+            shown: 5000,
+            total: 5000,
+            possibly_capped: true,
+            next: null,
+          },
+        ]);
+
         type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
         let args: SearchArgs | undefined = {
           entity_type: 'works',
           id: 'W3000000001',
-          select: [field],
+          slice: { field, offset: 0, limit: 1500 },
         };
         const seen: string[] = [];
         let calls = 0;
         while (args && calls < 100) {
           const result = await runToolContract(searchEntitiesTool, args);
           expect(result.isError).toBeFalsy();
-          expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(64_000);
-          expect(contentTextBytes(result.content)).toBeLessThanOrEqual(64_000);
           const structured = result.structuredContent as Structured;
           const window = structured.windows?.[0];
           expect(window).toMatchObject({
             field,
             offset: seen.length,
+            shown: Math.min(1500, 5000 - seen.length),
             total: 5000,
             possibly_capped: true,
           });
-          expect(window?.shown).toBeGreaterThan(0);
           const text = textOf(result);
           expect(text).toContain('5,000');
           expect(text).toContain('stored entries');
@@ -2497,8 +2947,7 @@ describe('searchEntitiesTool', () => {
           args = window?.next?.arguments as SearchArgs | undefined;
           calls++;
         }
-        expect(calls).toBeGreaterThan(2);
-        expect(calls).toBeLessThan(100);
+        expect(calls).toBe(4);
         expect(seen).toHaveLength(5000);
         expect(new Set(seen).size).toBe(5000);
         expect(seen[0]).toBe('https://openalex.org/A9000000');
@@ -2520,7 +2969,7 @@ describe('searchEntitiesTool', () => {
         });
         expect(textOf(past)).toContain('5,000');
         expect(textOf(past)).toContain('`select` was not applied');
-        expect(fetchMock).toHaveBeenCalledTimes(calls + 1);
+        expect(fetchMock).toHaveBeenCalledTimes(calls + 2);
       },
     );
 
@@ -2630,9 +3079,7 @@ describe('searchEntitiesTool', () => {
       const record = upstreamWork(1_858_542_512, 2932);
       const id = bare(record.id);
 
-      it('pages a 2,932-author author_list to the end with no gap or overlap', {
-        timeout: 30_000,
-      }, async () => {
+      it('pages a 2,932-author author_list to the end with no gap or overlap', async () => {
         const fetchMock = await useRealService([record]);
         const collected: unknown[] = [];
         const windows: Window[] = [];
@@ -2642,7 +3089,7 @@ describe('searchEntitiesTool', () => {
           const result = await runToolContract(searchEntitiesTool, {
             entity_type: 'works',
             id,
-            slice: { field: 'author_list', offset },
+            slice: { field: 'author_list', offset, limit: 1000 },
           });
           calls++;
           expect(result.isError).toBeFalsy();
@@ -2661,16 +3108,16 @@ describe('searchEntitiesTool', () => {
           expect(window).toMatchObject({ field: 'author_list', offset, total: 2932 });
           expect(textOf(result)).toContain(`**Window:** ${id} \`author_list\` — offset ${offset}`);
           const next = window.next?.arguments.slice as
-            | { field: string; offset: number }
+            | { field: string; offset: number; limit: number }
             | undefined;
-          if (next) expect(next.field).toBe('author_list');
+          if (next)
+            expect(next).toEqual({ field: 'author_list', offset: offset + 1000, limit: 1000 });
           offset = next?.offset;
         }
 
         expect(collected).toEqual(expectedList(2932));
-        expect(calls).toBeGreaterThan(1);
+        expect(windows.map((window) => window.shown)).toEqual([1000, 1000, 932]);
         expect(windows.at(-1)?.next).toBeNull();
-        expect(windows[1]?.offset).toBe(windows[0]?.shown);
       });
 
       it('returns an empty final window past the end of author_list', async () => {
@@ -2690,65 +3137,80 @@ describe('searchEntitiesTool', () => {
         expect(structured.notice).toContain('past the end of `author_list`, which holds 2932');
       });
 
-      it('continues a windowed id lookup with a slice on author_list', async () => {
-        const wide = workWithAuthorships(7, 2932, (i) => ({
-          author: {
-            id: `https://openalex.org/A${i}`,
-            display_name: `Member ${'x'.repeat(60)} ${i}`,
-          },
-        }));
-        await useRealService([wide]);
+      it('returns all 2,932 author_list entries on an id lookup, with no window', async () => {
+        await useRealService([record]);
 
-        const first = await runToolContract(searchEntitiesTool, {
+        const result = await runToolContract(searchEntitiesTool, {
           entity_type: 'works',
-          id: bare(wide.id),
+          id,
           select: ['author_list'],
         });
-        const [window] = (first.structuredContent as Structured).windows ?? [];
-        expect(window).toMatchObject({ field: 'author_list', offset: 0, total: 2932 });
-        expect(window?.next?.arguments).toEqual({
+
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.author_list).toEqual(expectedList(2932));
+        expect(structured).not.toHaveProperty('windows');
+        expect(textOf(result)).toContain('- [2931] id: https://openalex.org/A9002931,');
+      });
+
+      it('returns entries 100–199 for offset 100, limit 100, continuing at offset 200', async () => {
+        await useRealService([record]);
+
+        const result = await runToolContract(searchEntitiesTool, {
           entity_type: 'works',
-          id: bare(wide.id),
-          slice: { field: 'author_list', offset: window?.shown },
+          id,
+          slice: { field: 'author_list', offset: 100, limit: 100 },
         });
 
-        const second = await runToolContract(
-          searchEntitiesTool,
-          window?.next?.arguments as Parameters<
-            typeof runToolContract<typeof searchEntitiesTool>
-          >[1],
-        );
-        const items = (second.structuredContent as Structured).results[0]?.author_list as {
-          id: string;
-        }[];
-        expect(items[0]?.id).toBe(`https://openalex.org/A${window?.shown}`);
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.author_list).toEqual(expectedList(2932).slice(100, 200));
+        const next = {
+          tool: 'openalex_search_entities',
+          arguments: {
+            entity_type: 'works',
+            id,
+            slice: { field: 'author_list', offset: 200, limit: 100 },
+          },
+        };
+        expect(structured.windows).toEqual([
+          {
+            id,
+            field: 'author_list',
+            offset: 100,
+            shown: 100,
+            total: 2932,
+            possibly_capped: false,
+            next,
+          },
+        ]);
+        const text = textOf(result);
+        expect(text).toContain('- [100] id: https://openalex.org/A9000100,');
+        expect(text).toContain('- [199] id: https://openalex.org/A9000199,');
+        expect(text).not.toContain('- [200] ');
+        expect(text).toContain(JSON.stringify(next.arguments));
       });
     });
 
-    it('repeats select in the omitted call, which returns the same author_list shape', async () => {
-      // 30 works of ~100 authors each run well past the budget on one page.
+    it('returns every author_list record of a page past 64,000 bytes', async () => {
       const works = Array.from({ length: 30 }, (_, n) => upstreamWork(n, 98));
       await useRealService(works);
 
-      const first = await runToolContract(searchEntitiesTool, {
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         filters: { 'title.search': 'collaboration' },
         per_page: 30,
         select: ['author_list'],
       });
-      const omitted = (first.structuredContent as Structured).omitted;
-      expect(omitted?.next.arguments).toMatchObject({ select: ['author_list'] });
 
-      const second = await runToolContract(
-        searchEntitiesTool,
-        omitted?.next.arguments as Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1],
-      );
-      const results = (second.structuredContent as Structured).results;
-      expect(results.length).toBeGreaterThan(0);
-      for (const record of results) {
+      expect(result.isError).toBeFalsy();
+      expect(contentTextBytes(result.content)).toBeGreaterThan(64_000);
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toHaveLength(30);
+      for (const record of structured.results) {
         expect(Object.keys(record)).toEqual(['id', 'display_name', 'author_list']);
         expect(record.author_list).toEqual(expectedList(98));
       }
+      expect(structured).not.toHaveProperty('omitted');
     });
 
     it('documents author_list on select, slice, and results', () => {
@@ -2861,34 +3323,21 @@ describe('searchEntitiesTool', () => {
       },
     );
 
-    it('rejects sample + page on both surfaces before the round trip', async () => {
-      // The resolved value is what makes `not.toHaveBeenCalled()` load-bearing: without it a
-      // forwarded call would still fail, just for a different reason.
-      mockSearch.mockResolvedValue(sampleResult);
-
+    it('names sample as the other page-walked search in the page_without_semantic recovery', async () => {
       const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
         query: 'groundwater',
-        search_mode: 'semantic',
-        sample: 5,
         page: 2,
       });
-
-      expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({
         error: {
-          code: JsonRpcErrorCode.ValidationError,
           data: {
-            reason: 'sample_with_page',
-            recovery: { hint: expect.stringContaining('remove `page`') },
+            reason: 'page_without_semantic',
+            recovery: { hint: expect.stringMatching(/`sample`.*`seed`/) },
           },
         },
       });
-      // Error text is escaped in content[]; read it back through a CommonMark parse.
-      const rendered = readMarkdown(renderedText(result.content));
-      expect(rendered).toContain('remove `page`');
-      expect(rendered).toContain('sample_with_page');
-      expect(mockSearch).not.toHaveBeenCalled();
+      expect(readMarkdown(renderedText(result.content))).toMatch(/`sample`.*`seed`/);
     });
 
     it('accepts page 1 and rejects page 0 at the schema layer', () => {
@@ -2966,6 +3415,83 @@ describe('searchEntitiesTool', () => {
       }
     });
 
+    /**
+     * Semantic pages carry no `next_cursor`, so the notice is the only continuation signal: it
+     * points at the next `page` only while `page × per_page < meta.count`. (gh #126)
+     */
+    describe('continuation pointer (gh #126)', () => {
+      const candidates = (n: number, count = 70, per_page = 50): SearchResult => ({
+        meta: { count, per_page, next_cursor: null },
+        results: Array.from({ length: n }, (_, i) => ({
+          id: `https://openalex.org/W${i + 1}`,
+          display_name: `Candidate ${i + 1}`,
+        })),
+      });
+      const call = (extra: Record<string, unknown>) =>
+        runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          query: 'groundwater',
+          search_mode: 'semantic',
+          select: ['id'],
+          ...extra,
+        });
+      /** Reader-visible text: code-span backticks dropped, as the CommonMark parse drops them. */
+      const surfaces = (result: Awaited<ReturnType<typeof runToolContract>>) => [
+        ((result.structuredContent as { notice?: string }).notice ?? '').replaceAll('`', ''),
+        readMarkdown(renderedText(result.content)),
+      ];
+
+      it.each([
+        ['an omitted page', {}],
+        ['page 1', { page: 1 }],
+      ])('points %s of 70 candidates at 50 per page to page 2', async (_label, extra) => {
+        mockSearch.mockResolvedValue(candidates(50));
+        const result = await call({ per_page: 50, ...extra });
+        expect((result.structuredContent as { notice?: string }).notice).toContain(
+          'Continue with `page: 2` for the rest of the candidates.',
+        );
+        for (const text of surfaces(result)) {
+          expect(text).toContain('Continue with page: 2 for the rest of the candidates.');
+        }
+      });
+
+      it.each([
+        ['a short last page', 50, 20],
+        ['a full last page', 35, 35],
+      ])('carries no pointer on %s', async (_label, per_page, n) => {
+        mockSearch.mockResolvedValue(candidates(n, 70, per_page));
+        for (const text of surfaces(await call({ per_page, page: 2 }))) {
+          expect(text).toContain('The candidate set ends on this page.');
+          expect(text).not.toMatch(/page: \d/);
+          expect(text).not.toContain('Reach the rest');
+        }
+      });
+
+      it('carries the exhausted advice alone on the page past the last', async () => {
+        mockSearch.mockResolvedValue(candidates(0));
+        const result = await call({ per_page: 50, page: 3 });
+        const [notice] = surfaces(result);
+        expect(notice).toMatch(/^Pagination exhausted for /);
+        for (const text of surfaces(result)) {
+          expect(text).toContain('Stop paging');
+          expect(text).not.toMatch(/candidate/i);
+          expect(text).not.toMatch(/page: \d/);
+        }
+      });
+
+      it.each([
+        ['every candidate', 40, 40],
+        ['no candidates', 0, 0],
+      ])('carries no pointer on a first page holding %s', async (_label, count, n) => {
+        mockSearch.mockResolvedValue(candidates(n, count));
+        for (const text of surfaces(await call({ per_page: 50 }))) {
+          expect(text).toContain(`meta.count (${count})`);
+          expect(text).not.toMatch(/page: \d/);
+          expect(text).not.toContain('Reach the rest');
+        }
+      });
+    });
+
     it('states no fixed semantic candidate ceiling on any definition surface', () => {
       const schemaText = JSON.stringify([
         z.toJSONSchema(searchEntitiesTool.input),
@@ -2978,7 +3504,9 @@ describe('searchEntitiesTool', () => {
       expect(schemaText).not.toMatch(/ceil\(50/);
       expect(schemaText).not.toMatch(/page 17 with per_page=3/);
       // The per-page bound is real and stays documented.
-      expect(searchEntitiesTool.input.shape.per_page.description ?? '').toMatch(/caps at 50/);
+      expect(searchEntitiesTool.input.shape.per_page.description ?? '').toMatch(
+        /at most 50 under search_mode "semantic"/,
+      );
     });
 
     it.each([
@@ -3166,10 +3694,83 @@ describe('searchEntitiesTool', () => {
       expect(notice).not.toContain('Pagination exhausted');
     });
 
+    it('names the exactly-full final page in the meta.next_cursor description (gh #126)', () => {
+      const description = searchEntitiesTool.output.shape.meta.shape.next_cursor.description ?? '';
+      expect(description).toMatch(/exactly fills `per_page`/);
+      expect(description).toMatch(/empty page/);
+    });
+
     it('describes meta.per_page as the requested page size, not the result count', () => {
       const description = searchEntitiesTool.output.shape.meta.shape.per_page.description ?? '';
       expect(description).toMatch(/request/i);
       expect(description).not.toBe('Results on this page.');
+    });
+  });
+
+  /**
+   * A notice is authored Markdown: the framework quotes it into `content[]` and escapes nothing,
+   * so the empty-page notices escape the echo they repeat. Both surfaces carry the same string,
+   * the caller's text reads back as sent; the `echo` field itself stays raw. (gh #127)
+   */
+  describe('caller text in notices (gh #127)', () => {
+    /** The trailer's `>` lines, and the string they quote with the markers stripped. */
+    const quotedNotice = (text: string) => {
+      const lines = text.split('\n').filter((line) => line.startsWith('>'));
+      return {
+        markdown: lines.join('\n'),
+        quoted: lines.map((line) => line.replace(/^> ?/, '')).join('\n'),
+      };
+    };
+    const query = 'zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>';
+    const filters = {
+      'title.search': '<i>a</i> *b* `c` ~d~',
+      doi: 'https://doi.org/10.1002/a_b*c~d',
+    };
+    const sort = '-cited_by_count `x` *y*';
+    const seed = '[s](https://evil.test) _t_';
+    const filtersEcho =
+      '{"title.search":"<i>a</i> *b* `c` ~d~","doi":"https://doi.org/10.1002/a_b*c~d"}';
+
+    it.each([
+      [
+        'an empty first page',
+        { query, filters, sort },
+        `No matches for entity_type=works | query="zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>" | filters=${filtersEcho} | sort="-cited_by_count \`x\` *y*". Try broadening the query, removing filters, or switching search_mode.`,
+      ],
+      [
+        'an exhausted cursor page',
+        { query, filters, sort, cursor: 'next-page' },
+        `Pagination exhausted for entity_type=works | query="zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>" | filters=${filtersEcho} | sort="-cited_by_count \`x\` *y*" — the previous page was the last, so this one came back empty. Stop paging rather than broadening the search.`,
+      ],
+      [
+        'an exhausted sample page',
+        { query, sample: 10, seed, page: 2 },
+        'Pagination exhausted for entity_type=works | query="zqxjkvwq [x](https://evil.test) _emph_ <b>tag</b>" | sample=10 | seed="[s](https://evil.test) _t_" — the previous page was the last, so this one came back empty. Stop paging rather than broadening the search.',
+      ],
+    ] as const)('reads the echo back as sent on %s', async (_label, extra, expected) => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 0, per_page: 10, next_cursor: null },
+        results: [],
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        select: ['id'],
+        ...extra,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { echo: string; notice?: string };
+      const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      const { markdown, quoted } = quotedNotice(text);
+      expect(quoted).toBe(structured.notice);
+      const markup = ['emphasis', 'strong', 'delete', 'html', 'inlineCode'];
+      expect(nodeTypes(markdown).filter((t) => markup.includes(t))).toEqual([]);
+      expect(nonAutolinks(markdown)).toEqual([]);
+      expect(readMarkdown(markdown)).toBe(expected);
+      // The echo field is data, raw on both surfaces: a code span in the trailer.
+      expect(expected).toContain(structured.echo);
+      expect(readMarkdown(text)).toContain(`Query: ${structured.echo}`);
     });
   });
 
@@ -3314,10 +3915,11 @@ describe('searchEntitiesTool', () => {
   });
 
   /**
-   * Characterization: responses that already fit the 64,000-byte budget must come back exactly
-   * as they did before the budget existed — same records, same text, no disclosure fields.
+   * Characterization: a page with nothing to disclose comes back as its records alone — same
+   * records, same text — and never carries the `omitted` or `over_budget` fields the removed
+   * response budget once added. (gh #72, #73, #131)
    */
-  describe('response budget — pages that fit stay unchanged (gh #72, #73)', () => {
+  describe('pages with nothing to disclose', () => {
     const DISCLOSURE_KEYS = ['omitted', 'windows', 'over_budget'];
 
     function expectNoDisclosure(structured: unknown) {
@@ -3346,8 +3948,6 @@ describe('searchEntitiesTool', () => {
         ...page.results.flatMap((record) => renderEntityRecord(record)),
       ].join('\n');
       expect(result.content[0]).toEqual({ type: 'text', text: expected });
-      expect(utf8Bytes(JSON.stringify(structured))).toBeLessThan(64_000);
-      expect(contentTextBytes(result.content)).toBeLessThan(64_000);
     });
 
     it('returns a list record with 99 authorships whole and unflagged', async () => {
@@ -3369,7 +3969,7 @@ describe('searchEntitiesTool', () => {
       expectNoDisclosure(structured);
     });
 
-    it('returns an id lookup whose array fits the budget whole', async () => {
+    it('returns an id lookup with a 50-element array whole', async () => {
       const record = workWithAuthorships(2, 50);
       mockSearch.mockResolvedValue({
         meta: { count: 1, per_page: 1, next_cursor: null },
@@ -3391,12 +3991,12 @@ describe('searchEntitiesTool', () => {
   });
 
   /**
-   * The budget itself (gh #72) and the 100-authorship cap disclosure (gh #73). Every size
-   * assertion reads the assembled `CallToolResult` from `runToolContract`, enrichment trailer
-   * included, and the service fake writes the `budget` enrichment the real service writes.
+   * Whole pages and arrays (gh #131), the 100-authorship cap disclosure (gh #73), and the
+   * count-based `slice`. The ceiling and the window mechanics are tabled once in
+   * `record-page.test.ts`; these prove the tool's wiring through `runToolContract`, with the
+   * service fake writing the `budget` enrichment the real service writes.
    */
-  describe('response budget (gh #72, #73)', () => {
-    const BUDGET = 64_000;
+  describe('record pages (gh #73, #131)', () => {
     /** A budget reading with long float tails, so the trailer is as wide as it realistically gets. */
     const SPEND = {
       costUsd: 0.30000000000000004,
@@ -3412,10 +4012,6 @@ describe('searchEntitiesTool', () => {
       meta: { count: number; per_page: number; next_cursor: string | null };
       results: EntityRecord[];
       notice?: string;
-      omitted?: {
-        ids: string[];
-        next: { tool: string; arguments: Record<string, unknown> };
-      };
       windows?: {
         id: string;
         field: string;
@@ -3425,15 +4021,15 @@ describe('searchEntitiesTool', () => {
         possibly_capped: boolean;
         next: { tool: string; arguments: Record<string, unknown> } | null;
       }[];
-      over_budget?: boolean;
     };
 
-    function expectWithinBudget(result: {
+    /** Both surfaces past the 64,000 bytes the removed budget held them to. */
+    function expectPast64k(result: {
       structuredContent?: unknown;
       content: { type: string; text?: string }[];
     }) {
-      expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(BUDGET);
-      expect(contentTextBytes(result.content)).toBeLessThanOrEqual(BUDGET);
+      expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeGreaterThan(64_000);
+      expect(contentTextBytes(result.content)).toBeGreaterThan(64_000);
     }
 
     /**
@@ -3475,7 +4071,7 @@ describe('searchEntitiesTool', () => {
       });
     }
 
-    it('windows an oversized id lookup to the budget on both surfaces (repro 1)', async () => {
+    it('returns all 2,932 authorships of an id lookup on both surfaces', async () => {
       const record = workWithAuthorships(1_858_542_512, 2932);
       serve([record]);
       const id = bare(record.id);
@@ -3487,35 +4083,17 @@ describe('searchEntitiesTool', () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expectWithinBudget(result);
+      expectPast64k(result);
       const structured = result.structuredContent as Structured;
-      const shown = structured.windows?.[0]?.shown ?? 0;
-      expect(shown).toBeGreaterThan(50);
-      expect(structured.windows).toEqual([
-        {
-          id,
-          field: 'authorships',
-          offset: 0,
-          shown,
-          total: 2932,
-          possibly_capped: false,
-          next: {
-            tool: 'openalex_search_entities',
-            arguments: { entity_type: 'works', id, slice: { field: 'authorships', offset: shown } },
-          },
-        },
-      ]);
-      expect(structured.results[0]?.authorships).toEqual(
-        (record.authorships as unknown[]).slice(0, shown),
-      );
-      expect(structured.notice).toMatch(/slice/);
+      expect(structured.results[0]?.authorships).toEqual(record.authorships);
+      expect(structured).not.toHaveProperty('windows');
+      expect(structured.notice).toBeUndefined();
       const text = textOf(result);
-      expect(text).toContain(`- [${shown - 1}] author_position`);
-      expect(text).not.toContain(`- [${shown}] author_position`);
-      expect(text).toContain(`"slice":{"field":"authorships","offset":${shown}}`);
+      expect(text).toContain('- [2931] author_position');
+      expect(text).not.toContain('windowed');
     });
 
-    it('cuts an overflowing list page to whole records and names every omitted ID', async () => {
+    it('returns every record of a page past 64,000 bytes and continues it by cursor', async () => {
       const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 8));
       serve(records);
 
@@ -3526,62 +4104,24 @@ describe('searchEntitiesTool', () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expectWithinBudget(result);
+      expectPast64k(result);
       const structured = result.structuredContent as Structured;
-      const kept = structured.results.length;
-      expect(kept).toBeGreaterThan(1);
-      expect(kept).toBeLessThan(25);
-      expect(structured.results).toEqual(records.slice(0, kept));
+      expect(structured.results).toEqual(records);
       expect(structured.meta).toEqual({ count: 25, per_page: 25, next_cursor: 'cursor-2' });
-      const omittedIds = records.slice(kept).map((r) => bare(r.id));
-      expect(structured.omitted).toEqual({
-        ids: omittedIds,
-        next: {
-          tool: 'openalex_search_entities',
-          arguments: {
-            entity_type: 'works',
-            filters: { openalex: omittedIds.join('|') },
-            per_page: omittedIds.length,
-            select: ['authorships'],
-          },
-        },
-      });
-      expect(structured.windows).toBeUndefined();
-      expect(structured.notice).toMatch(/64,000-byte/);
-      const text = textOf(result);
-      for (const omittedId of omittedIds) expect(text).toContain(omittedId);
-      expect(text).toContain(JSON.stringify(structured.omitted?.next.arguments));
+      expect(structured).not.toHaveProperty('omitted');
+      expect(structured).not.toHaveProperty('windows');
+      expect(structured.notice).toBeUndefined();
+      expect(textOf(result)).toContain('next cursor: `cursor-2`');
     });
 
-    it('walks every cut continuation to the full set with no gap or overlap', async () => {
-      // ~12 KB records: each call keeps about five, so the continuation is itself cut, twice over.
-      const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 20));
-      serve(records);
-
-      type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
-      const seen: string[] = [];
-      let args: SearchArgs | undefined = {
-        entity_type: 'works',
-        filters: { 'title.search': 'collaboration' },
-        select: ['authorships'],
-      };
-      let calls = 0;
-      while (args && calls < 25) {
-        const result = await runToolContract(searchEntitiesTool, args);
-        calls++;
-        expect(result.isError).toBeFalsy();
-        expectWithinBudget(result);
-        const structured = result.structuredContent as Structured;
-        seen.push(...structured.results.map((r) => bare(r.id)));
-        args = structured.omitted?.next.arguments as SearchArgs | undefined;
-      }
-
-      expect(calls).toBeGreaterThan(2);
-      expect(seen).toHaveLength(25);
-      expect(new Set(seen)).toEqual(new Set(records.map((r) => bare(r.id))));
+    it('declares response_too_large as a handler-local ValidationError', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'response_too_large');
+      expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(entry).not.toHaveProperty('thrownBy');
+      expect(entry?.when).toContain('8,000,000 bytes');
     });
 
-    it('windows an oversized first list record and omits the rest', async () => {
+    it('returns a 2,932-author first list record whole beside the rest', async () => {
       const records = [
         workWithAuthorships(1, 2932),
         workWithAuthorships(2, 3),
@@ -3595,59 +4135,16 @@ describe('searchEntitiesTool', () => {
         select: ['authorships'],
       });
 
-      expectWithinBudget(result);
-      const structured = result.structuredContent as Structured;
-      expect(structured.results).toHaveLength(1);
-      const window = structured.windows?.[0];
-      expect(window).toMatchObject({
-        id: bare(records[0]!.id),
-        field: 'authorships',
-        offset: 0,
-        total: 2932,
-        possibly_capped: false,
-      });
-      expect(window?.next?.arguments).toEqual({
-        entity_type: 'works',
-        id: bare(records[0]!.id),
-        slice: { field: 'authorships', offset: window?.shown },
-      });
-      expect(structured.omitted?.ids).toEqual([bare(records[1]!.id), bare(records[2]!.id)]);
-    });
-
-    it('returns a record whose non-array fields alone overflow with every array emptied, flagged', async () => {
-      const record: EntityRecord = {
-        id: 'https://openalex.org/W77',
-        display_name: 'An abstract longer than the budget',
-        abstract: 'lorem ipsum '.repeat(6000),
-        authorships: authorships(3),
-        referenced_works: ['https://openalex.org/W1', 'https://openalex.org/W2'],
-      };
-      serve([record]);
-
-      const result = await runToolContract(searchEntitiesTool, {
-        entity_type: 'works',
-        id: 'W77',
-        select: ['*'],
-      });
-
       expect(result.isError).toBeFalsy();
       const structured = result.structuredContent as Structured;
-      expect(structured.over_budget).toBe(true);
-      expect(structured.results[0]?.abstract).toBe(record.abstract);
-      expect(structured.results[0]?.authorships).toEqual([]);
-      expect(structured.windows?.map((w) => [w.field, w.shown, w.total])).toEqual(
-        expect.arrayContaining([
-          ['authorships', 0, 3],
-          ['referenced_works', 0, 2],
-        ]),
-      );
-      expect(textOf(result)).toMatch(/over budget/i);
+      expect(structured.results).toEqual(records);
+      expect(structured).not.toHaveProperty('windows');
     });
 
-    it('marks each emptied array on an over-budget record as windowed, never (empty)', async () => {
+    it('returns a record with a 72,000-byte abstract and every array whole, on both surfaces', async () => {
       const record: EntityRecord = {
         id: 'https://openalex.org/W77',
-        display_name: 'An abstract longer than the budget',
+        display_name: 'A long abstract',
         abstract: 'lorem ipsum '.repeat(6000),
         authorships: authorships(3),
         referenced_works: ['https://openalex.org/W1', 'https://openalex.org/W2'],
@@ -3661,21 +4158,22 @@ describe('searchEntitiesTool', () => {
         select: ['*'],
       });
 
+      expect(result.isError).toBeFalsy();
+      expectPast64k(result);
       const structured = result.structuredContent as Structured;
-      expect(structured.over_budget).toBe(true);
-      expect(structured.results[0]?.topics).toEqual([]);
+      expect(structured.results).toEqual([record]);
+      expect(structured).not.toHaveProperty('over_budget');
+      expect(structured).not.toHaveProperty('windows');
       const text = textOf(result);
-      expect(text).toContain('**Authorships:** (0 of 3 shown — windowed; see Window)');
-      expect(text).toContain('**Referenced Works:** (0 of 2 shown — windowed; see Window)');
-      expect(text).not.toContain('**Authorships:** (empty)');
-      expect(text).not.toContain('**Referenced Works:** (empty)');
-      // `topics` came back empty from OpenAlex, not from the budget.
+      expect(text).toContain('- [2] author_position: middle');
+      expect(text).toContain(
+        '**Referenced Works:** https://openalex.org/W1, https://openalex.org/W2',
+      );
       expect(text).toContain('**Topics:** (empty)');
+      expect(text).not.toMatch(/over budget|windowed/i);
     });
 
-    it('shows elements of every windowed array of a list record, on both surfaces', async () => {
-      // ~900-byte elements: 100 authorships (a capped list record) and 82 locations, each too
-      // large to sit beside the other emptied, so both are windowed.
+    it('returns a capped list record with long arrays whole, windowing only the cap', async () => {
       const big = (i: number) => ({
         ...authorship(i),
         raw_affiliation_strings: ['Laboratory for Particle Physics, CERN, Geneva '.repeat(6)],
@@ -3684,7 +4182,8 @@ describe('searchEntitiesTool', () => {
         ...workWithAuthorships(1, 100, big),
         locations: Array.from({ length: 82 }, (_, i) => big(1_000 + i)),
       };
-      serve([first, workWithAuthorships(2, 3), workWithAuthorships(3, 3)]);
+      const records = [first, workWithAuthorships(2, 3), workWithAuthorships(3, 3)];
+      serve(records);
 
       const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'works',
@@ -3694,27 +4193,19 @@ describe('searchEntitiesTool', () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expectWithinBudget(result);
+      expectPast64k(result);
       const structured = result.structuredContent as Structured;
-      expect(structured.results).toHaveLength(1);
-      const byField = new Map(structured.windows?.map((w) => [w.field, w]));
-      const auth = byField.get('authorships');
-      const locs = byField.get('locations');
-      expect(auth).toMatchObject({ total: 100, possibly_capped: true });
-      expect(locs).toMatchObject({ total: 82, possibly_capped: false });
-      expect(auth?.shown).toBeGreaterThan(0);
-      expect(locs?.shown).toBeGreaterThan(0);
-      expect(structured.results[0]?.authorships).toHaveLength(auth?.shown ?? -1);
-      expect(structured.results[0]?.locations).toHaveLength(locs?.shown ?? -1);
+      expect(structured.results).toEqual(records);
+      expect(structured.windows).toEqual([
+        expect.objectContaining({ field: 'authorships', shown: 100, total: 100 }),
+      ]);
       const text = textOf(result);
-      expect(text).toContain(
-        `**Authorships:** (${auth?.shown} of 100 shown — windowed; see Window)`,
-      );
-      expect(text).toContain(`**Locations:** (${locs?.shown} of 82 shown — windowed; see Window)`);
-      expect(text).toContain(`- [${(auth?.shown ?? 0) - 1}] author_position`);
+      expect(text).toContain('- [99] author_position');
+      expect(text).toContain('- [81] author_position');
+      expect(text).not.toContain('windowed');
     });
 
-    it('returns an omitted keywords page through the `id` filter continuation', async () => {
+    it('returns a keywords page past 64,000 bytes whole', async () => {
       const keywords: EntityRecord[] = Array.from({ length: 10 }, (_, n) => ({
         id: `https://openalex.org/keywords/keyword-${n}`,
         display_name: `Keyword ${n}`,
@@ -3722,35 +4213,20 @@ describe('searchEntitiesTool', () => {
       }));
       serve(keywords, null);
 
-      type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
-      const seen: string[] = [];
-      let args: SearchArgs | undefined = {
+      const result = await runToolContract(searchEntitiesTool, {
         entity_type: 'keywords',
         query: 'keyword',
         per_page: 10,
-      };
-      let calls = 0;
-      while (args && calls < 10) {
-        const result = await runToolContract(searchEntitiesTool, args);
-        calls++;
-        expect(result.isError).toBeFalsy();
-        expectWithinBudget(result);
-        const structured = result.structuredContent as Structured;
-        seen.push(...structured.results.map((r) => r.id));
-        const next = structured.omitted?.next;
-        if (next) {
-          expect(next.arguments.filters).toEqual({ id: structured.omitted?.ids.join('|') });
-          expect(textOf(result)).toContain(JSON.stringify(next.arguments));
-        }
-        args = next?.arguments as SearchArgs | undefined;
-      }
+      });
 
-      expect(calls).toBeGreaterThan(1);
-      expect(seen).toHaveLength(keywords.length);
-      expect(new Set(seen)).toEqual(new Set(keywords.map((k) => k.id)));
+      expect(result.isError).toBeFalsy();
+      expectPast64k(result);
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toEqual(keywords);
+      expect(structured).not.toHaveProperty('omitted');
     });
 
-    it('keeps a sparse record — null title, no arrays — within the budget and undisclosed', async () => {
+    it('keeps a sparse record — null title, no arrays — undisclosed', async () => {
       const records: EntityRecord[] = [{ id: 'https://openalex.org/W5', display_name: null }];
       serve(records, null);
 
@@ -3777,7 +4253,6 @@ describe('searchEntitiesTool', () => {
           select: ['authorships'],
         });
 
-        expectWithinBudget(result);
         const structured = result.structuredContent as Structured;
         expect(structured.results).toEqual([capped, complete]);
         expect(structured.windows).toEqual([
@@ -3821,72 +4296,70 @@ describe('searchEntitiesTool', () => {
         expect(structured).not.toHaveProperty('windows');
         expect(structured.notice).toBeUndefined();
       });
-
-      it('points a windowed capped record at the same id + slice continuation', async () => {
-        // ~900-byte authorships, so 100 of them overflow the budget on their own.
-        const record = workWithAuthorships(1, 100, (i) => ({
-          ...authorship(i),
-          raw_affiliation_strings: ['Laboratory for Particle Physics, CERN, Geneva '.repeat(6)],
-        }));
-        serve([record]);
-
-        const result = await runToolContract(searchEntitiesTool, {
-          entity_type: 'works',
-          filters: { openalex: bare(record.id) },
-          select: ['authorships'],
-        });
-
-        expectWithinBudget(result);
-        const structured = result.structuredContent as Structured;
-        expect(structured.windows).toHaveLength(1);
-        const window = structured.windows![0]!;
-        expect(window).toMatchObject({ field: 'authorships', total: 100, possibly_capped: true });
-        expect(window.shown).toBeLessThan(100);
-        expect(window.next?.arguments).toEqual({
-          entity_type: 'works',
-          id: bare(record.id),
-          slice: { field: 'authorships', offset: window.shown },
-        });
-      });
     });
 
     describe('slice', () => {
       const record = workWithAuthorships(1_858_542_512, 2932);
       const id = bare(record.id);
 
-      it('walks all 2,932 authorships in windows with no gap or overlap', {
-        timeout: 30_000,
-      }, async () => {
+      it('returns 50 elements by default, continuing with the same limit', async () => {
         serve([record]);
-        const collected: unknown[] = [];
-        let offset: number | undefined = 0;
-        let calls = 0;
-        while (offset !== undefined && calls < 100) {
-          const result = await runToolContract(searchEntitiesTool, {
-            entity_type: 'works',
-            id,
-            slice: { field: 'authorships', offset },
-          });
-          calls++;
-          expect(result.isError).toBeFalsy();
-          expectWithinBudget(result);
-          const structured = result.structuredContent as Structured;
-          const window = structured.windows?.[0];
-          expect(window).toMatchObject({ id, field: 'authorships', offset, total: 2932 });
-          const items = structured.results[0]?.authorships as unknown[];
-          expect(items).toHaveLength(window?.shown ?? -1);
-          expect(textOf(result)).toContain(`- [${offset}] author_position`);
-          collected.push(...items);
-          const next = window?.next?.arguments.slice as { offset: number } | undefined;
-          if (next) expect(next.offset).toBe(offset + items.length);
-          offset = next?.offset;
-        }
-        expect(calls).toBeGreaterThan(20);
-        expect(collected).toEqual(record.authorships);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authorships', offset: 100 },
+        });
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.authorships).toEqual(
+          (record.authorships as unknown[]).slice(100, 150),
+        );
+        expect(structured.windows?.[0]).toMatchObject({
+          offset: 100,
+          shown: 50,
+          next: { arguments: { slice: { field: 'authorships', offset: 150, limit: 50 } } },
+        });
+        const text = textOf(result);
+        expect(text).toContain('- [149] author_position');
+        expect(text).toContain('"slice":{"field":"authorships","offset":150,"limit":50}');
         expect(mockSearch).toHaveBeenCalledWith(
           expect.objectContaining({ id, select: ['authorships'] }),
           expect.anything(),
         );
+      });
+
+      it('clamps slice.limit 6000 to 5,000 with a notice on both surfaces', async () => {
+        const long = workWithAuthorships(2, 5000, slimAuthorship);
+        serve([long]);
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: bare(long.id),
+          slice: { field: 'authorships', offset: 0, limit: 6000 },
+        });
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured.results[0]?.authorships).toHaveLength(5000);
+        expect(structured.windows?.[0]).toMatchObject({ shown: 5000, total: 5000, next: null });
+        const notice = 'slice.limit 6000 exceeds the maximum of 5000; using slice.limit 5000.';
+        expect(structured.notice).toContain(notice);
+        expect(textOf(result)).toContain(notice);
+        expect(clampMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+          'mcp.tool.name': 'openalex_search_entities',
+          'openalex.count_input.name': 'slice.limit',
+          'openalex.count_input.maximum': 5000,
+        });
+      });
+
+      it.each([0, -1, 1.5])('rejects slice.limit %s at the schema layer', async (limit) => {
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id,
+          slice: { field: 'authorships', offset: 0, limit },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams },
+        });
       });
 
       it('returns only id, display_name, and the sliced field', async () => {
@@ -3993,30 +4466,28 @@ describe('searchEntitiesTool', () => {
         expect(mockSearch).not.toHaveBeenCalled();
       });
 
-      it('flags a window whose one element alone exceeds the budget, on both surfaces', async () => {
+      it('returns 70,000-byte elements whole, as many as the limit asks', async () => {
         const huge = { note: 'x'.repeat(70_000) };
         const oversized: EntityRecord = {
           id: 'https://openalex.org/W6',
           display_name: 'Huge elements',
-          authorships: [huge, huge],
+          authorships: [huge, huge, huge],
         };
         serve([oversized]);
 
         const result = await runToolContract(searchEntitiesTool, {
           entity_type: 'works',
           id: 'W6',
-          slice: { field: 'authorships', offset: 0 },
+          slice: { field: 'authorships', offset: 0, limit: 2 },
         });
 
         expect(result.isError).toBeFalsy();
         const structured = result.structuredContent as Structured;
-        expect(structured.over_budget).toBe(true);
-        expect(structured.results[0]?.authorships).toEqual([huge]);
-        expect(structured.windows?.[0]).toMatchObject({ offset: 0, shown: 1, total: 2 });
-        expect(structured.notice).toMatch(/alone exceeds the 64,000-byte response budget/);
-        const text = textOf(result);
-        expect(text).toMatch(/\*\*Over budget:\*\*/);
-        expect(text).toContain('"slice":{"field":"authorships","offset":1}');
+        expect(structured).not.toHaveProperty('over_budget');
+        expect(structured.results[0]?.authorships).toEqual([huge, huge]);
+        expect(structured.windows?.[0]).toMatchObject({ offset: 0, shown: 2, total: 3 });
+        expect(structured.notice).toBeUndefined();
+        expect(textOf(result)).toContain('"slice":{"field":"authorships","offset":2,"limit":2}');
       });
 
       it('rejects a negative offset at the schema layer', async () => {

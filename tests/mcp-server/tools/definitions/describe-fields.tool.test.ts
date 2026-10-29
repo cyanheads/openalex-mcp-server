@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/describe-fields.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The tool reads the real catalog through the service's getFieldCatalog(), which needs no
@@ -191,6 +191,25 @@ describe('describeFieldsTool', () => {
       }
     });
 
+    it('lists the awards group_by view on both surfaces, without the fields OpenAlex refuses (gh #125)', async () => {
+      const result = await runToolContract(describeFieldsTool, {
+        entity_type: 'awards',
+        context: 'group_by',
+      });
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { fields: string[]; total: number };
+      const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      expect(text).toContain(`**awards** / **group_by** — ${structured.total} valid fields`);
+      for (const field of ['start_year', 'funder.id', 'research_scope.is_research']) {
+        expect(structured.fields).toContain(field);
+        expect(text).toContain(`- ${field}\n`);
+      }
+      for (const field of ['amount_usd', 'funder.country_code', 'lead_investigator.family_name']) {
+        expect(structured.fields).not.toContain(field);
+        expect(text).not.toMatch(new RegExp(`^- ${field.replaceAll('.', '\\.')}$`, 'm'));
+      }
+    });
+
     it('keeps is_preprint_repository out of group_by, where upstream 500s on it (gh #56)', async () => {
       // Valid as a filter and a select field, but grouping by it answers HTTP 500 — which
       // classifies as ServiceUnavailable and tells the caller to retry, forever.
@@ -248,12 +267,32 @@ describe('describeFieldsTool', () => {
         'is_in_jstage_since_year',
         'last_publication_year',
         'oa_flip_year',
+        // "Cannot group by is_in_jstage: OpenAlex doesn't record which sources are in J-STAGE." (gh #125)
+        'is_in_jstage',
       ],
-      institutions: ['display_name'],
+      institutions: [
+        'display_name',
+        // count fields the 2026-10-28 regeneration added: "Cannot group by date, number, or search fields."
+        'works_count_with_children',
+        'works_count_with_children_and_predecessors',
+      ],
       topics: ['display_name'],
       keywords: ['display_name'],
       publishers: ['display_name'],
       funders: ['display_name'],
+      // the 2026-10-28 sweep of every non-search awards filter field (gh #125)
+      awards: [
+        'amount',
+        'amount_usd',
+        'doi',
+        'funded_outputs_count',
+        'sub_awards_count',
+        'funder.country_code',
+        // HTTP 500 on every probe
+        'lead_investigator.affiliation.name',
+        'lead_investigator.family_name',
+        'lead_investigator.given_name',
+      ],
     };
 
     /** Fields the same sweep grouped successfully, including the near neighbours of rejects. */
@@ -281,21 +320,39 @@ describe('describeFieldsTool', () => {
       keywords: ['id', 'cited_by_count'],
       publishers: ['ids.ror', 'country_codes'],
       funders: ['awards_count', 'ror'],
+      awards: [
+        'start_year',
+        'end_year',
+        'funder.id',
+        'funder_scheme',
+        'funding_type',
+        'currency',
+        'institution_awarded.id',
+        'lead_investigator.orcid',
+        'lead_investigator.affiliation.country',
+        'has_parent_award',
+        'has_recipient_country',
+        'research_scope.is_research',
+        'funded_outputs',
+        'id',
+      ],
     };
 
     /**
      * group_by view size per entity type after the sweep and the 2026-10-18 regeneration (gh #104)
-     * — every other listed field grouped.
+     * — every other listed field grouped. Sources lost `is_in_jstage` and awards joined at the
+     * 2026-10-28 regeneration (gh #125): 60 awards filters less 4 text searches and 9 refusals.
      */
     const GROUP_BY_TOTALS: Record<string, number> = {
       works: 165,
       authors: 36,
-      sources: 36,
+      sources: 35,
       institutions: 33,
       topics: 9,
       keywords: 6,
       publishers: 19,
       funders: 20,
+      awards: 47,
     };
 
     it.each(Object.entries(SWEEP_REJECTS))(

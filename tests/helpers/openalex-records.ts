@@ -1,8 +1,8 @@
 /**
- * @fileoverview Synthetic OpenAlex records sized like the real ones, for the response-budget
- * tests. An authorship here serializes to roughly 600 bytes, near the ~737 bytes a real CERN
- * collaboration authorship carries, so a few hundred of them reproduce an oversized record
- * without shipping a multi-megabyte fixture.
+ * @fileoverview Synthetic OpenAlex records sized like the real ones, for the record-page tests.
+ * An authorship here serializes to roughly 600 bytes, near the ~737 bytes a real CERN
+ * collaboration authorship carries, so a few thousand of them reproduce a large collaboration
+ * record without shipping a multi-megabyte fixture.
  * @module tests/helpers/openalex-records
  */
 

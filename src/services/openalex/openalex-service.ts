@@ -35,6 +35,8 @@ import { normalizeProviderText, normalizeProviderValue } from './provider-text.j
 import {
   type AnalyzeParams,
   type AnalyzeResult,
+  AUTOCOMPLETE_ENTITY_TYPES,
+  type AutocompleteEntityType,
   type AutocompleteParams,
   type AutocompleteRecord,
   type AutocompleteResult,
@@ -49,27 +51,33 @@ import {
 import { redactUrlsInMessage } from './url-redaction.js';
 
 /**
- * OpenAlex group_by fields that produce only true/false groups and reject
- * cursor pagination (HTTP 400). These fields never have more than two groups,
- * so cursor-based paging is unnecessary and the upstream rejects `cursor=*`.
+ * True/false group_by fields whose names carry no `is_`/`has_` segment. OpenAlex names every
+ * other boolean field that way, on every entity type.
  */
-const BOOLEAN_GROUP_BY_FIELDS = new Set([
-  'is_retracted',
-  'is_paratext',
-  'is_oa',
-  'has_orcid',
-  'has_doi',
-  'has_raw_affiliation_string',
-  'open_access.is_oa',
-  'apc_paid',
-  'has_fulltext',
+const UNPREFIXED_BOOLEAN_GROUP_BY_FIELDS: ReadonlySet<string> = new Set([
+  'mag_only',
+  'open_access.any_repository_has_fulltext',
 ]);
 
-/** Whether this aggregation keeps count order, ignoring the native unknown-bucket suffix. */
+/**
+ * Whether this aggregation keeps count order, ignoring the native unknown-bucket suffix: a
+ * true/false field, which never has more than two groups and whose `cursor=*` OpenAlex answers
+ * with HTTP 400 ("Cannot use cursor pagination when grouping fields that return true or false.").
+ *
+ * A field is boolean when any dotted segment starts with `is_` or `has_` — the segment, not the
+ * leaf, so `has_content.pdf` counts — or when it is one of the unprefixed fields above. That
+ * covered every groupable boolean on every entity type in a live sweep (2026-10-28), and no
+ * groupable field it matches is anything but true/false. The service (whether to send `cursor`)
+ * and `openalex_analyze_trends` (the echoed order and the key-order notice) both read this one
+ * predicate, so they cannot disagree about a field.
+ */
 export function isBooleanGroupBy(groupBy: string): boolean {
   const suffix = ':include_unknown';
   const baseField = groupBy.endsWith(suffix) ? groupBy.slice(0, -suffix.length) : groupBy;
-  return BOOLEAN_GROUP_BY_FIELDS.has(baseField);
+  return (
+    UNPREFIXED_BOOLEAN_GROUP_BY_FIELDS.has(baseField) ||
+    baseField.split('.').some((segment) => segment.startsWith('is_') || segment.startsWith('has_'))
+  );
 }
 
 /** One upstream filter clause: the canonical key and the value it constrains. */
@@ -353,6 +361,7 @@ export function normalizeId(id: string): string {
 const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
   A: 'authors',
   F: 'funders',
+  G: 'awards',
   I: 'institutions',
   P: 'publishers',
   S: 'sources',
@@ -361,22 +370,22 @@ const ENTITY_TYPE_BY_ID_LETTER: Record<string, EntityType> = {
 };
 
 /**
- * Native OpenAlex IDs this server can route. Three letters `OPENALEX_ID_VALUE_PATTERN` accepts
- * as *filter values* are deliberately absent here. `C` (the deprecated Concepts entity) and `G`
- * are not in `ENTITY_TYPES`, so there is no endpoint to fetch one from. `K` is in `ENTITY_TYPES`,
- * but OpenAlex identifies keywords by slug and emits no numeric K-prefixed IDs, so routing that
- * shape addressed nothing — a keyword URL is the keyword identifier. All three fall through to
- * autocomplete rather than being routed to a path that would 404.
+ * Native OpenAlex IDs this server can route. Two letters `OPENALEX_ID_VALUE_PATTERN` accepts as
+ * *filter values* are deliberately absent here. `C` (the deprecated Concepts entity) is not in
+ * `ENTITY_TYPES`, so there is no endpoint to fetch one from. `K` is in `ENTITY_TYPES`, but
+ * OpenAlex identifies keywords by slug and emits no numeric K-prefixed IDs, so routing that shape
+ * addressed nothing — a keyword URL is the keyword identifier. Both fall through to autocomplete
+ * rather than being routed to a path that would 404.
  */
-const ROUTABLE_OPENALEX_ID = /^([AFIPSTW])\d+$/;
+const ROUTABLE_OPENALEX_ID = /^([AFGIPSTW])\d+$/;
 
 /**
  * A native ID whose letter names the entity type that holds it — every routable letter plus `C`,
  * a concept ID, which names a type this server does not serve. Read case-insensitively: OpenAlex
  * answers a lower-case ID as it does the upper-case one. `V` (a legacy venue ID that still
- * resolves under `/sources/`), `K`, and `G` are absent, so `search()` checks none of them.
+ * resolves under `/sources/`) and `K` are absent, so `search()` checks neither.
  */
-const LETTERED_OPENALEX_ID = /^([ACFIPSTW])\d+$/i;
+const LETTERED_OPENALEX_ID = /^([ACFGIPSTW])\d+$/i;
 
 /**
  * Refuse a native ID whose letter names a different entity type than the lookup's. No record of
@@ -490,7 +499,7 @@ export interface IdentifierResolution extends AutocompleteResult {
  */
 export function inferIdentifier(
   query: string,
-  requested?: EntityType,
+  requested?: AutocompleteEntityType,
 ): ResolvedIdentifier | undefined {
   const trimmed = query.trim();
   const fromUrl = parseOpenAlexUrl(trimmed);
@@ -884,21 +893,41 @@ function resolveSelect(
  */
 const OPENALEX_ID_VALUE_PATTERN = /^[WAISTKPFCG]\d+$/i;
 
+/** One `id` filter segment as the bare ID it names, or the segment itself when it is no URL. */
+function filterSegmentId(segment: string): string {
+  const trimmed = segment.trim();
+  const fromUrl = parseOpenAlexUrl(trimmed);
+  return fromUrl?.kind === 'native' ? fromUrl.id : trimmed;
+}
+
 /**
  * Detect a value the `id:` filter would carry — OpenAlex IDs, bare or in any URL spelling
  * `parseOpenAlexUrl()` reads, optionally pipe-joined for OR semantics. When matched, `id` is
  * rewritten to `openalex` (the canonical filter key) and the value is forwarded as written:
- * upstream accepts every one of those spellings, and the space around a `|`. Stricter than any
- * value so a future generic upstream `id:` filter wouldn't be shadowed — only values that read
- * as OpenAlex IDs get redirected. Exported for the timing suite, which runs it on caller-sized
- * values.
+ * upstream accepts every one of those spellings, and the space around a `|`. Awards are the
+ * exception (see `awardIdFilterValue`). Stricter than any value so a future generic upstream
+ * `id:` filter wouldn't be shadowed — only values that read as OpenAlex IDs get redirected.
+ * Exported for the timing suite, which runs it on caller-sized values.
  */
 export function isOpenAlexFilterValue(value: string): boolean {
-  return value.split('|').every((segment) => {
-    const trimmed = segment.trim();
-    const fromUrl = parseOpenAlexUrl(trimmed);
-    return OPENALEX_ID_VALUE_PATTERN.test(fromUrl?.kind === 'native' ? fromUrl.id : trimmed);
-  });
+  return value
+    .split('|')
+    .every((segment) => OPENALEX_ID_VALUE_PATTERN.test(filterSegmentId(segment)));
+}
+
+/**
+ * An `id` filter value for awards, which have no `openalex` filter (a 400) and whose `id` filter
+ * matches only the `https://openalex.org/G…` URL — a bare `G…`, in either case, matches nothing
+ * with no error. Each OR segment is rewritten to that URL, its letter upper-cased.
+ */
+function awardIdFilterValue(value: string): string {
+  return value
+    .split('|')
+    .map((segment) => {
+      const id = filterSegmentId(segment);
+      return `https://openalex.org/${id.charAt(0).toUpperCase()}${id.slice(1)}`;
+    })
+    .join('|');
 }
 
 /**
@@ -916,8 +945,9 @@ export function translateFilterKey(entityType: SearchParams['entityType'], key: 
 
 /**
  * Rewrite caller-supplied filter keys to the upstream OpenAlex names. Works-only key map plus
- * a universal `id` → `openalex` rewrite when the value looks like an OpenAlex ID. Values pass
- * through unchanged.
+ * an `id` → `openalex` rewrite when the value looks like an OpenAlex ID, on every type but
+ * awards, whose ID values stay under `id` in the URL form it matches (`awardIdFilterValue`).
+ * Every other value passes through unchanged.
  *
  * Emits clauses rather than a record because an alias and its canonical name are two separate
  * constraints that resolve to one key — `{year: "2020", publication_year: "2024"}` is a request
@@ -931,9 +961,11 @@ function translateFilters(
   filters: Record<string, string>,
 ): FilterClause[] {
   const out: FilterClause[] = [];
-  for (const [rawKey, value] of Object.entries(filters)) {
+  for (const [rawKey, rawValue] of Object.entries(filters)) {
     const aliased = translateFilterKey(entityType, rawKey);
-    const finalKey = aliased === 'id' && isOpenAlexFilterValue(value) ? 'openalex' : aliased;
+    const openAlexIds = aliased === 'id' && isOpenAlexFilterValue(rawValue);
+    const finalKey = openAlexIds && entityType !== 'awards' ? 'openalex' : aliased;
+    const value = openAlexIds && entityType === 'awards' ? awardIdFilterValue(rawValue) : rawValue;
     if (out.some(([key, existing]) => key === finalKey && existing === value)) continue;
     out.push([finalKey, value]);
   }
@@ -968,7 +1000,9 @@ const REQUEST_TIMEOUT_MS = 10_000;
  * the name search reports a timeout without being sent.
  */
 const NAME_FALLBACK_DEADLINE_MS = 45_000;
-const KNOWN_AUTOCOMPLETE_TYPES = new Set(ENTITY_TYPES.map((type) => type.replace(/s$/, '')));
+const KNOWN_AUTOCOMPLETE_TYPES = new Set(
+  AUTOCOMPLETE_ENTITY_TYPES.map((type) => type.replace(/s$/, '')),
+);
 
 type ErrorFactory = (
   message: string,
@@ -1748,27 +1782,23 @@ class OpenAlexService {
       queryParams.select = select.join(',');
     }
 
-    // Sampling overrides per_page — upstream truncates results at per_page even when
-    // sample is larger, which silently drops samples the caller asked for. Aligning the
-    // two means callers get exactly `sample` results in a single page.
+    // `per_page` sizes every page, a sample's included: OpenAlex draws `sample` records and
+    // serves them `per_page` at a time, so a draw larger than one page is walked with `page`.
+    queryParams.per_page = String(params.perPage ?? 25);
     if (params.sample !== undefined) {
       queryParams.sample = String(params.sample);
-      queryParams.per_page = String(params.sample);
       if (params.seed !== undefined) queryParams.seed = params.seed;
-    } else {
-      queryParams.per_page = String(params.perPage ?? 25);
     }
 
-    // Semantic search doesn't support cursor pagination — OpenAlex answers `search.semantic`
-    // plus a cursor with a 400 — so it walks its candidate set with `page`/`per_page` instead.
-    // Sampling returns one page only, so cursor is mutually exclusive there too. Both
-    // combinations are rejected at the tool layer; the service never sends them together.
-    // The tool also rejects `sample` under semantic mode (OpenAlex ignores it there, and the
-    // population request below would pair `search.semantic` with `cursor=*`) and `sample`
-    // beside `sort` (OpenAlex refuses the pair), so neither reaches this method.
-    if (params.searchMode === 'semantic') {
+    // Semantic search and samples walk with `page` — OpenAlex answers `search.semantic` plus a
+    // cursor with a 400, and pages a seeded draw by number. Every other listing walks by cursor.
+    // The tool rejects `cursor` on either, `sample` under semantic mode (OpenAlex ignores it
+    // there, and the population request below would pair `search.semantic` with `cursor=*`),
+    // `sample` beside `sort` (OpenAlex refuses the pair), and `page` on an unseeded sample or
+    // past the first 10,000 records of one (both 400s upstream), so none reaches this method.
+    if (params.searchMode === 'semantic' || params.sample !== undefined) {
       if (params.page !== undefined) queryParams.page = String(params.page);
-    } else if (params.sample === undefined) {
+    } else {
       queryParams.cursor = params.cursor ?? '*';
     }
 
@@ -1777,13 +1807,13 @@ class OpenAlexService {
       results: EntityRecord[];
     }>;
 
-    // Sampling: OpenAlex returns the sample size in `meta.count`, not the population
-    // matching the filters. The output schema documents `count` as "Total results
-    // matching the query/filters" — issue a parallel per_page=1 lookup without
-    // `sample` to recover the true population and overwrite `count` with it.
+    // Sampling: OpenAlex returns the drawn size, min(sample, population), in `meta.count`, not
+    // the population matching the filters. The output schema documents `count` as "Total
+    // results matching the query/filters" — issue a parallel per_page=1 lookup without the
+    // sample's own parameters to recover the true population and overwrite `count` with it.
     let populationRequest: Promise<{ meta: { count: number } }> | undefined;
     if (params.sample !== undefined) {
-      const { sample: _sample, seed: _seed, ...filterParams } = queryParams;
+      const { sample: _sample, seed: _seed, page: _page, ...filterParams } = queryParams;
       populationRequest = this.request(
         `/${params.entityType}`,
         { ...filterParams, per_page: '1', cursor: '*' },
@@ -1855,8 +1885,8 @@ class OpenAlexService {
       queryParams.per_page = String(params.perPage);
     }
 
-    // Boolean group_by fields (is_retracted, has_orcid, etc.) only produce
-    // two groups (true/false) and reject cursor pagination with a 400.
+    // Boolean group_by fields (see `isBooleanGroupBy`) only produce two groups (true/false) and
+    // reject cursor pagination with a 400, so they keep count order even under order "key".
     //
     // For all other fields, cursor behaviour follows the sort order:
     //   - count-desc (default): omit cursor on the first page so OpenAlex returns groups

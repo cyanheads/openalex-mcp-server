@@ -48,4 +48,20 @@ describe('researchLandscapePrompt', () => {
     expect(funding).not.toMatch(/awards\.funder_id|awards\.funder_display_name/);
     expect(funding).not.toContain('openalex_resolve_name');
   });
+
+  /**
+   * Few awards carry a primary topic, so an awards search filtered by `primary_topic.id`
+   * undercounts the topic's grants. The step reaches grants from the works side, grouping the
+   * topic's works by `awards.id`, then opens the top `G…` IDs on the awards entity for amounts,
+   * dates, and investigators. (gh #125)
+   */
+  it('reaches grants by grouping the topic works by awards.id, then opens them as awards (gh #125)', async () => {
+    const text = await generatedText();
+    const funding = text.slice(text.indexOf('**Funding**'), text.indexOf('**Impact**'));
+    expect(funding).toMatch(/group the topic's works by awards\.id/);
+    expect(funding).toContain('entity_type "awards", id');
+    expect(funding).toContain('G…');
+    expect(funding).not.toMatch(/filtered by primary_topic\.id|-amount_usd/);
+    expect(funding).not.toContain('awards.* fields');
+  });
 });

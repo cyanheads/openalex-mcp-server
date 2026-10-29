@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/citation-graph.tool.test
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
+import { type Context, z } from '@cyanheads/mcp-ts-core';
 import { invalidParams, JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
@@ -13,7 +13,11 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderEntityRecord } from '@/mcp-server/tools/render-entity-record.js';
 import type { EntityRecord, SearchParams, SearchResult } from '@/services/openalex/types.js';
-import { renderedText as readMarkdown } from '../../../helpers/markdown.js';
+import {
+  nodeTypes,
+  nonAutolinks,
+  renderedText as readMarkdown,
+} from '../../../helpers/markdown.js';
 import {
   contentTextBytes,
   defaultWork,
@@ -1282,6 +1286,75 @@ describe('getCitationGraphTool', () => {
       expect(description).toMatch(/request/i);
       expect(description).not.toBe('Records on this page.');
     });
+
+    it('names the exactly-full final page in the meta.next_cursor description (gh #126)', () => {
+      const description =
+        getCitationGraphTool.output.shape.meta.shape.next_cursor.description ?? '';
+      expect(description).toMatch(/exactly fills `per_page`/);
+      expect(description).toMatch(/empty page/);
+    });
+  });
+
+  /**
+   * A notice is authored Markdown: the framework quotes it into `content[]` and escapes nothing,
+   * so the empty-page notices escape the echo they repeat — `seed_id` included, since a `#…`
+   * suffix on it still resolves. Both surfaces carry the same string and the caller's text reads
+   * back as sent; the `echo` field itself stays raw. (gh #127)
+   */
+  describe('caller text in notices (gh #127)', () => {
+    /** The trailer's `>` lines, and the string they quote with the markers stripped. */
+    const quotedNotice = (text: string) => {
+      const lines = text.split('\n').filter((line) => line.startsWith('>'));
+      return {
+        markdown: lines.join('\n'),
+        quoted: lines.map((line) => line.replace(/^> ?/, '')).join('\n'),
+      };
+    };
+    const hostile = {
+      seed_id: 'W2741809807#[x](https://evil.test) _e_ <b>t</b>',
+      filters: { publication_year: '1900', 'title.search': '*b* `c` ~d~' },
+      sort: '-cited_by_count `x`',
+    };
+    const echo =
+      'seed_id="W2741809807#[x](https://evil.test) _e_ <b>t</b>" | direction=cites | filters={"publication_year":"1900","title.search":"*b* `c` ~d~"} | sort="-cited_by_count `x`"';
+
+    it.each([
+      [
+        'an empty first page',
+        {},
+        `No edges for ${echo}. Verify the seed_id with openalex_resolve_name, broaden filters, or try a different direction.`,
+      ],
+      [
+        'an exhausted cursor page',
+        { cursor: 'next-page' },
+        `Pagination exhausted for ${echo} — the previous page held the last edge, so this one came back empty. Stop paging rather than broadening filters or changing direction.`,
+      ],
+    ] as const)('reads the echo back as sent on %s', async (_label, extra, expected) => {
+      mockSearch.mockResolvedValueOnce(lookupResponse('W2741809807')).mockResolvedValueOnce({
+        meta: { count: 0, per_page: 25, next_cursor: null },
+        results: [],
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        ...hostile,
+        direction: 'cites',
+        select: ['id'],
+        ...extra,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { echo: string; notice?: string };
+      const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      const { markdown, quoted } = quotedNotice(text);
+      expect(quoted).toBe(structured.notice);
+      const markup = ['emphasis', 'strong', 'delete', 'html', 'inlineCode'];
+      expect(nodeTypes(markdown).filter((t) => markup.includes(t))).toEqual([]);
+      expect(nonAutolinks(markdown)).toEqual([]);
+      expect(readMarkdown(markdown)).toBe(expected);
+      // The echo field is data, raw on both surfaces: a code span in the trailer.
+      expect(structured.echo).toBe(echo);
+      expect(readMarkdown(text)).toContain(`Query: ${echo}`);
+    });
   });
 
   /**
@@ -1364,10 +1437,11 @@ describe('getCitationGraphTool', () => {
   });
 
   /**
-   * Characterization: graph pages that already fit the 64,000-byte budget come back exactly as
-   * they did before the budget existed — same records, same text, no disclosure fields.
+   * Characterization: a graph page with nothing to disclose comes back as its records alone —
+   * same records, same text — and never carries the `omitted` or `over_budget` fields the removed
+   * response budget once added. (gh #72, #73, #131)
    */
-  describe('response budget — pages that fit stay unchanged (gh #72, #73)', () => {
+  describe('pages with nothing to disclose', () => {
     it('returns a 25-record default page byte-for-byte as rendered today', async () => {
       const page: SearchResult = {
         meta: { count: 500, per_page: 25, next_cursor: 'cursor-2' },
@@ -1392,8 +1466,6 @@ describe('getCitationGraphTool', () => {
         ...page.results.flatMap((record) => renderEntityRecord(record)),
       ].join('\n');
       expect(result.content[0]).toEqual({ type: 'text', text: expected });
-      expect(utf8Bytes(JSON.stringify(structured))).toBeLessThan(64_000);
-      expect(contentTextBytes(result.content)).toBeLessThan(64_000);
     });
 
     it('returns a list record with 99 authorships whole and unflagged', async () => {
@@ -1437,12 +1509,11 @@ describe('getCitationGraphTool', () => {
   });
 
   /**
-   * The budget (gh #72) and the 100-authorship cap disclosure (gh #73) on graph pages. Size
-   * assertions read the assembled `CallToolResult` from `runToolContract`, enrichment trailer
-   * included, and the service fake writes the `budget` enrichment the real service writes.
+   * Whole graph pages (gh #131), the response ceiling's wiring, and the 100-authorship cap
+   * disclosure (gh #73). The ceiling itself is tabled in `record-page.test.ts`; the service fake
+   * writes the `budget` enrichment the real service writes.
    */
-  describe('response budget (gh #72, #73)', () => {
-    const BUDGET = 64_000;
+  describe('record pages (gh #73, #131)', () => {
     const SEED = 'W1858542512';
     const SPEND = {
       costUsd: 0.30000000000000004,
@@ -1459,7 +1530,6 @@ describe('getCitationGraphTool', () => {
       meta: { count: number; per_page: number; next_cursor: string | null };
       results: EntityRecord[];
       notice?: string;
-      omitted?: { ids: string[]; next: Call };
       windows?: {
         id: string;
         field: string;
@@ -1469,45 +1539,23 @@ describe('getCitationGraphTool', () => {
         possibly_capped: boolean;
         next: Call | null;
       }[];
-      over_budget?: boolean;
     };
 
-    function expectWithinBudget(result: {
-      structuredContent?: unknown;
-      content: { type: string; text?: string }[];
-    }) {
-      expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeLessThanOrEqual(BUDGET);
-      expect(contentTextBytes(result.content)).toBeLessThanOrEqual(BUDGET);
-    }
-
-    /**
-     * Fake service: the seed lookup resolves `SEED`, an `openalex` ID filter returns exactly those
-     * records in reverse page order (OpenAlex returns an ID set in its own order), and a graph
-     * filter returns the first `per_page` records plus a next cursor. Writes the budget
-     * enrichment the way the real service does.
-     */
+    /** Fake service: the seed lookup resolves `SEED`; the graph page is the first `per_page`. */
     function serve(records: EntityRecord[], nextCursor: string | null = 'cursor-2') {
       mockSearch.mockImplementation(async (...args: unknown[]) => {
         const [params, ctx] = args as [SearchParams, Context];
         ctx.enrich({ budget: SPEND });
         if (params.id) return lookupResponse(SEED);
-        const wanted = params.filters?.openalex?.split('|');
         const perPage = params.perPage ?? 25;
-        const results = wanted
-          ? records.filter((r) => wanted.includes(bare(r.id))).reverse()
-          : records.slice(0, perPage);
         return {
-          meta: {
-            count: records.length,
-            per_page: perPage,
-            next_cursor: wanted ? null : nextCursor,
-          },
-          results,
+          meta: { count: records.length, per_page: perPage, next_cursor: nextCursor },
+          results: records.slice(0, perPage),
         };
       });
     }
 
-    it('cuts an overflowing graph page to whole records and names every omitted ID', async () => {
+    it('returns every work of a page past 64,000 bytes and continues it by cursor', async () => {
       const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 8));
       serve(records);
 
@@ -1518,86 +1566,18 @@ describe('getCitationGraphTool', () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expectWithinBudget(result);
+      expect(utf8Bytes(JSON.stringify(result.structuredContent))).toBeGreaterThan(64_000);
+      expect(contentTextBytes(result.content)).toBeGreaterThan(64_000);
       const structured = result.structuredContent as Structured;
-      const kept = structured.results.length;
-      expect(kept).toBeGreaterThan(1);
-      expect(kept).toBeLessThan(25);
-      expect(structured.results).toEqual(records.slice(0, kept));
+      expect(structured.results).toEqual(records);
       expect(structured.meta).toEqual({ count: 25, per_page: 25, next_cursor: 'cursor-2' });
-      const omittedIds = records.slice(kept).map((r) => bare(r.id));
-      expect(structured.omitted).toEqual({
-        ids: omittedIds,
-        next: {
-          tool: 'openalex_search_entities',
-          arguments: {
-            entity_type: 'works',
-            filters: { openalex: omittedIds.join('|') },
-            per_page: omittedIds.length,
-            select: ['authorships'],
-          },
-        },
-      });
-      expect(structured.windows).toBeUndefined();
-      expect(structured.notice).toMatch(/64,000-byte/);
-      expect(structured.notice).toContain('openalex_search_entities');
-      const text = textOf(result);
-      for (const omittedId of omittedIds) expect(text).toContain(omittedId);
-      expect(text).toContain(JSON.stringify(structured.omitted?.next.arguments));
+      expect(structured).not.toHaveProperty('omitted');
+      expect(structured).not.toHaveProperty('windows');
+      expect(structured.notice).toBeUndefined();
+      expect(textOf(result)).toContain('next cursor: `cursor-2`');
     });
 
-    it('returns exactly the omitted records from the continuation it names', async () => {
-      // ~12 KB records: the graph page keeps about five, and the continuation is cut again.
-      const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 20));
-      serve(records);
-
-      const first = await runToolContract(getCitationGraphTool, {
-        seed_id: SEED,
-        direction: 'cites',
-        select: ['authorships'],
-      });
-      const firstPage = first.structuredContent as Structured;
-      const seen = firstPage.results.map((r) => bare(r.id));
-      expect(firstPage.omitted?.next.tool).toBe('openalex_search_entities');
-
-      type SearchArgs = Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1];
-      let args = firstPage.omitted?.next.arguments as SearchArgs | undefined;
-      let calls = 0;
-      while (args && calls < 25) {
-        const result = await runToolContract(searchEntitiesTool, args);
-        calls++;
-        expect(result.isError).toBeFalsy();
-        expectWithinBudget(result);
-        const page = result.structuredContent as Structured;
-        seen.push(...page.results.map((r) => bare(r.id)));
-        args = page.omitted?.next.arguments as SearchArgs | undefined;
-      }
-
-      // The continuation returns the omitted records as a set, in OpenAlex's order.
-      expect(calls).toBeGreaterThan(1);
-      expect(seen).toHaveLength(records.length);
-      expect(new Set(seen)).toEqual(new Set(records.map((r) => bare(r.id))));
-    });
-
-    it('leaves `select` out of the continuation when the graph call set none', async () => {
-      const records = Array.from({ length: 25 }, (_, n) => ({
-        ...defaultWork(n),
-        abstract: 'measurement '.repeat(400),
-      }));
-      serve(records);
-
-      const result = await runToolContract(getCitationGraphTool, {
-        seed_id: SEED,
-        direction: 'cited_by',
-      });
-
-      expectWithinBudget(result);
-      const structured = result.structuredContent as Structured;
-      expect(structured.omitted?.next.arguments).not.toHaveProperty('select');
-      expect(structured.omitted?.next.arguments).toMatchObject({ entity_type: 'works' });
-    });
-
-    it('windows an oversized first graph record and omits the rest', async () => {
+    it('returns a 2,932-author first work whole beside the rest', async () => {
       const records = [
         workWithAuthorships(1, 2932),
         workWithAuthorships(2, 3),
@@ -1611,49 +1591,60 @@ describe('getCitationGraphTool', () => {
         select: ['authorships'],
       });
 
-      expectWithinBudget(result);
-      const structured = result.structuredContent as Structured;
-      expect(structured.results).toHaveLength(1);
-      const window = structured.windows?.[0];
-      expect(window).toMatchObject({
-        id: bare(records[0]!.id),
-        field: 'authorships',
-        offset: 0,
-        total: 2932,
-        possibly_capped: false,
-      });
-      expect(window?.next).toEqual({
-        tool: 'openalex_search_entities',
-        arguments: {
-          entity_type: 'works',
-          id: bare(records[0]!.id),
-          slice: { field: 'authorships', offset: window?.shown },
-        },
-      });
-      expect(structured.omitted?.ids).toEqual([bare(records[1]!.id), bare(records[2]!.id)]);
-      expect(textOf(result)).toContain(`**Window:** ${bare(records[0]!.id)} \`authorships\``);
-    });
-
-    /**
-     * A first work whose non-array fields alone exceed the budget runs the page over it; the
-     * `notice` description has to name that case, as `openalex_search_entities`' does.
-     */
-    it('flags a graph page whose first work alone runs over, a case the notice description names', async () => {
-      serve([{ ...workWithAuthorships(1, 3), abstract: 'lorem ipsum '.repeat(6000) }], null);
-
-      const result = await runToolContract(getCitationGraphTool, {
-        seed_id: SEED,
-        direction: 'cites',
-        select: ['abstract', 'authorships'],
-      });
-
       expect(result.isError).toBeFalsy();
       const structured = result.structuredContent as Structured;
-      expect(structured.over_budget).toBe(true);
-      expect(structured.notice).toMatch(/runs over/);
-      const RAN_OVER = /response budget cut [^.]*ran over/;
-      expect(getCitationGraphTool.enrichment?.notice.description ?? '').toMatch(RAN_OVER);
-      expect(searchEntitiesTool.enrichment?.notice.description ?? '').toMatch(RAN_OVER);
+      expect(structured.results).toEqual(records);
+      expect(structured).not.toHaveProperty('windows');
+      expect(textOf(result)).toContain('- [2931] author_position');
+    });
+
+    it('refuses a page over the ceiling, naming the per_page that fits, and that page fits', async () => {
+      const records = Array.from({ length: 10 }, (_, n) => ({
+        id: `https://openalex.org/W${n + 1}`,
+        display_name: `Padded ${n + 1}`,
+        note: 'x'.repeat(1_000_000),
+      }));
+      serve(records);
+
+      const over = await runToolContract(getCitationGraphTool, {
+        seed_id: SEED,
+        direction: 'cites',
+        select: ['note'],
+        per_page: 10,
+      });
+      expect(over.isError).toBe(true);
+      expect(over.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'response_too_large',
+            largestFitting: { input: 'per_page', value: 7 },
+            recovery: { hint: expect.stringContaining('Rerun with per_page 7') },
+          },
+        },
+      });
+      expect(JSON.stringify(over.content)).toContain('8,000,000-byte response ceiling');
+
+      const rerun = await runToolContract(getCitationGraphTool, {
+        seed_id: SEED,
+        direction: 'cites',
+        select: ['note'],
+        per_page: 7,
+      });
+      expect(rerun.isError).toBeFalsy();
+      expect((rerun.structuredContent as Structured).results).toEqual(records.slice(0, 7));
+    });
+
+    it('describes no response budget on either record tool', () => {
+      for (const definition of [getCitationGraphTool, searchEntitiesTool]) {
+        const surface = JSON.stringify([
+          definition.description,
+          z.toJSONSchema(definition.input),
+          z.toJSONSchema(definition.output),
+          z.toJSONSchema(z.object(definition.enrichment ?? {})),
+        ]);
+        expect(surface).not.toMatch(/64,000|response budget|over_budget|`omitted`/);
+      }
     });
 
     it('flags a graph record with exactly 100 authorships on both surfaces, not one with 99', async () => {
@@ -1667,10 +1658,8 @@ describe('getCitationGraphTool', () => {
         select: ['authorships'],
       });
 
-      expectWithinBudget(result);
       const structured = result.structuredContent as Structured;
       expect(structured.results).toEqual([capped, complete]);
-      expect(structured.omitted).toBeUndefined();
       expect(structured.windows).toEqual([
         {
           id: bare(capped.id),

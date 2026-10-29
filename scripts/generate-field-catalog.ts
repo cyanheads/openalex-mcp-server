@@ -29,6 +29,7 @@ const ENTITY_TYPES = [
   'keywords',
   'publishers',
   'funders',
+  'awards',
 ] as const;
 
 type EntityType = (typeof ENTITY_TYPES)[number];

@@ -27,7 +27,9 @@ const ServerConfigSchema = z.object({
   clampPerPage: z
     .stringbool()
     .default(true)
-    .describe('Clamp oversized per_page values to each tool maximum, with a notice'),
+    .describe(
+      'Clamp oversized count inputs (per_page, semantic per_page, sample, slice.limit) to their caps with a notice; false rejects them',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;

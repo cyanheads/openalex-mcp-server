@@ -7,8 +7,8 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
 import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
+import { joinNotices } from '@/mcp-server/tools/record-page.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { joinNotices } from '@/mcp-server/tools/response-budget.js';
 import { getOpenAlexService, isBooleanGroupBy } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -183,7 +183,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .min(1)
       .describe(
-        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". The native ":include_unknown" suffix also enables include_unknown, even when the boolean is false; passing both adds the suffix once. OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
+        'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". The native ":include_unknown" suffix also enables include_unknown, even when the boolean is false; passing both adds the suffix once. OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Awards: "start_year", "funder.id", "funding_type" — groups count awards and do not sum amount_usd. Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
       ),
     filters: z
       .record(z.string(), z.string())
@@ -339,11 +339,13 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     // enumerated every group, so there is nothing left to remove or regroup. On a first call
     // the same shape can still be an honest zero — including the all-values-unknown case,
     // where `count` is nonzero but every matched entity is null for the grouped field.
+    // A notice is authored Markdown, so the caller text the echo repeats is escaped in it.
     if (result.groups.length === 0) {
+      const criteria = escapeMarkdown(echo);
       notices.push(
         input.cursor === undefined
-          ? `No groups returned for ${echo}. Try removing filters or grouping by a different field.`
-          : `Pagination exhausted for ${echo} — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping.`,
+          ? `No groups returned for ${criteria}. Try removing filters or grouping by a different field.`
+          : `Pagination exhausted for ${criteria} — the previous page held the last group, so this one came back empty. Stop paging rather than removing filters or regrouping.`,
       );
     }
     if (keyOrder) {
@@ -454,7 +456,10 @@ function renderGroupLabel(g: Group): string {
   return g.key === g.key_display_name ? display : `${display} (${key})`;
 }
 
-/** The request as one line: caller text is JSON-encoded, so a line break in it stays escaped. */
+/**
+ * The request as one line: caller text is JSON-encoded, so a line break in it stays escaped.
+ * Raw, as the `echo` field carries it; a notice repeating it escapes it for Markdown.
+ */
 function buildAnalyzeEcho(
   input: {
     entity_type: string;

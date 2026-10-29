@@ -7,26 +7,32 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { ATTR_MCP_TOOL_NAME, createCounter } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
-import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
+import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
+import { clampCount, countSchema, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import {
-  type BudgetDisclosure,
-  type BudgetedPage,
-  fitRecordsToBudget,
-  fitSliceToBudget,
+  buildRecordPage,
+  buildSlicePage,
   formatRecordPage,
-  joinNotices,
-  measurePageFrame,
-  omittedOutputSchema,
-  overBudgetOutputSchema,
+  type PageOutcome,
   windowsOutputSchema,
-} from '@/mcp-server/tools/response-budget.js';
+} from '@/mcp-server/tools/record-page.js';
+import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
 import { parseNativeFilters, quoteCallerText } from '@/services/openalex/filter-values.js';
 import { getOpenAlexService, selectRecordKey } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
+const PER_PAGE_CAP = 100;
+const PER_PAGE_DEFAULT = 25;
 const SEMANTIC_PER_PAGE_CAP = 50;
-const SAMPLE_MAX = 100;
+/** The most authorships OpenAlex stores per work, the longest array a slice needs to cover. */
+const SLICE_LIMIT_CAP = 5000;
+const SLICE_LIMIT_DEFAULT = 50;
+/**
+ * The largest sample OpenAlex draws, and the most records of one it serves by page number:
+ * `page × per_page` above it is refused upstream even inside a smaller draw.
+ */
+const SAMPLE_MAX = 10_000;
+const SAMPLE_MAX_LABEL = SAMPLE_MAX.toLocaleString('en-US');
 /** What `meta.count` counts, in the rendered header. */
 const RESULT_NOUN = 'result(s)';
 
@@ -78,8 +84,8 @@ type SearchEchoInput = {
  * answers an entity-by-ID URL identically whether or not search params ride along.
  *
  * Pagination (`per_page`, `cursor`, `page`) is deliberately absent: a singleton lookup is one
- * record by definition, and `per_page` always carries its schema default, so a caller's intent
- * there cannot be told apart from the absence of one. Naming it would be noise, not a warning.
+ * record by definition, so page size and position have nothing to apply to. Naming them would be
+ * noise, not a warning.
  */
 function searchOnlyParams(input: SearchEchoInput): { name: string; rendered: string }[] {
   const parts: { name: string; rendered: string }[] = [];
@@ -104,7 +110,8 @@ function searchOnlyParams(input: SearchEchoInput): { name: string; rendered: str
  * Echo the criteria that actually ran. An `id` lookup echoes `entity_type` and `id` only —
  * echoing a filter the singleton path never applied reads as confirmation that it did, which
  * is the one thing this field exists not to do. Caller text is JSON-encoded, so a line break in
- * it cannot start a heading or end the line the echo renders on.
+ * it cannot start a heading or end the line the echo renders on. Raw, as the `echo` field
+ * carries it; a notice repeating it escapes it for Markdown.
  */
 function buildSearchEcho(input: SearchEchoInput): string {
   const parts = [`entity_type=${input.entity_type}`];
@@ -116,10 +123,10 @@ function buildSearchEcho(input: SearchEchoInput): string {
  * Is this call continuing a paginated traversal rather than opening one? A `cursor` is the
  * keyword/exact signal — the schema rejects a blank one, so its presence is always a real
  * continuation rather than a mistake OpenAlex answers with page 1; a `page` past the first is
- * the semantic signal, and `page` only survives the handler's preconditions under semantic
- * mode. Only on a continuing call does a page of
- * zero results mean the traversal is finished — on a first call it means nothing matched, and
- * the two want opposite advice.
+ * the signal for semantic search and a seeded sample, the only listings `page` survives the
+ * handler's preconditions on. Only on a continuing call does a page of zero results mean the
+ * traversal is finished — on a first call it means nothing matched, and the two want opposite
+ * advice.
  */
 function isContinuationPage(input: {
   cursor?: string | undefined;
@@ -128,9 +135,18 @@ function isContinuationPage(input: {
   return input.cursor !== undefined || (input.page ?? 1) > 1;
 }
 
+/**
+ * Whether records remain past this page of a `page`-walked listing that reaches `reachable`
+ * records — semantic candidates, or a sample's draw. A pointer to the next page appears only
+ * then: an exactly full last page has none to point at. (gh #126)
+ */
+function hasNextPage(page: number, perPage: number, reachable: number): boolean {
+  return page * perPage < reachable;
+}
+
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Filters take a record object; an unambiguous native string such as "issn:0920-8542" is also accepted when enabled and disclosed in `notice`. Native clauses split on commas outside paired double quotes and the first colon; duplicate keys and bare fragments are rejected. Any filter value sent unquoted must have paired double quotes; balanced search phrases remain valid. Supports keyword search with boolean operators, exact phrase matching, and AI semantic search. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. Responses cap at 64,000 bytes per surface unless the least a call can return is larger (`over_budget`); `omitted` and `windows` give the calls that continue a cut, and `slice` pages a long array.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders, awards). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Filters take a record object; an unambiguous native string such as "issn:0920-8542" is also accepted when enabled and disclosed in `notice`. Native clauses split on commas outside paired double quotes and the first colon; duplicate keys and bare fragments are rejected. Any filter value sent unquoted must have paired double quotes; balanced search phrases remain valid. Supports keyword search with boolean operators, exact phrase matching, AI semantic search, and seeded random samples. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. A page holds `per_page` records and `next_cursor` continues it — semantic search and a seeded `sample` continue with `page` instead; an `id` lookup returns every selected array whole, and `slice` pages one array by count.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -161,8 +177,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'semantic_per_page_cap',
       code: JsonRpcErrorCode.ValidationError,
-      when: `A search (no \`id\`) set per_page above the semantic-search cap of ${SEMANTIC_PER_PAGE_CAP}.`,
+      when: `A semantic search (no \`id\`) set per_page above its cap of ${SEMANTIC_PER_PAGE_CAP} on a server with OPENALEX_CLAMP_PER_PAGE=false; with clamping on (the default), it returns ${SEMANTIC_PER_PAGE_CAP} and says so.`,
       recovery: `Reduce per_page to ${SEMANTIC_PER_PAGE_CAP} or less, or switch search_mode to keyword.`,
+    },
+    {
+      reason: 'response_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: "The response's structuredContent or content[] text would exceed 8,000,000 bytes — a wide `select` on a large page, or a record with very long arrays. A page is never shortened to fit.",
+      recovery:
+        'Rerun with the per_page or slice.limit the error names when it names one, or narrow `select` to the fields you need; for a single oversized record, page its largest array with `slice`.',
     },
     {
       reason: 'semantic_without_query',
@@ -181,21 +204,29 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     {
       reason: 'page_without_semantic',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A search supplied `page` under a search_mode other than "semantic".',
+      when: 'A search supplied `page` with neither search_mode "semantic" nor `sample`.',
       recovery:
-        'Drop `page` and paginate with `cursor`, or set search_mode to "semantic" — the only mode `page` applies to.',
+        'Drop `page` and paginate with `cursor`, set search_mode to "semantic", or pass `sample` with a `seed` — the only searches `page` walks.',
     },
     {
       reason: 'sample_with_cursor',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A search (no `id`) provided both `sample` and `cursor`.',
-      recovery: 'Sampling returns a single page only; remove `cursor` or remove `sample`.',
+      recovery:
+        'A sample walks its draw with `page` and a `seed`, not `cursor`; remove `cursor`, or remove `sample`.',
     },
     {
-      reason: 'sample_with_page',
+      reason: 'sample_page_without_seed',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A search (no `id`) provided both `sample` and `page`.',
-      recovery: 'Sampling returns a single page only; remove `page` or remove `sample`.',
+      when: 'A search (no `id`) provided `page` with `sample` but no `seed`, which OpenAlex refuses: an unseeded sample redraws on every call, so its pages would overlap.',
+      recovery:
+        'Pass `seed` to page a sample — an unseeded sample redraws on every call — or drop `page`.',
+    },
+    {
+      reason: 'sample_page_too_deep',
+      code: JsonRpcErrorCode.ValidationError,
+      when: `A sample page reaches past record ${SAMPLE_MAX_LABEL} (\`page\` × \`per_page\` above ${SAMPLE_MAX_LABEL}), the most of a sample OpenAlex serves by page number.`,
+      recovery: `Keep \`page\` × \`per_page\` at or under ${SAMPLE_MAX_LABEL}, with a per_page that divides ${SAMPLE_MAX_LABEL} — 25, 50, or 100 — so the last page ends on record ${SAMPLE_MAX_LABEL}; at per_page 100 that is page 100.`,
     },
     {
       reason: 'sample_with_semantic',
@@ -235,7 +266,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.ValidationError,
       when: '`id` is a native OpenAlex ID whose letter names another entity type than `entity_type`, or a concept ID (C…), a type this server does not serve.',
       recovery:
-        'Pass the entity_type the ID letter names — W works, A authors, S sources, I institutions, T topics, P publishers, F funders. A concept ID (C…) has no entity_type here; search topics for the concept by name with openalex_resolve_name instead.',
+        'Pass the entity_type the ID letter names — W works, A authors, S sources, I institutions, T topics, P publishers, F funders, G awards. A concept ID (C…) has no entity_type here; search topics for the concept by name with openalex_resolve_name instead.',
       thrownBy: 'service',
     },
     {
@@ -403,7 +434,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807" or "https://api.openalex.org/works/W2741809807"), whose letter must name `entity_type` — W works, A authors, S sources, I institutions, T topics, P publishers, F funders; DOI ("10.1038/nature12373"; under entity_type "funders", a funder\'s Crossref Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361" — one ROR can name an institution, a funder, and a publisher, and `entity_type` picks which), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). An array too long for the response budget comes back as a window (`windows`); page the rest with `slice`. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807" or "https://api.openalex.org/works/W2741809807"), whose letter must name `entity_type` — W works, A authors, S sources, I institutions, T topics, P publishers, F funders, G awards; DOI ("10.1038/nature12373"; under entity_type "funders", a funder\'s Crossref Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361" — one ROR can name an institution, a funder, and a publisher, and `entity_type` picks which), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). Every selected array returns whole; `slice` pages a long one by count. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
@@ -433,12 +464,12 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .array(z.string())
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. Large projections may be cut to fit the response budget (`omitted`, `windows`). Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. A wide projection on a large page makes a large response, so name the fields you need. Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
       ),
-    per_page: pageSizeSchema(100)
-      .default(25)
+    per_page: pageSizeSchema(PER_PAGE_CAP)
+      .optional()
       .describe(
-        'Results per page. Default 25; positive integers above 100 clamp to 100 with a notice unless OPENALEX_CLAMP_PER_PAGE=false restores rejection. Semantic search caps at 50 — when search_mode="semantic", set per_page ≤ 50 (also subject to a 1 req/sec rate limit upstream). The semantic cap checks the requested size. An `id` lookup ignores page size, and `sample` overrides it. A budget-cut page returns fewer (`omitted`).',
+        `Results per page. Default ${PER_PAGE_DEFAULT}, or under \`sample\` the sample size up to ${PER_PAGE_CAP}, so a sample of ${PER_PAGE_CAP} or fewer returns whole in one call. A larger value returns at most ${PER_PAGE_CAP} and says so — at most ${SEMANTIC_PER_PAGE_CAP} under search_mode "semantic", which OpenAlex also limits to about 1 request per second. A server set to OPENALEX_CLAMP_PER_PAGE=false rejects a value over either cap instead. An \`id\` lookup ignores page size.`,
       ),
     cursor: z
       .string()
@@ -453,22 +484,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        'Page number (1-based) for semantic search, the one mode that paginates with `page` instead of `cursor`. Semantic search ranks a query-dependent candidate set whose size `meta.count` reports, so the last reachable page is ceil(meta.count / per_page) — e.g. page 14 for a count of 70 with per_page=5. Passing it under any other search_mode is rejected.',
+        `Page number (1-based) for semantic search and for a seeded \`sample\`, the two searches that paginate with \`page\` instead of \`cursor\`. Semantic search ranks a query-dependent candidate set whose size \`meta.count\` reports, so the last reachable page is ceil(meta.count / per_page) — e.g. page 14 for a count of 70 with per_page=5. A sample draws min(sample, meta.count) records, so its last page is ceil(min(sample, meta.count) / per_page); paging a sample requires \`seed\`, and OpenAlex serves only its first ${SAMPLE_MAX_LABEL} records, so a page × per_page above ${SAMPLE_MAX_LABEL} is rejected. Passing it with any other search is rejected.`,
       ),
-    sample: z
-      .number()
-      .int()
-      .min(1)
-      .max(SAMPLE_MAX)
+    sample: countSchema(1, SAMPLE_MAX)
       .optional()
       .describe(
-        `Return a random sample of this many entities matching the filters (1-${SAMPLE_MAX}). Single page only — neither \`cursor\` nor \`page\` pagination applies to sampling, and a search that passes either alongside it is rejected. Keyword and exact modes only: OpenAlex does not sample a semantic search, so \`sample\` with search_mode "semantic" is rejected. Cannot be combined with \`sort\` — a sample has no order, and a search passing both is rejected. Overrides \`per_page\`. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
+        `Return a random sample of this many entities matching the filters, up to ${SAMPLE_MAX_LABEL}; a larger value draws ${SAMPLE_MAX_LABEL} and says so (rejected instead on a server set to OPENALEX_CLAMP_PER_PAGE=false). The sample comes back \`per_page\` records at a time — by default the whole sample up to ${PER_PAGE_CAP} — and a larger one is walked with \`page\` and a \`seed\`, which fixes the draw; without \`seed\` only its first page is returned. \`meta.count\` stays the population matching the filters. Keyword and exact modes only: OpenAlex does not sample a semantic search, so \`sample\` with search_mode "semantic" is rejected. Cannot be combined with \`cursor\` or \`sort\` — a sample has no order, and a search passing either is rejected. Useful for unbiased exploration: spot-checking filter correctness, stratified review prompts, or generating exploration sets without bias toward most-cited.`,
       ),
     seed: z
       .string()
       .optional()
       .describe(
-        'Deterministic seed for `sample`. Same seed + same filters = same results — pass when reproducibility matters. Has no effect without `sample`, and a search that passes it alone is rejected.',
+        'Deterministic seed for `sample`. Same seed + same filters = the same draw, page for page — required to walk a sample larger than one page with `page`, and worth passing whenever reproducibility matters. Has no effect without `sample`, and a search that passes it alone is rejected.',
       ),
     slice: z
       .object({
@@ -483,10 +510,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           .min(0)
           .default(0)
           .describe('0-based index of the first element to return.'),
+        limit: countSchema(1, SLICE_LIMIT_CAP)
+          .default(SLICE_LIMIT_DEFAULT)
+          .describe(
+            `Elements to return. Default ${SLICE_LIMIT_DEFAULT}; a larger value returns at most ${SLICE_LIMIT_CAP.toLocaleString('en-US')} and says so (rejected instead on a server set to OPENALEX_CLAMP_PER_PAGE=false).`,
+          ),
       })
       .optional()
       .describe(
-        'Page one array of the record at `id`: returns `id`, `display_name`, and `field` from `offset` onward, as many elements as fit the response budget (at least one), with the window and its `next` call in `windows`. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. A 100-author list cap can be continued on the singleton; at 5,000 stored authors the byline remains possibly capped, but `next` is null once stored entries are exhausted.',
+        'Page one array of the record at `id`: returns `id`, `display_name`, and `limit` elements of `field` from `offset` — fewer only at the array end — with the window in `windows`, whose `next` call repeats `limit` from the following offset. Requires `id`; replaces `select`. An offset at or past the end returns an empty window. A 100-author list cap can be continued on the singleton; at 5,000 stored authors the byline remains possibly capped, but `next` is null once stored entries are exhausted.',
       ),
   }),
   output: z.object({
@@ -495,18 +527,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         count: z
           .number()
           .describe(
-            'Total results matching the query/filters. Under search_mode "semantic" it is instead the size of the ranked candidate set — the most results `page` can reach — not an exhaustive match total.',
+            'Total results matching the query/filters — under `sample` too, whose draw holds min(sample, count) records. Under search_mode "semantic" it is instead the size of the ranked candidate set — the most results `page` can reach — not an exhaustive match total.',
           ),
         per_page: z
           .number()
           .describe(
-            'Page size OpenAlex echoed for this request — the applied per_page after clamping or sample override, not the number of records returned. A singleton reports 1. A short or exhausted page carries fewer records than this, as does a page the response budget cut (`omitted`).',
+            'Page size OpenAlex echoed for this request — the applied per_page after clamping or its default, not the number of records returned. A singleton reports 1. A short or exhausted page carries fewer records than this.',
           ),
         next_cursor: z
           .string()
           .nullable()
           .describe(
-            'Cursor for next page. null if no more results. Continues after the full upstream page, `omitted` records included.',
+            'Cursor for the next page; pass it back unchanged as `cursor`. null when no further page exists — always under semantic search and `sample`, which continue with `page` — except on a final page that exactly fills `per_page`: OpenAlex still returns a cursor there, and it leads to an empty page.',
           ),
       })
       .describe('Result metadata including pagination.'),
@@ -517,7 +549,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
             id: z
               .string()
               .describe(
-                'OpenAlex ID URL (e.g., "https://openalex.org/W2741809807"). `windows` and `omitted` name records by the bare ID ("W2741809807"); a keyword keeps its URL.',
+                'OpenAlex ID URL (e.g., "https://openalex.org/W2741809807"). `windows` names records by the bare ID ("W2741809807"); a keyword keeps its URL.',
               ),
             display_name: z
               .string()
@@ -532,11 +564,9 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           ),
       )
       .describe(
-        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`, and a selected `author_list` as one `{id, display_name, orcid}` entry per author. Additional fields depend on entity_type and select. Records cut by the response budget are in `omitted`; partial or possibly capped arrays are in `windows`.',
+        'OpenAlex entity objects. Text values are plain text — HTML entities decoded, HTML/JATS/MathML markup removed — except identifier and URL fields such as `id`, `doi`, `ids`, and `*_url`, returned exactly as OpenAlex stores them; an abstract arrives reconstructed as `abstract`, and a selected `author_list` as one `{id, display_name, orcid}` entry per author. Additional fields depend on entity_type and select. Possibly capped author arrays and `slice` windows are in `windows`.',
       ),
-    omitted: omittedOutputSchema,
     windows: windowsOutputSchema,
-    over_budget: overBudgetOutputSchema,
   }),
 
   // Agent-facing context for the success path — the query/filters as parsed, the
@@ -553,7 +583,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when per_page was clamped (requested and applied sizes), a native filter string was converted, a first call has no matches, a continuation is exhausted, an id lookup ignores search criteria, semantic search reports a candidate total, the response budget cut records, windowed an array, or ran over, an author array is possibly capped (100 list entries or 5,000 stored singleton entries), a slice offset is past the end, or slice replaces select. Absent otherwise.',
+        'Guidance notice. Set when per_page, sample, or slice.limit was clamped (requested and applied sizes), a native filter string was converted, a first call has no matches, a continuation is exhausted, an id lookup ignores search criteria, semantic search reports a candidate total and whether a later `page` holds more, a sample draws more than one page (the next `page`, its last page, or that `seed` makes it pageable), an author array is possibly capped (100 list entries or 5,000 stored singleton entries), a slice offset is past the end, or slice replaces select. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -618,6 +648,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
      * to each other fails it on constraints it never met. The dropped-parameter notice below
      * reports them instead. The `id` predicate mirrors the service's own truthiness branch.
      */
+    // `per_page` as the caller set it, or its default: the whole sample up to a page, else 25.
+    const requestedPerPage =
+      input.per_page ??
+      (input.sample !== undefined ? Math.min(input.sample, PER_PAGE_CAP) : PER_PAGE_DEFAULT);
     if (!input.id) {
       // Semantic search matches an embedding of the query text, so with no query there is
       // nothing to embed — the request silently degraded to a plain unfiltered listing whose
@@ -630,11 +664,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         );
       }
 
-      if (input.search_mode === 'semantic' && input.per_page > SEMANTIC_PER_PAGE_CAP) {
+      // With clamping on, an over-cap semantic page size clamps below instead. A semantic sample
+      // is refused below as `sample_with_semantic` whatever its page size, which the sample sets.
+      if (
+        input.search_mode === 'semantic' &&
+        input.sample === undefined &&
+        requestedPerPage > SEMANTIC_PER_PAGE_CAP &&
+        !getServerConfig().clampPerPage
+      ) {
         throw ctx.fail(
           'semantic_per_page_cap',
           `Semantic search supports at most ${SEMANTIC_PER_PAGE_CAP} results per page. Reduce per_page or switch search_mode.`,
-          { searchMode: input.search_mode, perPage: input.per_page, cap: SEMANTIC_PER_PAGE_CAP },
+          { searchMode: input.search_mode, perPage: requestedPerPage, cap: SEMANTIC_PER_PAGE_CAP },
         );
       }
 
@@ -648,12 +689,16 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         );
       }
 
-      // The inverse: `page` is the semantic-only knob, and OpenAlex ignores it on a cursor
-      // traversal — silently returning page 1 again rather than the page that was asked for.
-      if (input.page !== undefined && input.search_mode !== 'semantic') {
+      // The inverse: `page` walks semantic candidates and samples only, and OpenAlex ignores it on
+      // a cursor traversal — silently returning page 1 again rather than the page asked for.
+      if (
+        input.page !== undefined &&
+        input.search_mode !== 'semantic' &&
+        input.sample === undefined
+      ) {
         throw ctx.fail(
           'page_without_semantic',
-          `\`page\` applies to semantic search only — search_mode is "${input.search_mode}", which paginates with \`cursor\`.`,
+          `\`page\` applies to semantic search and samples only — search_mode is "${input.search_mode}" with no \`sample\`, which paginates with \`cursor\`.`,
           { searchMode: input.search_mode, page: input.page },
         );
       }
@@ -661,26 +706,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       if (input.sample !== undefined && input.cursor !== undefined) {
         throw ctx.fail(
           'sample_with_cursor',
-          'Sampling returns one page only — `sample` cannot be combined with `cursor` pagination.',
+          '`sample` cannot be combined with `cursor` — a seeded sample pages with `page`.',
           { sample: input.sample, cursor: input.cursor },
-        );
-      }
-
-      // Sampling pins `per_page` to `sample` and returns that one page, so there is no second
-      // page for `page` to address — the same exclusion `cursor` has above. Reachable under
-      // semantic mode alone; every other mode rejects `page` at the check before this one.
-      if (input.sample !== undefined && input.page !== undefined) {
-        throw ctx.fail(
-          'sample_with_page',
-          'Sampling returns one page only — `sample` cannot be combined with `page` pagination.',
-          { sample: input.sample, page: input.page },
         );
       }
 
       // OpenAlex ignores `sample` and `seed` under `search.semantic` and returns the ranked page,
       // so forwarding the pair would label a relevance ranking as a random sample. The population
       // request would also carry `cursor=*` beside `search.semantic`, which upstream rejects.
-      // Checked after `sample_with_page`, which is reachable under semantic mode alone.
+      // Checked ahead of the sample-paging checks below: a semantic sample is wrong at any page.
       if (input.sample !== undefined && input.search_mode === 'semantic') {
         throw ctx.fail(
           'sample_with_semantic',
@@ -706,12 +740,72 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           { seed: input.seed },
         );
       }
+
+      // OpenAlex refuses `page` on an unseeded sample (HTTP 400): each call redraws it.
+      if (input.sample !== undefined && input.page !== undefined && input.seed === undefined) {
+        throw ctx.fail(
+          'sample_page_without_seed',
+          '`page` walks a sample only with `seed` — an unseeded sample redraws on every call, so its pages would overlap.',
+          { sample: input.sample, page: input.page },
+        );
+      }
+
+      // OpenAlex serves the first 10,000 records of a sample by page number and answers a page
+      // past them with a 400, even inside a smaller draw. Measured at the per_page the call
+      // will send, which a clamp can only lower.
+      const sentPerPage = Math.min(requestedPerPage, PER_PAGE_CAP);
+      if (
+        input.sample !== undefined &&
+        input.page !== undefined &&
+        input.page * sentPerPage > SAMPLE_MAX
+      ) {
+        const last = input.page * sentPerPage;
+        throw ctx.fail(
+          'sample_page_too_deep',
+          `Page ${input.page} at per_page ${sentPerPage} reaches record ${last.toLocaleString('en-US')}, past the first ${SAMPLE_MAX_LABEL} records OpenAlex serves from a sample.`,
+          { sample: input.sample, page: input.page, perPage: sentPerPage, maxRecords: SAMPLE_MAX },
+        );
+      }
     }
 
-    const pageSize =
-      input.id || input.sample !== undefined
-        ? { applied: input.per_page, notice: undefined }
-        : clampPageSize(input.per_page, 100, 'openalex_search_entities', ctx);
+    const semantic = input.search_mode === 'semantic';
+    // An `id` lookup draws no sample, so its `sample` is neither clamped nor disclosed.
+    const sample =
+      input.id || input.sample === undefined
+        ? undefined
+        : clampCount(
+            {
+              input: 'sample',
+              requested: input.sample,
+              maximum: SAMPLE_MAX,
+              tool: 'openalex_search_entities',
+            },
+            ctx,
+          );
+    const appliedSample = sample?.applied ?? input.sample;
+    const pageSize = input.id
+      ? { applied: requestedPerPage, notice: undefined }
+      : clampCount(
+          {
+            input: 'per_page',
+            requested: requestedPerPage,
+            maximum: semantic ? SEMANTIC_PER_PAGE_CAP : PER_PAGE_CAP,
+            ...(semantic && { maximumLabel: 'semantic-search maximum' }),
+            tool: 'openalex_search_entities',
+          },
+          ctx,
+        );
+    const sliceLimit = slice
+      ? clampCount(
+          {
+            input: 'slice.limit',
+            requested: slice.limit,
+            maximum: SLICE_LIMIT_CAP,
+            tool: 'openalex_search_entities',
+          },
+          ctx,
+        )
+      : undefined;
     const service = getOpenAlexService();
     const result = await service.search(
       {
@@ -725,7 +819,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         perPage: pageSize.applied,
         cursor: input.cursor,
         page: input.page,
-        sample: input.sample,
+        sample: appliedSample,
         seed: input.seed,
       },
       ctx,
@@ -739,11 +833,13 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       totalCount: result.meta.count,
     });
 
-    const echo = buildSearchEcho(input);
+    const echo = buildSearchEcho({ ...input, sample: appliedSample });
     ctx.enrich({ echo, totalCount: result.meta.count });
 
     const notices: string[] = [];
+    if (sample?.notice) notices.push(sample.notice);
     if (pageSize.notice) notices.push(pageSize.notice);
+    if (sliceLimit?.notice) notices.push(sliceLimit.notice);
     if (normalized?.converted) {
       notices.push('Converted native filter string to a filters record object.');
     }
@@ -758,19 +854,55 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         `\`id\` takes precedence — ${ignored.join(', ')} ${verb} not applied, and the record below is the entity at that ID regardless of ${pronoun}. Drop \`id\` to run ${pronoun} as a search.`,
       );
     } else if (result.results.length === 0) {
+      // A notice is authored Markdown, so the caller text the echo repeats is escaped in it.
+      const criteria = escapeMarkdown(echo);
       notices.push(
         isContinuationPage(input)
-          ? `Pagination exhausted for ${echo} — the previous page was the last, so this one came back empty. Stop paging rather than broadening the search.`
-          : `No matches for ${echo}. Try broadening the query, removing filters, or switching search_mode.`,
+          ? `Pagination exhausted for ${criteria} — the previous page was the last, so this one came back empty. Stop paging rather than broadening the search.`
+          : `No matches for ${criteria}. Try broadening the query, removing filters, or switching search_mode.`,
       );
     }
+
+    /**
+     * Semantic search and samples carry no `next_cursor`, so these notices are their only
+     * continuation signal. The empty page past the last carries the exhausted advice above alone.
+     */
+    const page = input.page ?? 1;
+    const exhausted = result.results.length === 0 && isContinuationPage(input);
 
     // `meta.count` reports the ranked candidate set under semantic search, not the population
     // matching the query. Its size is query-dependent (OpenAlex serves 70 for some queries,
     // 50 for others), so the notice states the count it got rather than a fixed ceiling.
-    if (!input.id && input.search_mode === 'semantic') {
+    if (!input.id && semantic && !exhausted) {
+      const continuation = hasNextPage(page, pageSize.applied, result.meta.count)
+        ? ` Continue with \`page: ${page + 1}\` for the rest of the candidates.`
+        : result.results.length > 0
+          ? ' The candidate set ends on this page.'
+          : '';
       notices.push(
-        `Semantic search ranks a candidate set rather than every match, so \`meta.count\` (${result.meta.count}) is the number of candidates \`page\` can reach, not the total number of matching records. Reach the rest of the candidates with \`page\`.`,
+        `Semantic search ranks a candidate set rather than every match, so \`meta.count\` (${result.meta.count}) is the number of candidates \`page\` can reach, not the total number of matching records.${continuation}`,
+      );
+    }
+
+    // `meta.count` stays the population under `sample`; the draw is the smaller of the two. A
+    // draw that fits one page needs no notice — the page holds all of it.
+    const drawn = sample ? Math.min(sample.applied, result.meta.count) : 0;
+    if (result.results.length > 0 && drawn > pageSize.applied) {
+      const size = `${drawn.toLocaleString('en-US')} records`;
+      // OpenAlex serves no sample page reaching past record 10,000, so at a per_page that does not
+      // divide 10,000 the records after its last whole page are out of reach at that size.
+      const reachable = Math.min(
+        drawn,
+        Math.floor(SAMPLE_MAX / pageSize.applied) * pageSize.applied,
+      );
+      notices.push(
+        input.seed === undefined
+          ? `This sample draws ${size}, more than one page of ${pageSize.applied}, so only its first page is returned. Pass a \`seed\` to fix the draw and walk it with \`page\` — an unseeded sample redraws on every call.`
+          : hasNextPage(page, pageSize.applied, reachable)
+            ? `This seeded sample draws ${size}, ${pageSize.applied} per page; continue with \`page: ${page + 1}\` and the same \`seed\`.`
+            : reachable < drawn
+              ? `This seeded sample draws ${size}, ${pageSize.applied} per page, and this is the last page OpenAlex serves at that size. Records ${(reachable + 1).toLocaleString('en-US')}–${drawn.toLocaleString('en-US')} are reachable only at a per_page that divides ${SAMPLE_MAX_LABEL}, such as 25, 50, or 100.`
+              : `This seeded sample draws ${size}, ${pageSize.applied} per page; the draw ends on this page.`,
       );
     }
 
@@ -780,22 +912,23 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       );
     }
 
-    const meta = {
-      count: result.meta.count,
-      per_page: result.meta.per_page,
-      next_cursor: result.meta.next_cursor,
+    const context = {
+      entityType: input.entity_type,
+      meta: {
+        count: result.meta.count,
+        per_page: result.meta.per_page,
+        next_cursor: result.meta.next_cursor,
+      },
+      noun: RESULT_NOUN,
+      echo,
+      totalCount: result.meta.count,
+      totalLabel: 'Total',
+      notices,
     };
-    const measureFrame = (disclosure: BudgetDisclosure, budgetNotice: string | undefined) =>
-      measurePageFrame({ meta, results: [], ...disclosure }, RESULT_NOUN, {
-        echo,
-        totalCount: result.meta.count,
-        totalLabel: 'Total',
-        notice: joinNotices([...notices, budgetNotice]),
-      });
 
-    let page: BudgetedPage;
+    let outcome: PageOutcome;
     // A slice without an `id` was refused as `slice_without_id`, so `input.id` only narrows here.
-    if (slice && input.id) {
+    if (slice && sliceLimit && input.id) {
       // The one-field projection lands under its record key — `authors` arrives as `authorships`,
       // and `author_list` as itself.
       const field = selectRecordKey(input.entity_type, slice.field);
@@ -813,27 +946,28 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           `slice.offset ${slice.offset} is past the end of \`${field}\`, which holds ${items.length} element(s), so nothing follows.`,
         );
       }
-      page = fitSliceToBudget({
+      outcome = buildSlicePage({
+        ...context,
         record,
         field,
         offset: slice.offset,
-        entityType: input.entity_type,
-        measureFrame,
+        limit: sliceLimit.applied,
       });
     } else {
-      page = fitRecordsToBudget({
+      outcome = buildRecordPage({
+        ...context,
         records: result.results,
-        entityType: input.entity_type,
         path: input.id ? 'lookup' : 'list',
-        select: input.select,
-        measureFrame,
+        continuation: semantic || sample ? 'page' : 'cursor',
+        page,
       });
     }
+    if (outcome.kind === 'too_large') {
+      throw ctx.fail('response_too_large', outcome.message, outcome.data);
+    }
 
-    const notice = joinNotices([...notices, page.notice]);
-    if (notice) ctx.enrich.notice(notice);
-
-    return { meta, results: page.results, ...page.disclosure };
+    if (outcome.notice) ctx.enrich.notice(outcome.notice);
+    return outcome.page;
   },
 
   format: (result) => formatRecordPage(result, RESULT_NOUN),

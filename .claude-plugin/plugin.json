@@ -40,8 +40,8 @@
     },
     "OPENALEX_CLAMP_PER_PAGE": {
       "type": "string",
-      "title": "Clamp page size",
-      "description": "Clamp oversized per_page values with a notice. Set false to restore rejecting maxima.",
+      "title": "Clamp count inputs",
+      "description": "Clamp oversized count inputs (per_page, semantic-search per_page, sample, slice.limit) to their caps with a notice. Set false to reject them instead.",
       "default": "true"
     },
     "OPENALEX_FILTER_STRING_INPUT": {

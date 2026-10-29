@@ -44,6 +44,11 @@ const NON_GROUPABLE_DATE_FIELDS: ReadonlySet<string> = new Set([
  * institutions' own `geo.city` groups while works' `authorships.institutions.geo.city` does not.
  * Probe each new field after regenerating the field catalog; the generator rewrites only the JSON,
  * so these exclusions survive it.
+ *
+ * The 2026-10-28 regeneration added awards, whose 56 non-search filter fields were swept the same
+ * way, and two institutions count fields, each grouped once. Sources' `is_in_jstage` matches the
+ * filter it names but answers "Cannot group by is_in_jstage: OpenAlex doesn't record which sources
+ * are in J-STAGE."
  */
 const GROUP_BY_REJECTED_FIELDS: Record<EntityType, ReadonlySet<string>> = {
   works: new Set([
@@ -93,17 +98,31 @@ const GROUP_BY_REJECTED_FIELDS: Record<EntityType, ReadonlySet<string>> = {
     'ids.mag',
     'is_high_oa_rate_since_year',
     'is_in_doaj_since_year',
+    'is_in_jstage',
     'is_in_jstage_since_year',
     'last_publication_year',
     'oa_flip_year',
     // looked up from a related entity at query time (2026-10-18)
     'host_organization.country_code',
   ]),
-  institutions: new Set(['display_name']),
+  institutions: new Set([
+    'display_name',
+    'works_count_with_children',
+    'works_count_with_children_and_predecessors',
+  ]),
   topics: new Set(['display_name']),
   keywords: new Set(['display_name']),
   publishers: new Set(['display_name']),
   funders: new Set(['display_name']),
+  awards: new Set([
+    'amount',
+    'amount_usd',
+    'doi',
+    'funded_outputs_count',
+    'sub_awards_count',
+    // looked up from a related entity at query time
+    'funder.country_code',
+  ]),
 };
 
 /**
@@ -123,6 +142,11 @@ const GROUP_BY_UPSTREAM_FAILURES: Partial<Record<EntityType, ReadonlySet<string>
     'primary_location.raw_type',
   ]),
   sources: new Set(['is_preprint_repository']),
+  awards: new Set([
+    'lead_investigator.affiliation.name',
+    'lead_investigator.family_name',
+    'lead_investigator.given_name',
+  ]),
 };
 
 /**
