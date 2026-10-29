@@ -15,7 +15,7 @@
 
 [OpenAlex](https://openalex.org) is a fully open catalog of the global research system — 270M+ works, 90M+ authors, 100K+ sources. CC0 data, no API key required (email address optional for polite pool access).
 
-**Entity types:** works, authors, sources, institutions, topics, keywords, publishers, funders. All share a uniform API (list/filter, search, get-by-ID, group-by, autocomplete).
+**Entity types:** works, authors, sources, institutions, topics, keywords, publishers, funders, awards. All share a uniform API (list/filter, search, get-by-ID, group-by); all but awards (grants, `G…` IDs) also have autocomplete, so `openalex_resolve_name` takes the eight `AUTOCOMPLETE_ENTITY_TYPES` and answers an award ID with a notice naming the `openalex_search_entities` call.
 
 **Critical workflow:** Names are ambiguous, IDs are not. Always resolve names to IDs first via `openalex_resolve_name` before using them in filters.
 
@@ -32,8 +32,9 @@
 | Tool | `openalex_describe_fields` | List valid filter/group_by/select field names per entity type |
 | Prompt | `openalex_literature_review` | Guided systematic literature search workflow |
 | Prompt | `openalex_research_landscape` | Quantitative research landscape analysis |
+| Skill | `openalex-guide` | Published Agent Skill (root `skills/`): which filter key answers the question, how to read `group_by` counts, ID sources; served at `skill://openalex-guide/SKILL.md` |
 
-No resources — entity lookups need `select` for payload control, which fits tools better than URI templates.
+No hand-written resources — entity lookups need `select` for payload control, which fits tools better than URI templates.
 
 ### Config
 
@@ -43,7 +44,7 @@ No resources — entity lookups need `select` for payload control, which fits to
 | `OPENALEX_MAILTO` | No | Email sent as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key |
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
 | `OPENALEX_FILTER_STRING_INPUT` | No | Default: `true`; accept unambiguous native filter strings on `openalex_search_entities`; `false` restores record-only input. Strict boolean parsing rejects invalid values. |
-| `OPENALEX_CLAMP_PER_PAGE` | No | Default: `true`; clamp positive integer `per_page` to 100 for search/citation and 200 for analysis, with a notice, log, and counter. `false` restores rejecting advertised maxima. Strict boolean parsing; semantic cap 50 and sample maxima still reject. |
+| `OPENALEX_CLAMP_PER_PAGE` | No | Default: `true`; clamp positive integer `per_page` (100 search/citation, 50 semantic, 200 analysis), `slice.limit` (5,000), and `sample` (10,000) to their caps, with a notice, log, and `openalex.count_input.clamps` counter. `false` rejects each over its cap. Strict boolean parsing. |
 
 **Session mode:** `createApp({ sessionMode: 'stateless' })` in `src/index.ts` — no tool gates on `ctx.requestInput`, so every call completes in one round trip. An explicit `MCP_SESSION_MODE` still overrides it; `.env.example` and the `Dockerfile` set the same value. No service holds a watcher, socket, or ref'd timer, so there is no `teardown` hook.
 
@@ -87,13 +88,13 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getOpenAlexService } from '@/services/openalex/openalex-service.js';
-import { ENTITY_TYPES } from '@/services/openalex/types.js';
+import { AUTOCOMPLETE_ENTITY_TYPES } from '@/services/openalex/types.js';
 
 export const resolveNameTool = tool('openalex_resolve_name', {
   description: 'Resolve a name or partial name to an OpenAlex ID. Returns up to 10 matches with disambiguation hints.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    entity_type: z.enum(ENTITY_TYPES).optional().describe('Entity type to search. Omit for cross-entity search.'),
+    entity_type: z.enum(AUTOCOMPLETE_ENTITY_TYPES).optional().describe('Entity type to search. Omit for cross-entity search.'),
     query: z.string().describe('Name or partial name to resolve.'),
   }),
   output: z.object({
@@ -193,7 +194,7 @@ async handler(input, ctx) {
 
 Native-filter parser failures raised during schema preprocessing carry explicit recovery guidance: the handler boundary has not run yet, so handler-contract hint filling cannot supply it.
 
-The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Three service throws set their own `recovery: { hint }`, which wins over the fill: the PMCID 404, since the generic "verify the ID" recovery would send the caller back to retry an identifier OpenAlex never indexes; `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone); and `upstream_unavailable` on a semantic search — including the HTTP 400 `Failed to embed query:` and `Semantic search is not configured` bodies, relabelled from caller errors to that outage — whose hint adds the keyword-search fallback the generic outage recovery cannot name. One status is read past its code: an HTTP 429 whose body `error` is `Plan upgrade required` — a filter OpenAlex serves only on a paid plan — is thrown as `Forbidden` with `upstream_plan_required` and `retryable: false` under a message of the server's own, so it fails on its first request — no wait clears a plan gate. Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_with_page`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, and `slice_field_not_array` on `openalex_search_entities`; `reserved_filter_key` and the seed-lookup `entity_not_found` on `openalex_get_citation_graph`; `filters_without_entity_type` on `openalex_resolve_name`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Three service throws set their own `recovery: { hint }`, which wins over the fill: the PMCID 404, since the generic "verify the ID" recovery would send the caller back to retry an identifier OpenAlex never indexes; `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone); and `upstream_unavailable` on a semantic search — including the HTTP 400 `Failed to embed query:` and `Semantic search is not configured` bodies, relabelled from caller errors to that outage — whose hint adds the keyword-search fallback the generic outage recovery cannot name. One status is read past its code: an HTTP 429 whose body `error` is `Plan upgrade required` — a filter OpenAlex serves only on a paid plan — is thrown as `Forbidden` with `upstream_plan_required` and `retryable: false` under a message of the server's own, so it fails on its first request — no wait clears a plan gate. Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_page_without_seed`, `sample_page_too_deep`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, `slice_field_not_array`, and `response_too_large` on `openalex_search_entities`; `reserved_filter_key`, the seed-lookup `entity_not_found`, and `response_too_large` on `openalex_get_citation_graph`; `filters_without_entity_type` on `openalex_resolve_name`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
 
@@ -232,8 +233,8 @@ src/
       escape-markdown.ts                # Markdown escaping for provider text in content[]
       render-entity-record.ts           # Entity records as content[] markdown
       render-budget.ts                  # The budget trailer line
-      response-budget.ts                # 64,000-byte response budget and its disclosures
-      page-size.ts                      # Configurable page-size validation and disclosed clamping
+      record-page.ts                    # Record pages: author-cap and slice windows, the 8,000,000-byte response_too_large ceiling
+      page-size.ts                      # Count-input validation (per_page, sample, slice.limit) and disclosed clamping
     tools/definitions/
       search-entities.tool.ts           # openalex_search_entities
       analyze-trends.tool.ts            # openalex_analyze_trends
@@ -243,6 +244,8 @@ src/
     prompts/definitions/
       literature-review.prompt.ts       # openalex_literature_review
       research-landscape.prompt.ts      # openalex_research_landscape
+skills/
+  openalex-guide/SKILL.md               # Published Agent Skill, served via createApp({ skills: 'skills' })
 ```
 
 ---
@@ -265,11 +268,11 @@ Two skill trees live at the project root, written for different readers:
 | Tree | For | Written by |
 |:-----|:----|:-----------|
 | `framework-skills/` | The agent developing this server — framework skills (`metadata.audience: external`) plus any development-time skills of the server's own | `init` and the `maintenance` sync (framework skills); you (your own) |
-| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Absent by default; usually none is needed |
+| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Ships `openalex-guide` |
 
 Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand them to every agent that installs it.
 
-A published skill in root `skills/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients when the server opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
+The published skill in root `skills/` (`openalex-guide`) reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients through `createApp({ skills: 'skills' })` in `src/index.ts`, served at `skill://openalex-guide/SKILL.md`. `lint:packaging` validates the tree.
 
 **Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 

@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 03:09:37
+Generated on: 2026-10-29 03:04:20
 
 ```text
 openalex-mcp-server/
@@ -147,6 +147,9 @@ openalex-mcp-server/
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── openalex-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -164,9 +167,9 @@ openalex-mcp-server/
 │   │       │   └── search-entities.tool.ts
 │   │       ├── escape-markdown.ts
 │   │       ├── page-size.ts
+│   │       ├── record-page.ts
 │   │       ├── render-budget.ts
-│   │       ├── render-entity-record.ts
-│   │       └── response-budget.ts
+│   │       └── render-entity-record.ts
 │   ├── services/
 │   │   └── openalex/
 │   │       ├── budget.ts
@@ -199,9 +202,9 @@ openalex-mcp-server/
 │   │       │   ├── resolve-name.tool.test.ts
 │   │       │   └── search-entities.tool.test.ts
 │   │       ├── escape-markdown.test.ts
+│   │       ├── record-page.test.ts
 │   │       ├── render-budget.test.ts
-│   │       ├── render-entity-record.test.ts
-│   │       └── response-budget.test.ts
+│   │       └── render-entity-record.test.ts
 │   └── services/
 │       └── openalex/
 │           ├── budget.test.ts

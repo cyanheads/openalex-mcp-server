@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: openalex-mcp-server
-abstract: "Model Context Protocol (MCP) server for the OpenAlex scholarly catalog (270M+ works, authors, sources, institutions, topics, publishers, funders), providing entity search and filtering, group-by trend analysis, and name-to-ID resolution via autocomplete."
+abstract: "Model Context Protocol (MCP) server for the OpenAlex scholarly catalog (270M+ works, authors, sources, institutions, topics, keywords, publishers, funders, awards), providing entity search and filtering, group-by trend analysis, and name-to-ID resolution via autocomplete."
 type: software
 authors:
   - family-names: Hand
