@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.11.0](changelog/0.11.x/0.11.0.md) — 2026-10-28 · ⚠️ Breaking
+
+Adds the awards entity, seeded sample paging up to 10,000 records, and the openalex-guide skill. Pages are no longer cut to a byte budget (omitted and over_budget removed; a response over 8,000,000 bytes fails response_too_large), and boolean group_by fields keep count order.
+
 ## [0.10.1](changelog/0.10.x/0.10.1.md) — 2026-10-25
 
 mcp-ts-core 0.13.18: query echoes render as code spans, error text in content[] escapes Markdown, invalid framework config fails startup naming the variable, and the root Agent Plugins pair ships.
