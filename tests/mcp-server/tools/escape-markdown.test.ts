@@ -69,43 +69,42 @@ const LINE_START = [
   '| a | b |',
 ];
 
-const collapse = (s: string) => s.replace(/[\r\n\t]+/g, ' ');
+/** What a reader sees for a provider string: CommonMark reads CR and CRLF as LF. */
+const lf = (s: string) => s.replace(/\r\n?/g, '\n');
 
 describe('escapeMarkdown', () => {
   describe.each([...HOSTILE, ...LINE_START])('%j', (raw) => {
-    const expected = collapse(raw);
+    const expected = lf(raw);
     const allowed = new Set(['paragraph', 'text', 'strong', 'heading', 'link']);
 
     it('reads back literally inline after a bold label', () => {
       const md = `**L:** ${escapeMarkdown(raw)}`;
       expect(nodeTypes(md).filter((t) => !allowed.has(t))).toEqual([]);
-      expect(renderedText(md)).toBe(`L: ${expected}`.trimEnd());
+      expect(renderedText(md)).toBe(`L: ${expected}`);
     });
 
     it('reads back literally at the start of a line', () => {
       const md = `heading:\n\nprev: 1\n${escapeMarkdown(raw, 'line-start')}: 5\n${escapeMarkdown(raw, 'line-start')}: 6`;
       expect(nodeTypes(md).filter((t) => !allowed.has(t))).toEqual([]);
-      const line = `${expected.trimStart()}`;
-      expect(renderedText(md)).toBe(`heading:\nprev: 1\n${line}: 5\n${line}: 6`);
+      expect(renderedText(md)).toBe(`heading:\nprev: 1\n${expected}: 5\n${expected}: 6`);
     });
 
     it('reads back literally as the first line after a blank line', () => {
       const md = `heading:\n\n${escapeMarkdown(raw, 'line-start')}: 5`;
       expect(nodeTypes(md).filter((t) => !allowed.has(t))).toEqual([]);
-      expect(renderedText(md)).toBe(`heading:\n${expected.trimStart()}: 5`);
+      expect(renderedText(md)).toBe(`heading:\n${expected}: 5`);
     });
 
     it('reads back literally as ATX heading text', () => {
       const md = `### ${escapeMarkdown(raw, 'heading')}`;
       expect(nodeTypes(md).filter((t) => !allowed.has(t))).toEqual([]);
-      expect(renderedText(md)).toBe(expected.trim());
+      expect(renderedText(md)).toBe(expected);
     });
 
-    // Callers trim inside the wrapper: `**` beside a space neither opens nor closes bold.
     it('reads back literally inside a bold wrapper', () => {
-      const md = `**${escapeMarkdown(raw.trim())}** (source)`;
+      const md = `**${escapeMarkdown(raw)}** (source)`;
       expect(nodeTypes(md).filter((t) => !allowed.has(t))).toEqual([]);
-      expect(renderedText(md)).toBe(`${collapse(raw.trim())} (source)`);
+      expect(renderedText(md)).toBe(`${expected} (source)`);
     });
   });
 
@@ -115,8 +114,16 @@ describe('escapeMarkdown', () => {
     expect(escapeMarkdown('', 'heading')).toBe('');
   });
 
-  it('collapses CR, LF, and tab into spaces', () => {
-    expect(escapeMarkdown('a\r\nb\nc\td')).toBe('a b c d');
+  it('keeps line breaks as hard breaks and tabs as tabs (gh #128)', () => {
+    expect(escapeMarkdown('a\r\nb\nc\td')).toBe('a\\\nb\\\nc\td');
+    expect(escapeMarkdown('a\rb')).toBe('a\\\nb');
+  });
+
+  it('writes a final line break, edge whitespace, and blank lines as references (gh #128)', () => {
+    expect(escapeMarkdown('a\n')).toBe('a&#10;');
+    expect(escapeMarkdown(' a\t')).toBe('&#32;a&#9;');
+    expect(escapeMarkdown('a\n\n  \nb')).toBe('a\\\n\\\n&#32;&#32;\\\nb');
+    expect(escapeMarkdown('  ', 'line-start')).toBe('&#32;&#32;');
   });
 
   it('leaves citation brackets alone when no `](` follows them', () => {
@@ -165,6 +172,81 @@ describe('escapeMarkdown', () => {
       nodeTypes(md).filter((t) => !['paragraph', 'text', 'strong', 'link'].includes(t)),
     ).toEqual([]);
     expect(renderedText(md)).toBe(values.map((v, n) => `L${n}: ${v}`).join('\n'));
+  });
+});
+
+/**
+ * Provider text with line breaks, in every slot a multi-line value can land in. The real values
+ * are measured OpenAlex strings after `provider-text.ts` normalization (gh #128).
+ */
+describe('escapeMarkdown on multi-line provider text (gh #128)', () => {
+  const MULTI_LINE = [
+    // W2611533896 abstract
+    'Implementar ayudas tecnicas en personas con discapacidad fisica de\r\nla Parroquia San Juan de Iluman del Canton Otavalo en la provincia\r\nde Imbabura en el periodo 2015-2016.',
+    // W2236131296 abstract, first two lines: a space before the break, then `=` and parentheses
+    'مفهوم شبة المضاعف m (Quasi-multiplier )على الجبر A انه ترابط معرف من AxA الي نفسها بحيث \r\nm(ax,yb)=am(x,y)b لكل من a,x,y,b تنتمي إلي A',
+    // W4206853251 raw_affiliation_strings: a blank line
+    "LCME - Laboratoire de Chimie Moléculaire et Environnement (Université Savoie Mont Blanc - LCME 73376 Le Bourget du Lac cedex\r\n\r\nA fusionné avec l'Edytem - France)",
+    // W4206853251: `[…]`, a space before a break, and a line opening with ` - `
+    "LSCE - Laboratoire des Sciences du Climat et de l'Environnement [Gif-sur-Yvette] (Bât. 12,\r\navenue de la Terrasse, \r\nF-91198 GIF-SUR-YVETTE CEDEX\r\n - France)",
+    // W4232217492: a continuation line indented by twelve spaces
+    'Aus der Rontgenabteilung (Leitung: Prof. Dr. H. Reindell) der Medizinischen Universitäts-Klinik\n            Freiburg i. Br. (Direktor: Prof. Dr. Dr. h. c. L. Heilmeyer)',
+    // W2908174118
+    'Key Laboratory of Ocean Energy Utilization and Energy Conservation of Ministry of Education,\nSchool of Energy and Power Engineering, Dalian University of Technology, Dalian 116024, China',
+    // A5149007440 display_name_alternatives
+    'Wichmann, Arthur,\n    b. 1851.',
+    // W3174182629 and W2058299847: a leading and a trailing space
+    ' Department of Physiology Tzu Chi university Hualien Taiwan',
+    'Department of Biology, Ecology and Earth Sciences (Di.B.E.S.T.), University of Calabria , Rende , Italy ',
+    // W2904215230 abstract tail: tabs
+    'Keywords\t: Early Breastfeeding Initiation, Body Temperature of Neonates\r\nReferences\t: 44 (2007 – 2017)',
+    // Constructed: what a continuation line could open, and the edges of a break.
+    'line one\n- not a list\n+ nor this\n* nor this\n# not a heading\n> not a quote\n1. not a list\n2) nor this',
+    'a\n-\tnot a list\n1.\tnor this\n\tindented by a tab',
+    'setext\n---\nand\n==\nand\n- - -',
+    'a | b\n---|---\nand\n|---|\nand\n:-',
+    'fences\n```\nx\n~~~\n<div>not html</div>',
+    '[label]: http://x.test\n[^1]: footnote',
+    'ends with a break\n',
+    '\n\nonly breaks before\n\n',
+    'a\n   \nwhitespace-only line',
+    'Learning C# #\nC:\\dir\\\nnext',
+    'see https://doi.org/10.1/x\nand www.example.com/a_b_\nnext',
+    // GFM links a `www.` after a tab, and none after the `;` of a leading reference.
+    'tab\twww.a.co/`x`\n\twww.b.co/`y`',
+    'line one\nsee https://doi.org/10.1/x here and a@b.co too',
+  ];
+
+  /** Each slot renders the Markdown a tool builds around the value `place` escapes for it. */
+  const SLOTS: [string, (place: (position: 'inline' | 'line-start') => string) => string][] = [
+    ['a **Field:** line', (e) => `**Abstract:** ${e('inline')}\n**Next:** x`],
+    ['a list item', (e) => `**Authorships:**\n- [0] raw: ${e('inline')}\n- [1] k: y`],
+    ['a bold name', (e) => `**${e('inline')}** (work)\nid | hint`],
+    ['a line-start label', (e) => `heading:\n\n${e('line-start')}: 5\nother: 6`],
+  ];
+
+  /** Block-level structure: everything but inline text, breaks, and links. */
+  const structure = (md: string) =>
+    nodeTypes(md).filter((t) => !['text', 'break', 'link'].includes(t));
+
+  describe.each(SLOTS)('in %s', (_slot, render) => {
+    it.each(MULTI_LINE)('%j reads back intact', (raw) => {
+      const md = render((position) => escapeMarkdown(raw, position));
+      const skeleton = render(() => 'VALUE');
+      expect(structure(md)).toEqual(structure(skeleton));
+      expect(nonAutolinks(md)).toEqual([]);
+      expect(renderedText(md)).toBe(renderedText(skeleton).replace('VALUE', () => lf(raw)));
+    });
+  });
+
+  // A hard break's backslash, or the reference a trailing space becomes, would join the link.
+  it('keeps a URL mid-line byte-identical, and keeps a break or space out of a URL ending a line', () => {
+    const md = `**L:** ${escapeMarkdown('see https://doi.org/10.1/x here\nhttps://a.co/y\nhttps://b.co/z \nwww.\nend')}`;
+    expect(md).toContain('see https://doi.org/10.1/x here');
+    expect(nonAutolinks(md)).toEqual([]);
+    expect(renderedText(md)).toBe(
+      'L: see https://doi.org/10.1/x here\nhttps://a.co/y\nhttps://b.co/z \nwww.\nend',
+    );
   });
 });
 
@@ -219,29 +301,27 @@ describe('escapeMarkdown on random provider text', () => {
   }
 
   const ALLOWED = new Set(['paragraph', 'heading', 'text', 'strong', 'link', 'break']);
-  /** Whitespace runs collapse and line edges trim in the rendered text; the rest must match. */
-  const words = (text: string) =>
-    text
-      .split('\n')
-      .map((line) => line.replace(/[ \u00a0]+/g, ' ').trim())
-      .join('\n');
 
   it('renders 3,000 random value triples as their literal text', () => {
     for (const [a, b, c] of randomValues(3_000)) {
+      // A heading holds one line: a multi-line name takes a labeled line, as entity records do.
+      const title = /[\r\n]/.test(a)
+        ? `### W1\n**Display Name:** ${escapeMarkdown(a)}`
+        : `### ${escapeMarkdown(a, 'heading')}`;
       const markdown = [
-        `### ${escapeMarkdown(a, 'heading')}`,
+        title,
         `**L:** ${escapeMarkdown(a)}, ${escapeMarkdown(b)}`,
-        `**${escapeMarkdown(b.trim())}** (source)`,
+        `**${escapeMarkdown(b)}** (source)`,
         `${escapeMarkdown(c, 'line-start')} (${escapeMarkdown(a)}): 5`,
         `unknown (no value; key ${escapeMarkdown(b)}, label ${escapeMarkdown(c)}): 7`,
       ].join('\n');
-      const [ca, cb, cc] = [a, b, c].map(collapse) as [string, string, string];
+      const [la, lb, lc] = [a, b, c].map(lf) as [string, string, string];
       const expected = [
-        ca,
-        `L: ${ca}, ${cb}`,
-        `${cb.trim()} (source)`,
-        `${cc} (${ca}): 5`,
-        `unknown (no value; key ${cb}, label ${cc}): 7`,
+        /[\r\n]/.test(a) ? `W1\nDisplay Name: ${la}` : la,
+        `L: ${la}, ${lb}`,
+        `${lb} (source)`,
+        `${lc} (${la}): 5`,
+        `unknown (no value; key ${lb}, label ${lc}): 7`,
       ].join('\n');
       const label = JSON.stringify([a, b, c]);
       expect(
@@ -249,8 +329,8 @@ describe('escapeMarkdown on random provider text', () => {
         label,
       ).toEqual([]);
       expect(nonAutolinks(markdown), label).toEqual([]);
-      // `****` is no bold wrapper: skip the text check when the wrapped name is blank.
-      if (cb.trim()) expect(words(renderedText(markdown)), label).toBe(words(expected));
+      // `****` is no bold wrapper: skip the text check when the wrapped name is empty.
+      if (b !== '') expect(renderedText(markdown), label).toBe(expected);
     }
   }, 60_000);
 });

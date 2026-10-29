@@ -134,7 +134,9 @@ function renderField(field: string, value: unknown, view: ArrayWindowView | unde
  * Render an OpenAlex entity record as markdown lines: a `### display_name` header,
  * the ID, then each remaining field as a labeled line. Caller joins the lines into
  * the final text block. Provider text is escaped for Markdown; field names are OpenAlex
- * schema keys and render as they are.
+ * schema keys and render as they are. A heading holds one line, so a `display_name` with a
+ * line break heads the record with the ID, as a missing one does, and takes a
+ * `**Display Name:**` line of its own.
  *
  * `windows` maps an array field returned in part to where it sits in the full array: its items
  * are numbered from `offset`, and its line says how many of `total` it shows, so a window never
@@ -145,11 +147,13 @@ export function renderEntityRecord(
   windows?: ReadonlyMap<string, ArrayWindowView>,
 ): string[] {
   const { id, display_name, ...rest } = record;
+  const multiLineName = display_name != null && /[\r\n]/.test(display_name);
   const lines = [
     '',
-    `### ${escapeMarkdown(display_name || id, 'heading')}`,
+    `### ${escapeMarkdown((!multiLineName && display_name) || id, 'heading')}`,
     `**ID:** ${escapeMarkdown(id)}`,
   ];
+  if (multiLineName) lines.push(renderField('display_name', display_name, undefined));
   for (const [field, value] of Object.entries(rest)) {
     lines.push(renderField(field, value, windows?.get(field)));
   }

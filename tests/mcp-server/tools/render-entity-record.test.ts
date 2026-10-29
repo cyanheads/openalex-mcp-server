@@ -316,17 +316,86 @@ describe('renderEntityRecord', () => {
       expect(renderedText(text).split('\n')[0]).toBe('Learning C# #');
     });
 
-    it('collapses line breaks and tabs in provider text into spaces', () => {
+    it('keeps line breaks, tabs, and edge whitespace in provider text (gh #128)', () => {
       const text = renderEntityRecord({
         id: 'W1',
-        display_name: 'Line one\n# injected heading',
-        abstract: 'para\r\n - item\n1. item\ttab',
+        display_name: ' Paper ',
+        abstract: 'para\r\n - item\n1. item\ttab\n# not a heading',
+        keywords: [{ display_name: 'one\n> not a quote' }],
       }).join('\n');
       expect(nodeTypes(text).filter((t) => t === 'heading')).toHaveLength(1);
-      expect(nodeTypes(text)).not.toContain('list');
+      expect(nodeTypes(text).filter((t) => t === 'list')).toHaveLength(1);
+      expect(nodeTypes(text)).not.toContain('blockquote');
       const rendered = renderedText(text);
-      expect(rendered.split('\n')[0]).toBe('Line one # injected heading');
-      expect(rendered).toContain('Abstract: para  - item 1. item tab');
+      expect(rendered.split('\n')[0]).toBe(' Paper ');
+      expect(rendered).toContain('Abstract: para\n - item\n1. item\ttab\n# not a heading\n');
+      expect(rendered).toContain('[0] display_name: one\n> not a quote');
+    });
+
+    it('keeps a multi-line display_name out of the heading, on a Display Name line (gh #128)', () => {
+      const lines = renderEntityRecord({
+        id: 'https://openalex.org/A5149007440',
+        display_name: 'Wichmann, Arthur,\r\n    b. 1851.',
+        works_count: 3,
+      });
+      expect(lines).toContain('### https://openalex.org/A5149007440');
+      const text = lines.join('\n');
+      expect(nodeTypes(text).filter((t) => t === 'heading')).toHaveLength(1);
+      expect(renderedText(text)).toBe(
+        'https://openalex.org/A5149007440\nID: https://openalex.org/A5149007440\nDisplay Name: Wichmann, Arthur,\n    b. 1851.\nWorks Count: 3',
+      );
+    });
+  });
+
+  /**
+   * Live OpenAlex values (2026-10-28) after `provider-text.ts` normalization: content[] reads
+   * back what structuredContent holds, CR and CRLF as LF (gh #128).
+   */
+  describe('measured multi-line provider text (gh #128)', () => {
+    const W3082917150_ABSTRACT =
+      'PO Puspa Jaya merupakan usaha dibidang transportasi khusunya pada transportasi BUS. Sistem pemesanan tiket PO Puspa Jaya yang sedang berjalan pada perusahaan ini sudah ada tetapi masih terdapat kekurangan-kekurangan seperti belum menerapkan sistem secara terkomputerisasi dan hanya dapat melakukan pemesanan pada loket penjualan tiket yang ada di terminal BUS, cakupan jangkauan yang tidak terlalu luas, pelanggan harus datang ke terminal BUS PO Puspa Jaya dan melakukan pemesanan pada loket yang disediakan PO Puspa Jaya. Tujuan penelitian ini adalah merancang sistem informasi pemesanan tiket PO Puspa Jaya.\r\n\r\nMetode pengembangan sistem yang digunakan dalam membagun sistem informasi tiket PO Puspa Jaya dengan metode Prototype yang diharapkan dapat membantu dalam proses membangun sistem informasi ini. Metode pengumpulan data menggunakan metode observasi (observation) dan (interview). Alat yang dipakai untuk memodelkan sistem dengan penggambaran aktor, dan Unified Modeling Language (UML). Adapun perangkat lunak yang digunakan untuk perancangan dan implementasi program aplikasi web menggunakan appserv sebagai webserver, MySQL sebagai database dan Macromedia Dreamweaver 8 sebagai editor penulisan code PHP dan HTML.\r\n\r\nHasil pengembangan perancangan aplikasi pemesanan tiket PO Puspa Jaya dapat menampilkan informasi harga, tujuan, ketersedian kursi, kontak, hingga pemesanan tiket.';
+    const W2904215230_ABSTRACT =
+      'The risk of hypothermia in neonates is four times higher than adult. It is possible since neonates’ body cannot perform the proper body heat production yet. The solution of hypothermia is by skin to skin contact with the mother for the first an hour after the delivery process. This research was aimed to find out the influence of early breastfeeding initiation toward body temperature change. It was quasi experimental research with pretest-posttest nonequivalent control group design. The neonates at recovery room of Kendal Islamic Hospital were the population of the research. For the sample, 26 neonates were taken as sample using purposive sampling. Paired T-test and independent samples T-test were used as the data analysis method. The average body temperature before early breast feeding initiation in intervention group was 36.2°C and after the initiation was 36.9°C. Meanwhile in control group, the average body temperature before the initiation was 36.3°C and 36.7°C after the initiation. There was influence of early breast feeding initiation toward neonatal body temperature change with p value 0.000 < α 0.05. The early breastfeeding initiation in intervention group was proven to be significant in improving body temperature of neonates. Mother’s chest temperature is able to raise 1°C from the delivery process. When the baby’s temperature drops, mother’s skin temperature raises up to 2°C to warm the baby through skin to skin contact or the conduction process. It is expected for the nurse to allow the longer early breastfeeding initiation, not only in the recovery room but also in the inpatient room for the first two hours to stabilize the body temperature of neonates.\r\n\r\nKeywords\t: Early Breastfeeding Initiation, Body Temperature of Neonates\r\nReferences\t: 44 (2007 – 2017)';
+    const W2908174118_AFFILIATIONS = [
+      'Key Laboratory of Ocean Energy Utilization and Energy Conservation of Ministry of Education,\nSchool of Energy and Power Engineering, Dalian University of Technology, Dalian 116024, China',
+      'Key Laboratory of Ocean Energy Utilization and Energy Conservation of the Ministry of\nEducation, Dalian University of Technology, Dalian, 116024, Liaoning, P.R. China; School of Energy and Power Engineering, Dalian University of Technology, Dalian, 116024,\nLiaoning, P.R. China',
+      'School of Energy and Power Engineering, Dalian University of Technology, Dalian, 116024,\nLiaoning, P.R. China',
+    ];
+    const lf = (s: string) => s.replace(/\r\n?/g, '\n');
+
+    it.each([
+      ['W3082917150', W3082917150_ABSTRACT],
+      ['W2904215230', W2904215230_ABSTRACT],
+    ])('reads the %s abstract back line for line', (id, abstract) => {
+      const text = renderEntityRecord({ id, display_name: 'Paper', abstract }).join('\n');
+      expect(nodeTypes(text).filter((t) => !['text', 'break'].includes(t))).toEqual([
+        'heading',
+        'paragraph',
+        'strong',
+        'strong',
+      ]);
+      expect(renderedText(text)).toBe(`Paper\nID: ${id}\nAbstract: ${lf(abstract)}`);
+    });
+
+    it('reads the W2908174118 raw_affiliation_strings back in their list items', () => {
+      const text = renderEntityRecord({
+        id: 'W2908174118',
+        display_name: 'Paper',
+        authorships: [
+          { author_position: 'first', raw_affiliation_strings: W2908174118_AFFILIATIONS },
+          { author_position: 'last', raw_affiliation_strings: [W2908174118_AFFILIATIONS[2]] },
+        ],
+      }).join('\n');
+      expect(nodeTypes(text).filter((t) => t === 'listItem')).toHaveLength(2);
+      expect(renderedText(text)).toBe(
+        [
+          'Paper',
+          'ID: W2908174118',
+          'Authorships:',
+          `[0] author_position: first, raw_affiliation_strings: ${W2908174118_AFFILIATIONS.join(', ')}`,
+          `[1] author_position: last, raw_affiliation_strings: ${W2908174118_AFFILIATIONS[2]}`,
+        ].join('\n'),
+      );
     });
   });
 

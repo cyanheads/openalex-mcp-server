@@ -3,21 +3,24 @@
  * that interpolates OpenAlex text routes it through `escapeMarkdown`, so the surfaces cannot
  * drift. Escapes use backslashes, never HTML entities, and cover only what a CommonMark + GFM
  * renderer would read as structure; a URL that GFM links cleanly renders byte-identical, as the
- * autolink it is. `structuredContent` never passes through here — it carries the plain text.
+ * autolink it is. Line breaks, tabs, and edge whitespace read back as written. `structuredContent`
+ * never passes through here — it carries the plain text.
  * @module mcp-server/tools/escape-markdown
  */
 
 import { isNamedCharacterReference } from '@/services/openalex/provider-text.js';
 
 /**
- * Where the text lands. `inline` is mid-line (after a label, inside bold, in a list item);
- * `line-start` begins a line, where block syntax (`#`, `- `, `1. `, `>`, `[label]:`) applies;
- * `heading` follows `### `, where a trailing `#` run would close the heading.
+ * Where the text's first line lands. `inline` is mid-line (after a label, inside bold, in a list
+ * item); `line-start` begins a line, where block syntax (`#`, `- `, `1. `, `>`, `[label]:`, a
+ * setext underline, a table delimiter row) applies; `heading` follows `### `, where a trailing `#`
+ * run would close the heading. Every later line begins a line. A heading holds one line, so a
+ * value with a line break never takes the `heading` position.
  */
 export type MarkdownPosition = 'inline' | 'line-start' | 'heading';
 
-/** Line breaks and tabs would start new blocks or indent code; every position is one line. */
-const LINE_BREAKS = /[\r\n\t]+/g;
+/** CR and CRLF are line endings to CommonMark, read back as LF. */
+const LINE_ENDING = /\r\n?/g;
 
 const ASCII_ALPHA = /[A-Za-z]/;
 const ASCII_ALPHANUMERIC = /[A-Za-z\d]/;
@@ -31,8 +34,21 @@ const TAG_START = /[A-Za-z/!?]/;
  * spec's domain rule, which only costs a spare backslash.
  */
 const EMAIL_AUTOLINK = /<[\w.!#$%&'*+/=?^`{|}~-]+@[a-zA-Z\d][a-zA-Z\d.-]*>/y;
-/** An ordered-list marker: up to nine digits, `.` or `)`, then a space or the end. */
-const ORDERED_LIST_MARKER = /^\d{1,9}[.)](?: |$)/;
+/** A bullet-list marker: `-` or `+`, then a space, a tab, or the end. */
+const BULLET_MARKER = /^[-+](?:[ \t]|$)/;
+/** An ordered-list marker: up to nine digits, `.` or `)`, then a space, a tab, or the end. */
+const ORDERED_LIST_MARKER = /^\d{1,9}[.)](?:[ \t]|$)/;
+/**
+ * A line a paragraph's next line would turn into a setext heading or a GFM table: a `=` or `-`
+ * underline, a thematic break of `-`, or a delimiter row (`|---|`, `---|---`, `:-`). Looser than
+ * the delimiter-row grammar, which only costs a spare backslash.
+ */
+const UNDERLINE_OR_DELIMITER_ROW = /^(?:=+|[|: \t]*-[-|: \t]*)$/;
+/**
+ * Whitespace a paragraph strips from a line's edges or a table cell trims — every Unicode
+ * whitespace character but U+000B, whose numeric reference markdown-it decodes as U+FFFD.
+ */
+const EDGE_WHITESPACE = /[^\S\v]/;
 /** Character references CommonMark decodes; the longest WHATWG name is 31 characters. */
 const NUMERIC_REFERENCE = /&#(?:\d{1,7}|[xX][0-9a-fA-F]{1,6});/y;
 const NAMED_REFERENCE = /&([A-Za-z][A-Za-z0-9]{0,31});/y;
@@ -67,7 +83,7 @@ const PATH_TRAIL_CANDIDATES: ReadonlySet<string> = new Set([
   ']',
 ]);
 /** Characters a `www.` literal may follow; a protocol literal may follow anything but a letter. */
-const WWW_PREVIOUS: ReadonlySet<string> = new Set(['(', '*', '_', '[', ']', '~', ' ']);
+const WWW_PREVIOUS: ReadonlySet<string> = new Set(['(', '*', '_', '[', ']', '~', ' ', '\t']);
 /**
  * Trailing punctuation a link leaves unescaped — escaped, the backslash would join the link. It
  * is inert when it holds no `&name;` a renderer would decode and no `*`, and any `_` or `~` forms
@@ -163,17 +179,19 @@ function pathEnd(s: string, start: number, trail: Int32Array): number {
 
 /**
  * Where a GFM autolink literal could begin at `i`: the index of the `:` or `.` whose escape
- * keeps it from linking, or -1 when no literal can start here.
+ * keeps it from linking, or -1 when no literal can start here. A `www.` ending the text links
+ * only with a hard break or reference after it.
  */
-function autolinkPrefixIndex(s: string, i: number): number {
-  const previous = s[i - 1];
+function autolinkPrefixIndex(s: string, i: number, edges: LineEdges): number {
+  // GFM reads a reference before the text as its `;`, which no `www.` literal may follow.
+  const previous = i > 0 ? s[i - 1] : edges.referenceBefore ? ';' : undefined;
   const rest = s.slice(i, i + 8);
   if (HTTP_PREFIX.test(rest) && (previous === undefined || !ASCII_ALPHA.test(previous))) {
     return rest.indexOf(':') + i;
   }
   if (
     WWW_PREFIX.test(rest) &&
-    s.length > i + 4 &&
+    (s.length > i + 4 || edges.joinedAfter) &&
     (previous === undefined || WWW_PREVIOUS.has(previous))
   ) {
     return i + 3;
@@ -265,13 +283,20 @@ function closingHashIndex(text: string): number {
   return start === 0 || text[start - 1] === ' ' ? start : -1;
 }
 
-/** Index of the character to escape so the text cannot open a block at the start of a line. */
+/** Index of the character to escape so the text cannot open a block at the start of its line. */
 function blockMarkerIndex(text: string): number {
   const first = text[0];
   if (first === '#' || first === '>' || first === '[') return 0;
-  if ((first === '-' || first === '+') && (text.length === 1 || text[1] === ' ')) return 0;
+  if (BULLET_MARKER.test(text) || UNDERLINE_OR_DELIMITER_ROW.test(text)) return 0;
   const ordered = ORDERED_LIST_MARKER.exec(text);
   return ordered ? ordered[0].trimEnd().length - 1 : -1;
+}
+
+/** Each whitespace character as its decimal numeric reference (`&#32;`, `&#9;`, `&#160;`). */
+function toReferences(whitespace: string): string {
+  let out = '';
+  for (const ch of whitespace) out += `&#${ch.codePointAt(0)};`;
+  return out;
 }
 
 /**
@@ -279,23 +304,77 @@ function blockMarkerIndex(text: string): number {
  *
  * Escaped everywhere: `*`, backticks, `~` (GFM strikethrough), `<` before a letter, `/`, `!`, or
  * `?`, `_` unless it sits between two letters or digits, `&` when it starts a character reference
- * a renderer would decode, a backslash before punctuation or at the end, a `<` that opens an
- * email autolink, and any `[` ahead of a `](` pair (a link needs it to open its label) or never
- * closed. Closed citation brackets with no `](` after them stay as they are. At a line start,
- * also the block markers; in a heading, a trailing `#` run. Line breaks and tabs collapse to a
- * space.
+ * a renderer would decode, a backslash before punctuation or at the end of a line, a `<` that
+ * opens an email autolink, and any `[` ahead of a `](` pair on its line (a link needs it to open
+ * its label) or that the line never closes. Closed citation brackets with no `](` after them stay
+ * as they are. At a line start, also the block markers; in a heading, a trailing `#` run.
+ *
+ * Line by line, the way `escapeMarkdownInline` from `@cyanheads/mcp-ts-core/utils` does it: a
+ * line break becomes a hard break (`\` before it), so the value stays in its paragraph, list
+ * item, or bold span, and every line after the first is escaped as a line start; a final line
+ * break becomes `&#10;`, where a hard break cannot stand; a line's leading and trailing
+ * whitespace becomes numeric references, which a paragraph cannot strip; tabs inside a line stay
+ * tabs. CR and CRLF read back as LF.
  *
  * A span GFM links as an autolink literal passes through untouched. When it cannot — trailing
  * punctuation that needs an escape would join the link, an open `[` or an email literal holds
- * it, or GFM would not link it at all — the `:` or `.` of its prefix is escaped instead, which
- * reads the same but links nothing in any renderer, and the span is escaped like any other text.
+ * it, a hard break or edge whitespace reference right after it would join it, or GFM would not
+ * link it at all — the `:` or `.` of its prefix is escaped instead, and the span is escaped like
+ * any other text. A renderer that matches literals while tokenizing (micromark's HTML output)
+ * then links nothing there; remark, whose `mdast-util-gfm-autolink-literal` matches over the
+ * text after escapes are removed, still links it, with the URL itself as the link text. Either
+ * way the span reads back as written and no link shows text other than its address. (The
+ * framework escaper backslashes characters inside such a link, cyanheads/mcp-ts-core#801, so
+ * this one keeps its own autolink handling.)
  */
 export function escapeMarkdown(text: string, position: MarkdownPosition = 'inline'): string {
-  let s = text.replace(LINE_BREAKS, ' ');
-  if (position === 'line-start') s = s.trimStart();
+  const lines = text.replace(LINE_ENDING, '\n').split('\n');
+  let out = escapeLine(lines[0] as string, position, lines.length > 1);
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const last = i === lines.length - 1;
+    out += last && line === '' ? '&#10;' : `\\\n${escapeLine(line, 'line-start', !last)}`;
+  }
+  return out;
+}
 
-  const blockMarker = position === 'line-start' ? blockMarkerIndex(s) : -1;
-  const closingHash = position === 'heading' ? closingHashIndex(s) : -1;
+/** What surrounds the text of one line once its edge whitespace is split off. */
+interface LineEdges {
+  /** It opens a line, so block markers apply: nothing precedes it. */
+  blockStart: boolean;
+  /** It ends an ATX heading, so a trailing `#` run applies: nothing follows it. */
+  headingEnd: boolean;
+  /** A whitespace reference or line break follows it; either joins an autolink ending it. */
+  joinedAfter: boolean;
+  /** A whitespace reference precedes it. */
+  referenceBefore: boolean;
+}
+
+/**
+ * One line of `escapeMarkdown`: its edge whitespace as references around the escaped rest.
+ * `followed` says a line break comes after it, written as a hard break or `&#10;`.
+ */
+function escapeLine(line: string, position: MarkdownPosition, followed: boolean): string {
+  let start = 0;
+  while (start < line.length && EDGE_WHITESPACE.test(line[start] as string)) start++;
+  if (start === line.length) return toReferences(line);
+  let end = line.length;
+  while (EDGE_WHITESPACE.test(line[end - 1] as string)) end--;
+  const lead = line.slice(0, start);
+  const trail = line.slice(end);
+  const core = escapeText(line.slice(start, end), {
+    blockStart: position === 'line-start' && lead === '',
+    headingEnd: position === 'heading' && trail === '',
+    referenceBefore: lead !== '',
+    joinedAfter: followed || trail !== '',
+  });
+  return `${toReferences(lead)}${core}${toReferences(trail)}`;
+}
+
+/** Escape the text of one line, which holds no edge whitespace. */
+function escapeText(s: string, edges: LineEdges): string {
+  const blockMarker = edges.blockStart ? blockMarkerIndex(s) : -1;
+  const closingHash = edges.headingEnd ? closingHashIndex(s) : -1;
   const brackets = escapedBrackets(s, blockMarker);
   let trail: Int32Array | undefined;
   let emails: [number, number][] | undefined;
@@ -305,7 +384,8 @@ export function escapeMarkdown(text: string, position: MarkdownPosition = 'inlin
   /**
    * Whether the autolink literal ending at `end`, with its trailing punctuation up to `trailEnd`,
    * renders as exactly those characters: no open `[` before it, inert trailing punctuation, and
-   * no escape needed on the character past it, whose backslash would join the link.
+   * no escape needed on the character past it, whose backslash would join the link — nor, at the
+   * end of the text, a hard break or reference after it.
    */
   const linksCleanly = (end: number, trailEnd: number): boolean => {
     if (openBrackets > 0) return false;
@@ -313,6 +393,7 @@ export function escapeMarkdown(text: string, position: MarkdownPosition = 'inlin
     if (!INERT_TRAIL.test(trailing)) return false;
     if (/^[_~]/.test(trailing) && !ASCII_ALPHANUMERIC.test(s[end - 1] as string)) return false;
     const after = s[trailEnd];
+    if (after === undefined) return !edges.joinedAfter;
     if (after === '<') return !opensTagOrAutolink(s, trailEnd);
     return after !== '[' || !brackets.has(trailEnd);
   };
@@ -328,7 +409,7 @@ export function escapeMarkdown(text: string, position: MarkdownPosition = 'inlin
     const next = s[i + 1];
 
     if (ch === 'h' || ch === 'H' || ch === 'w' || ch === 'W') {
-      const prefix = autolinkPrefixIndex(s, i);
+      const prefix = autolinkPrefixIndex(s, i, edges);
       if (prefix !== -1) {
         trail ??= trailEnds(s);
         emails ??= emailLiteralSpans(s);
