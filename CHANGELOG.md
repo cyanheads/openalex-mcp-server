@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.11.1](changelog/0.11.x/0.11.1.md) — 2026-11-11
+
+Resolves arXiv IDs and arXiv URLs as work identifiers, accepts >=, <=, and .. on numeric filters, repairs JSON-native filters records and select strings (each with an off switch), refuses reversed numeric ranges, and logs per-response cost. mcp-ts-core ^0.13.22.
+
 ## [0.11.0](changelog/0.11.x/0.11.0.md) — 2026-10-28 · ⚠️ Breaking
 
 Adds the awards entity, seeded sample paging up to 10,000 records, and the openalex-guide skill. Pages are no longer cut to a byte budget (omitted and over_budget removed; a response over 8,000,000 bytes fails response_too_large), and boolean group_by fields keep count order.
