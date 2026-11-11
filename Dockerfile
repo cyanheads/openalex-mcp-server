@@ -163,6 +163,8 @@ ENV MCP_HTTP_HOST="0.0.0.0"
 ENV MCP_TRANSPORT_TYPE="http"
 ENV MCP_SESSION_MODE="stateless"
 ENV MCP_LOG_LEVEL="info"
+# Each 2xx upstream response writes one `OpenAlex response metrics` record under a constant message; the framework's config docs recommend 0 for that case.
+ENV MCP_LOG_RATE_LIMIT_THRESHOLD=0
 ENV LOGS_DIR="/var/log/openalex-mcp-server"
 
 # Expose the port the server listens on
