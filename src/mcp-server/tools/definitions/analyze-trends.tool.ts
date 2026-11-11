@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
+import { discloseFilterRepairs, filtersInput } from '@/mcp-server/tools/filters-input.js';
 import { clampPageSize, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import { joinNotices } from '@/mcp-server/tools/record-page.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
@@ -103,6 +104,14 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       thrownBy: 'service',
     },
     {
+      reason: 'invalid_range_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A numeric filter (publication_year, cited_by_count, fwci, and the other count, year, and score fields) holds a range OpenAlex cannot read: a negative bound, a reversed range (high bound first), a "!" before a comparison or an open range, a bound that is not a plain decimal, or two comparisons ANDed in one value.',
+      recovery:
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'invalid_country_code',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A country filter (a key ending in country_code, country_codes, or countries) holds a segment that cannot be a country code, such as a misspelled name, an unassigned number, "unknown", or two codes joined by a space ("DE US").',
@@ -159,6 +168,22 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       thrownBy: 'service',
     },
     {
+      reason: 'upstream_wildcard_requires_exact',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * or ? wildcard in a stemmed works .search filter that has a .search.exact form (HTTP 400).',
+      recovery:
+        'Use the `.search.exact` key the message names in place of the `.search` filter (title.search → title.search.exact), or remove a `*` that is part of the text rather than a wildcard.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_wildcard_prefix_too_short',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * wildcard with fewer than three characters before it in a .search filter value (HTTP 400).',
+      recovery:
+        'Put at least three characters before the `*` in the filter value (micro*), or remove a `*` that is part of a name or title such as "A* search".',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_validation_failed',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
@@ -176,7 +201,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       thrownBy: 'service',
     },
   ],
-  inputAliases: { filter: 'filters' },
+  inputAliases: { filter: 'filters', entity: 'entity_type', limit: 'per_page' },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Entity type to aggregate.'),
     group_by: z
@@ -185,11 +210,10 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .describe(
         'Field to group by. Works examples: "publication_year", "type", "oa_status", "primary_topic.field.id", "authorships.institutions.country_code", "is_retracted". The native ":include_unknown" suffix also enables include_unknown, even when the boolean is false; passing both adds the suffix once. OpenAlex builds authorships.countries groups from only the first 100 authorships of each work; authorships.institutions.country_code counts every authorship. Authors: "last_known_institutions.country_code", "has_orcid". Sources: "type", "is_oa", "country_code". Awards: "start_year", "funder.id", "funding_type" — groups count awards and do not sum amount_usd. Not all fields support group_by — call openalex_describe_fields(entity_type, "group_by") for the groupable set.',
       ),
-    filters: z
-      .record(z.string(), z.string())
+    filters: filtersInput({ nativeString: false })
       .optional()
       .describe(
-        'Filter record object, using the same value syntax as openalex_search_entities; native string input is unavailable here. Narrows the population before aggregation. Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare \'search\' filter key. Example: group works by year filtered to a specific topic.',
+        'Filter record object, using the same value syntax as openalex_search_entities; native string input is unavailable here. Narrows the population before aggregation. On numeric fields, `>=N`, `<=N`, `a..b`, `a..`, and `..b` are inclusive ranges, sent as OpenAlex\'s hyphen ranges (`N-`, `-N`, `a-b`); a negative bound, a reversed range, or a `!` before a comparison or an open range is rejected. Boolean values, non-negative numbers, nested objects (`{"authorships":{"author":{"id":"A1"}}}` reads as `authorships.author.id`), and a key wrapped in quotes are read as string values under dotted keys and disclosed in `notice`, except that a whole number at the top level is sent as its decimal text without a notice. null, arrays, empty objects, negative or exponent numbers, and two keys naming one field are rejected. Country fields take ISO 3166-1 alpha-2 codes ("DE") and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, awards.funder_display_name, geo.city, raw_affiliation_strings) matches as one phrase ("National Science Foundation"; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. For full-text within filters, use abstract.search, title.search, or default.search — there is no bare \'search\' filter key. Example: group works by year filtered to a specific topic.',
       ),
     include_unknown: z
       .boolean()
@@ -271,7 +295,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when per_page was clamped (requested and applied sizes), on every effective key-order call (upstream wrap warning and stopping conditions), when a first call returns no groups (recovery suggestions), when a cursor continuation returns none because the traversal is already finished, when a count-order page is full and more groups likely exist (truncation signal with narrowing advice), or when works are grouped by authorships.countries, which OpenAlex counts from only the first 100 authorships of each work. Absent otherwise.',
+        'Guidance notice. Set when per_page was clamped (requested and applied sizes), when the filters record was normalized (booleans, numbers, nested objects, or quoted keys; it names the keys), on every effective key-order call (upstream wrap warning and stopping conditions), when a first call returns no groups (recovery suggestions), when a cursor continuation returns none because the traversal is already finished, when a count-order page is full and more groups likely exist (truncation signal with narrowing advice), or when works are grouped by authorships.countries, which OpenAlex counts from only the first 100 authorships of each work. Absent otherwise.',
       ),
     budget: z
       .object({
@@ -303,7 +327,10 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     budget: { render: renderBudgetTrailer },
   },
 
-  async handler(input, ctx) {
+  async handler(parsedInput, ctx) {
+    const { filters: normalized, ...rest } = parsedInput;
+    const input = { ...rest, filters: normalized?.value };
+    const filterRepairs = discloseFilterRepairs(normalized, 'openalex_analyze_trends', ctx);
     const pageSize = clampPageSize(input.per_page, 200, 'openalex_analyze_trends', ctx);
     const service = getOpenAlexService();
     const result = await service.analyze(
@@ -334,6 +361,7 @@ export const analyzeTrendsTool = tool('openalex_analyze_trends', {
     // `notice` is last-wins, so every sentence is collected and set once.
     const notices: string[] = [];
     if (pageSize.notice) notices.push(pageSize.notice);
+    if (filterRepairs) notices.push(filterRepairs);
 
     // An empty page on a `cursor` continuation means the key-ascending traversal already
     // enumerated every group, so there is nothing left to remove or regroup. On a first call

@@ -19,7 +19,12 @@ const mockResolveIdentifier = vi.fn<() => Promise<AutocompleteResult>>();
 
 /** A keyless server, for the cases that run the real service against a routed `fetch`. */
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: () => ({ apiKey: '', baseUrl: 'https://api.openalex.org', mailto: '' }),
+  getServerConfig: () => ({
+    apiKey: '',
+    baseUrl: 'https://api.openalex.org',
+    mailto: '',
+    filterRecordRepair: true,
+  }),
 }));
 
 const jsonResponse = (body: unknown, status = 200) =>
@@ -189,6 +194,111 @@ describe('resolveNameTool', () => {
       expect(query).not.toHaveProperty('maxLength');
       expect(query).toMatchObject({ type: 'string', minLength: 1 });
       expect(resolveNameTool.input.parse({ query: 'a'.repeat(5000) }).query).toHaveLength(5000);
+    });
+  });
+
+  /**
+   * A wildcard OpenAlex refuses in a `.search` filter reaches the caller under its own reason
+   * with this tool's recovery, through the real service against a verbatim upstream body
+   * (2026-11-10). The classification table lives in the service suite. (gh #134)
+   */
+  describe('wildcard 400s through the real service (gh #134)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    const REQUIRES_EXACT =
+      'Wildcards (* or ?) require the exact (no-stem) field. "title.search" is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use "title.search.exact" instead, e.g. title.search.exact:microplastic*.';
+    const PREFIX_TOO_SHORT =
+      'A * wildcard needs at least 3 leading characters: "G*". Add characters before the *, e.g. abc*.';
+
+    it.each([
+      [
+        'upstream_wildcard_requires_exact',
+        'works',
+        'title.search',
+        'microplastic*',
+        REQUIRES_EXACT,
+      ],
+      [
+        'upstream_wildcard_prefix_too_short',
+        'authors',
+        'display_name.search',
+        'G*',
+        PREFIX_TOO_SHORT,
+      ],
+    ] as const)(
+      '%s carries its declared recovery on both surfaces',
+      async (reason, entityType, key, value, message) => {
+        const declared = resolveNameTool.errors?.find((e) => e.reason === reason);
+        expect(declared, `${reason} missing from the contract`).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          thrownBy: 'service',
+        });
+        const { requests } = await routeToRealService((url) =>
+          url.pathname === `/autocomplete/${entityType}`
+            ? jsonResponse({ error: 'Invalid query parameters error.', message }, 400)
+            : undefined,
+        );
+
+        const result = await runToolContract(resolveNameTool, {
+          entity_type: entityType,
+          query: 'karst',
+          filters: { [key]: value },
+        });
+
+        expect(requests()).toHaveLength(1);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.InvalidParams,
+            message,
+            data: { reason, upstreamMessage: message, recovery: { hint: declared?.recovery } },
+          },
+        });
+        const text = renderedText(contentText(result));
+        expect(text).toContain(message);
+        expect(text).toContain(`Recovery: ${declared?.recovery}`);
+        expect(text).toContain(reason);
+      },
+    );
+  });
+
+  /**
+   * An unknown filter key on a typed autocomplete gets the same ranked field suggestions the
+   * list tools give, ranked against the entity type after `/autocomplete/`, through the real
+   * service against an upstream body cut at the framework's 500-byte capture. (gh #139)
+   */
+  describe('field suggestions on a rejected autocomplete filter key (gh #139)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('suggests the authors filter fields and keeps the declared recovery', async () => {
+      const message = `institutions.id is not a valid field. Valid fields are underscore or hyphenated versions of: ${'affiliations.institution.country_code, '.repeat(20)}x_concepts.id`;
+      await routeToRealService((url) =>
+        url.pathname === '/autocomplete/authors'
+          ? jsonResponse({ error: 'Invalid query parameters error.', message }, 400)
+          : undefined,
+      );
+      const declared = resolveNameTool.errors?.find((e) => e.reason === 'upstream_invalid_params');
+
+      const result = await runToolContract(resolveNameTool, {
+        entity_type: 'authors',
+        query: 'Hinton',
+        filters: { 'institutions.id': 'I185261750' },
+      });
+
+      const { error } = result.structuredContent as {
+        error: { message: string; data: Record<string, unknown> };
+      };
+      expect(error.message).toMatch(
+        /^institutions\.id is not a valid field\. Did you mean: last_known_institutions\.id\b.*\? Browse all with openalex_describe_fields/,
+      );
+      expect(error.message).not.toContain('list of valid fields omitted');
+      expect(error.data).toMatchObject({
+        reason: 'upstream_invalid_params',
+        upstreamMessage: expect.stringContaining('Valid fields are'),
+        recovery: { hint: declared?.recovery },
+      });
+      const text = renderedText(contentText(result));
+      expect(text).toContain('Did you mean: last_known_institutions.id');
+      expect(text).toContain(`Recovery: ${declared?.recovery}`);
     });
   });
 
@@ -1526,10 +1636,9 @@ describe('resolveNameTool', () => {
   });
 
   /**
-   * A PMCID is still recognized and still forwarded, but OpenAlex indexes none, so it can only
-   * come back empty. The generic identifier-miss notice ("check it for a typo") is the wrong
-   * advice there — nothing about the identifier is wrong — so the PMCID case carries the
-   * conversion guidance instead, on both client surfaces.
+   * OpenAlex indexes PMCIDs, so a PMCID goes to the deterministic lookup like any other
+   * identifier, and one OpenAlex does not hold is an ordinary miss: it gets the generic
+   * identifier-miss notice, on both client surfaces.
    */
   describe('PMCID queries (gh #67)', () => {
     const pmcQueries: [label: string, query: string][] = [
@@ -1562,45 +1671,31 @@ describe('resolveNameTool', () => {
     );
 
     it.each(pmcQueries)(
-      'carries the conversion guidance on both client surfaces for %s',
+      'carries the generic identifier-miss notice on both client surfaces for %s',
       async (_label, query) => {
         mockResolveIdentifier.mockResolvedValue({ results: [] });
+        const miss = `No work in OpenAlex for PMCID ${JSON.stringify(query)}. An identifier either resolves or does not — check it for a typo, or search for the entity by name instead.`;
 
         const result = await runToolContract(resolveNameTool, { query });
 
         expect(result.isError).toBeFalsy();
-        expect(result.structuredContent).toMatchObject({
-          notice: expect.stringContaining('OpenAlex indexes no PMCIDs'),
-        });
-        const rendered = (result.content ?? [])
-          .map((block) => (block.type === 'text' ? block.text : ''))
-          .join('\n');
-        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
-        expect(rendered).toContain('PMID');
-        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
-        expect(rendered).not.toMatch(/check it for a typo/i);
+        const { notice } = result.structuredContent as { notice?: string };
+        expect(renderedText(notice ?? '')).toBe(miss);
+        expect(renderedText(contentText(result))).toContain(miss);
       },
     );
 
-    it('leaves the generic identifier-miss notice on every other scheme', async () => {
-      mockResolveIdentifier.mockResolvedValue({ results: [] });
-      const ctx = createMockContext();
-      const input = resolveNameTool.input.parse({ query: '10.1038/thisdoesnotexist999999' });
-
-      await resolveNameTool.handler(input, ctx);
-
-      const { notice } = getEnrichment(ctx);
-      expect(notice).toMatch(/check it for a typo/i);
-      expect(notice).not.toMatch(/PMCID/i);
-    });
-
-    it('no longer advertises PMCID as an identifier that resolves', () => {
-      expect(resolveNameTool.description).toMatch(/OpenAlex indexes no PMCIDs/i);
-      expect(resolveNameTool.description).toMatch(/PMID or DOI/i);
-
+    it('lists PMCID among the identifiers that resolve', () => {
+      expect(resolveNameTool.description).toContain(
+        'OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN, or arXiv ID, bare or in URL form',
+      );
       const queryDescription = resolveNameTool.input.shape.query.description ?? '';
-      expect(queryDescription).toMatch(/OpenAlex indexes no PMCIDs/i);
-      expect(queryDescription).toMatch(/PMID or DOI/i);
+      expect(queryDescription).toContain(
+        'PMCID ("PMC1234567" or a PubMed Central URL such as "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/")',
+      );
+      for (const description of [resolveNameTool.description, queryDescription]) {
+        expect(description).not.toMatch(/indexes no PMCIDs|PMID or DOI instead/i);
+      }
     });
   });
 
@@ -1780,6 +1875,45 @@ describe('resolveNameTool', () => {
     it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
       const entry = resolveNameTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
       expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /** The rewrite table lives in the service suite; these prove autocomplete reaches it. */
+    describe('numeric ranges (gh #133)', () => {
+      const RANGE_RECOVERY =
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.';
+
+      it('sends ">= 50" on cited_by_count as the hyphen range "50-"', async () => {
+        const { result, sentFilter } = await run({ cited_by_count: '>= 50' });
+        expect(result.isError).toBeFalsy();
+        expect(sentFilter()).toBe('filter=cited_by_count%3A50-');
+      });
+
+      it('refuses an exponent bound as invalid_range_in_filter_value before any request', async () => {
+        const { fetchMock, result } = await run({ cited_by_count: '>=1e3' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining('Filter "cited_by_count" value ">=1e3"'),
+            data: { reason: 'invalid_range_in_filter_value', recovery: { hint: RANGE_RECOVERY } },
+          },
+        });
+        const text = renderedText(textOf(result));
+        expect(text).toContain('Filter "cited_by_count" value ">=1e3"');
+        expect(text).toContain(RANGE_RECOVERY);
+        expect(text).toContain('invalid_range_in_filter_value');
+      });
+
+      it('declares invalid_range_in_filter_value as a service-thrown ValidationError', () => {
+        const entry = resolveNameTool.errors?.find(
+          (e) => e.reason === 'invalid_range_in_filter_value',
+        );
+        expect(entry).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          thrownBy: 'service',
+        });
+      });
     });
   });
 
@@ -2085,6 +2219,227 @@ describe('resolveNameTool', () => {
         'Wichmann, Arthur,\n    b. 1851. (author)\nhttps://openalex.org/A5149007440 | 0 citations | 3 works | Line one\n- not a list\n# not a heading',
       );
       expect(rendered).toContain(' Harvard University  (institution)');
+    });
+  });
+
+  /** Root-key aliases; the tool takes no per_page, so `limit` stays unknown. (gh #138) */
+  describe('input aliases (gh #138)', () => {
+    /** Arguments as a client sends them: untyped, so the alias keys reach the framework's parse. */
+    const call = (args: Record<string, unknown>) => runToolContract(resolveNameTool, args as never);
+
+    it('reads entity as entity_type', async () => {
+      mockAutocomplete.mockResolvedValue({ results: [] });
+      const result = await call({ entity: 'works', query: 'attention is all you need' });
+      expect(result.isError).toBeFalsy();
+      expect(mockAutocomplete).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'works', query: 'attention is all you need' }),
+        expect.anything(),
+      );
+    });
+
+    it('rejects entity beside entity_type with the alias hint', async () => {
+      const result = await call({ entity: 'works', entity_type: 'works', query: 'x' });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(
+        'entity is an alias of entity_type; send one of them, not both.',
+      );
+      expect(mockAutocomplete).not.toHaveBeenCalled();
+    });
+
+    it('still rejects limit as an unknown key', async () => {
+      const result = await call({ query: 'x', limit: 5 });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain('Unknown key limit');
+      expect(mockAutocomplete).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * An arXiv ID resolves to its work under any entity_type through the real service; these cases
+   * prove the wiring — the routing, the scheme label, and the notices on both surfaces. (gh #137)
+   */
+  describe('arXiv IDs (gh #137)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    const BUDGET = (cost: number) => ({
+      'x-ratelimit-cost-usd': String(cost),
+      'x-ratelimit-remaining-usd': '0.5',
+      'x-ratelimit-reset': '100',
+    });
+    const work = (id: string) =>
+      new Response(
+        JSON.stringify({
+          id: `https://openalex.org/${id}`,
+          display_name: 'Attention Is All You Need',
+          doi: 'https://doi.org/10.48550/arxiv.1706.03762',
+          publication_year: 2017,
+          cited_by_count: 6532,
+        }),
+        { headers: BUDGET(0) },
+      );
+    const missing = () => new Response('<!doctype html><title>404</title>', { status: 404 });
+    const landingList = (...ids: string[]) =>
+      new Response(
+        JSON.stringify({
+          meta: { count: ids.length },
+          results: ids.map((id) => ({
+            id: `https://openalex.org/${id}`,
+            locations: [
+              {
+                landing_page_url: 'http://arxiv.org/abs/2608.25542',
+                source: { id: 'https://openalex.org/S4306400194' },
+              },
+            ],
+          })),
+        }),
+        { headers: BUDGET(0.0001) },
+      );
+
+    async function call(input: { query: string; entity_type?: AutocompleteEntityType }) {
+      const result = await runToolContract(resolveNameTool, input);
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        results: { id: string }[];
+        notice?: string;
+        budget?: { costUsd: number };
+      };
+      return { structured, text: contentText(result) };
+    }
+
+    it.each([
+      ['1706.03762'],
+      ['arXiv:1706.03762'],
+      ['https://arxiv.org/abs/1706.03762'],
+      ['10.48550/arXiv.1706.03762'],
+      ['https://doi.org/10.48550/arXiv.1706.03762'],
+    ])('resolves %s to its work by the arXiv DOI, with no name search', async (query) => {
+      const { requests } = await routeToRealService((url) =>
+        url.pathname === '/works/doi:10.48550/arXiv.1706.03762' ? work('W2626778328') : undefined,
+      );
+
+      const { structured } = await call({ query });
+
+      expect(requests()).toEqual(['/works/doi:10.48550/arXiv.1706.03762']);
+      expect(structured.results).toEqual([
+        expect.objectContaining({ id: 'https://openalex.org/W2626778328', entity_type: 'work' }),
+      ]);
+      expect(structured).not.toHaveProperty('notice');
+    });
+
+    it('resolves to the work under entity_type authors with the notice a DOI gets, on both surfaces', async () => {
+      await routeToRealService((url) =>
+        url.pathname === '/works/doi:10.48550/arXiv.1706.03762' ? work('W2626778328') : undefined,
+      );
+
+      const { structured, text } = await call({ query: '1706.03762', entity_type: 'authors' });
+
+      expect(structured.results.map((r) => r.id)).toEqual(['https://openalex.org/W2626778328']);
+      const notice =
+        'Resolved "1706.03762" by arXiv ID — it identifies one work directly, so entity_type="authors" did not apply.';
+      expect(structured.notice).toBe(notice);
+      expect(text).toContain(notice);
+    });
+
+    it('joins the dropped version to the did-not-apply notice', async () => {
+      await routeToRealService((url) =>
+        url.pathname === '/works/doi:10.48550/arXiv.1706.03762' ? work('W2626778328') : undefined,
+      );
+
+      const { structured } = await call({ query: '1706.03762v5', entity_type: 'keywords' });
+
+      expect(structured.notice).toBe(
+        'Resolved "1706.03762v5" by arXiv ID — it identifies one work directly, so entity_type="keywords" did not apply. Version v5 was dropped from arXiv ID 1706.03762v5: OpenAlex keeps one work per arXiv paper, not one per version, so it was looked up as 1706.03762.',
+      );
+    });
+
+    it('discloses the billed landing-page lookup and counts it in budget', async () => {
+      const { requests } = await routeToRealService((url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') return missing();
+        if (url.pathname === '/works') return landingList('W7204606861');
+        if (url.pathname === '/works/W7204606861') return work('W7204606861');
+        return;
+      });
+
+      const { structured, text } = await call({ query: '10.48550/arXiv.2608.25542' });
+
+      expect(requests().map((r) => r.split('?')[0])).toEqual([
+        '/works/doi:10.48550/arXiv.2608.25542',
+        '/works',
+        '/works/W7204606861',
+      ]);
+      expect(structured.results.map((r) => r.id)).toEqual(['https://openalex.org/W7204606861']);
+      expect(structured.notice).toContain('found by its landing page');
+      expect(structured.budget?.costUsd).toBe(0.0001);
+      expect(text).toContain('($0.0001)');
+    });
+
+    it('names both lookups on a plain miss', async () => {
+      await routeToRealService((url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.9999.99999') return missing();
+        if (url.pathname === '/works') return landingList();
+        return;
+      });
+
+      const { structured, text } = await call({ query: '9999.99999' });
+
+      expect(structured.results).toEqual([]);
+      const notice =
+        'No work in OpenAlex for arXiv ID "9999.99999" — neither its 10.48550/arXiv DOI nor its arXiv landing page found one. Check it for a typo, or search for the work by title instead.';
+      expect(structured.notice).toBe(notice);
+      expect(text).toContain(notice);
+    });
+
+    it('lists the candidate works a tie leaves', async () => {
+      await routeToRealService((url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') return missing();
+        if (url.pathname === '/works') return landingList('W11', 'W22');
+        return;
+      });
+
+      const { structured } = await call({ query: '2608.25542' });
+
+      expect(structured.results).toEqual([]);
+      expect(structured.notice).toBe(
+        'No work in OpenAlex for arXiv ID "2608.25542" by its DOI, and 2 works hold an arXiv location at its landing page: W11, W22 — pass one as `query` to resolve it.',
+      );
+    });
+
+    it.each([
+      [
+        'an outage',
+        () => new Response(JSON.stringify({ error: 'down' }), { status: 503 }),
+        'failed upstream (reason upstream_unavailable) — call again to complete it.',
+      ],
+      [
+        'a spent budget',
+        () =>
+          new Response(
+            JSON.stringify({ error: 'Rate limit exceeded', message: 'Insufficient budget.' }),
+            { status: 429 },
+          ),
+        'was refused (reason upstream_budget_exhausted) — call again after the daily budget refills at midnight UTC.',
+      ],
+    ])('names %s on the landing-page lookup in the miss notice', async (_label, list, ending) => {
+      vi.useFakeTimers();
+      await routeToRealService((url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') return missing();
+        if (url.pathname === '/works') return list();
+        return;
+      });
+
+      const pending = runToolContract(resolveNameTool, { query: '2608.25542' });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.isError).toBeFalsy();
+      const { notice } = result.structuredContent as { notice: string };
+      expect(notice).toBe(
+        `No work in OpenAlex for arXiv ID "2608.25542" by its DOI, and the landing-page lookup that finds a work without that DOI ${ending}`,
+      );
+      expect(contentText(result)).toContain(ending);
     });
   });
 });

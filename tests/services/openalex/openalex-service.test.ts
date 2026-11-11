@@ -61,11 +61,19 @@ function budgetHeaders(values: {
   };
 }
 
-/** Payload of the service's debug metrics line, or undefined when it never fired. */
-function findMetricsLog(debug: { mock: { calls: unknown[][] } }): unknown {
-  return debug.mock.calls.find(
-    ([msg]) => typeof msg === 'string' && msg === 'OpenAlex response metrics',
-  )?.[1];
+/**
+ * Spy the framework's module `logger`, which the service writes its per-response metrics through.
+ * Returns a reader for the `extra` fields of each `OpenAlex response metrics` record so far, and
+ * of the whole context each was written with.
+ */
+async function spyMetricsRecords() {
+  const { logger } = await import('@cyanheads/mcp-ts-core/utils');
+  const info = vi.spyOn(logger, 'info');
+  const contexts = () =>
+    info.mock.calls
+      .filter(([msg]) => msg === 'OpenAlex response metrics')
+      .map(([, context]) => context as { extra?: Record<string, unknown>; requestId?: string });
+  return { contexts, records: () => contexts().map((context) => context.extra ?? {}) };
 }
 
 const mockConfig = vi.hoisted(() => ({
@@ -513,6 +521,46 @@ describe('OpenAlexService', () => {
         expect((await searchById(id)).pathname).toBe(path);
       },
     );
+  });
+
+  // --- PMCID lookups (gh #67) ---
+
+  /**
+   * OpenAlex indexes PMCIDs: `/works/pmcid:PMC1234567` answers with W1988822451, whose
+   * `ids.pmcid` holds the PubMed Central URL. Every PMCID form reaches that one path and returns
+   * the work, identifiers byte-identical; only that path answers, so any other request fails.
+   */
+  describe('PMCID lookups (gh #67)', () => {
+    const WORK = {
+      id: 'https://openalex.org/W1988822451',
+      display_name:
+        'Intravenous Contrast Medium Aggravates the Impairment of Pancreatic Microcirculation in Necrotizing Pancreatitis in the Rat',
+      publication_year: 1995,
+      ids: {
+        openalex: 'https://openalex.org/W1988822451',
+        doi: 'https://doi.org/10.1097/00000658-199503000-00007',
+        pmid: 'https://pubmed.ncbi.nlm.nih.gov/7717779',
+        pmcid: 'https://www.ncbi.nlm.nih.gov/pmc/articles/1234567',
+      },
+    };
+
+    it.each([
+      ['a bare PMCID', 'PMC1234567'],
+      ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/'],
+      ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/'],
+      ['an uppercase-scheme PMCID', 'PMCID:PMC1234567'],
+    ])('returns the work %s identifies', async (_label, id) => {
+      routeFetch({ '/works/pmcid:PMC1234567': () => jsonResponse(WORK) });
+      const service = await getService();
+
+      const result = await service.search({ entityType: 'works', id }, createMockContext());
+
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [WORK],
+      });
+    });
   });
 
   // --- Keyword identifiers: slugs, not native IDs (gh #68) ---
@@ -2704,6 +2752,245 @@ describe('OpenAlexService', () => {
   });
 
   /**
+   * OpenAlex writes a numeric range with a hyphen, both ends inclusive and either end open:
+   * `50-` is ≥ 50 and `-2022` is ≤ 2022. On a numeric key each `|` alternative written `>=N`,
+   * `<=N`, or `a..b` goes out as that range; every other alternative goes out byte-for-byte, and a
+   * form OpenAlex cannot read fails before any request. (gh #133)
+   */
+  describe('numeric ranges (gh #133)', () => {
+    async function sentFilter(filters: Record<string, string>, entityType: EntityType = 'works') {
+      const service = await getService();
+      await service.search({ entityType, filters }, createMockContext());
+      return lastFetchUrl().searchParams.get('filter');
+    }
+
+    it('pins NUMERIC_FILTER_KEYS to the catalog keys that answer ">=1" with "must be a number"', async () => {
+      const { NUMERIC_FILTER_KEYS } = await import('@/services/openalex/filter-values.js');
+      expect([...NUMERIC_FILTER_KEYS].sort()).toEqual([
+        'amount',
+        'amount_usd',
+        'apc_list.value',
+        'apc_list.value_usd',
+        'apc_paid.value',
+        'apc_paid.value_usd',
+        'apc_prices.price',
+        'apc_usd',
+        'authors_count',
+        'awards_count',
+        'citation_normalized_percentile.value',
+        'cited_by_count',
+        'cited_by_percentile_year.max',
+        'cited_by_percentile_year.min',
+        'concepts_count',
+        'countries_distinct_count',
+        'end_year',
+        'first_publication_year',
+        'funded_outputs_count',
+        'fwci',
+        'hierarchy_level',
+        'institutions_distinct_count',
+        'is_high_oa_rate_since_year',
+        'is_in_doaj_since_year',
+        'last_publication_year',
+        'locations_count',
+        'oa_flip_year',
+        'primary_location.source.summary_stats.2yr_mean_citedness',
+        'primary_location.source.summary_stats.h_index',
+        'publication_year',
+        'referenced_works_count',
+        'start_year',
+        'sub_awards_count',
+        'summary_stats.2yr_mean_citedness',
+        'summary_stats.h_index',
+        'summary_stats.i10_index',
+        'sustainable_development_goals.score',
+        'works_count',
+        'works_count_with_children',
+        'works_count_with_children_and_predecessors',
+      ]);
+    });
+
+    /** Forms OpenAlex reads today, and `>=`/`..` on keys outside the numeric set. */
+    it.each([
+      ['cited_by_count', '>49'],
+      ['cited_by_count', '<50'],
+      ['publication_year', '2020-2022'],
+      ['publication_year', '2020-'],
+      ['publication_year', '-2022'],
+      ['publication_year', '!2020'],
+      ['publication_year', '!2020-2022'],
+      ['publication_year', '> 2020'],
+      ['cited_by_count', '>1e3'],
+      ['publication_year', '2020|>2020'],
+      ['cited_by_count', '>-1'],
+      ['cited_by_count', '<0'],
+      ['cited_by_count', '!0'],
+      ['cited_by_count', '0-0'],
+      ['publication_year', ' 2020 | 2021'],
+      ['biblio.volume', '>=1'],
+      ['display_name', '1..2'],
+      ['publication_date', '>=2020-01-01'],
+      ['title.search', '2020..2022'],
+    ])('sends %s:%s byte-for-byte', async (key, value) => {
+      expect(await sentFilter({ [key]: value })).toBe(`${key}:${value}`);
+    });
+
+    it.each([
+      ['cited_by_count', '>=50', '50-'],
+      ['publication_year', '<=2022', '-2022'],
+      ['publication_year', '2020..2022', '2020-2022'],
+      ['publication_year', '2020..', '2020-'],
+      ['publication_year', '..2022', '-2022'],
+      ['publication_year', '!2020..2022', '!2020-2022'],
+      ['publication_year', '>=2020|2010', '2020-|2010'],
+      ['publication_year', '2020|>2020|<=2010', '2020|>2020|-2010'],
+      ['publication_year', ' 2020 |>=2021', ' 2020 |2021-'],
+      ['cited_by_count', '>=1.5', '1.5-'],
+      ['fwci', '>=25.2322', '25.2322-'],
+      ['fwci', '<=25.2322', '-25.2322'],
+      ['cited_by_count', '>= 50', '50-'],
+      ['publication_year', '2020 .. 2022', '2020-2022'],
+      ['publication_year', ' ! 2020 .. 2022 ', '!2020-2022'],
+      ['publication_year', '2020..2020', '2020-2020'],
+      ['cited_by_count', '007..7', '007-7'],
+      ['fwci', '1.50..1.5', '1.50-1.5'],
+      ['cited-by-count', '>=50', '50-'],
+    ])('sends %s:%s as the OpenAlex range %s', async (key, value, range) => {
+      expect(await sentFilter({ [key]: value })).toBe(`${key}:${range}`);
+    });
+
+    it('rewrites a key that is numeric on another entity type the same way', async () => {
+      expect(await sentFilter({ 'summary_stats.h_index': '>=50' }, 'authors')).toBe(
+        'summary_stats.h_index:50-',
+      );
+    });
+
+    it('ANDs an alias pair after rewriting each, in either key order', async () => {
+      expect(await sentFilter({ year: '>=2021', publication_year: '2020..2022' })).toBe(
+        'publication_year:2021-,publication_year:2020-2022',
+      );
+      expect(await sentFilter({ publication_year: '2020..2022', year: '>=2021' })).toBe(
+        'publication_year:2020-2022,publication_year:2021-',
+      );
+    });
+
+    it.each([
+      ['cited_by_count', '>=-1', 'negative bound'],
+      ['cited_by_count', '-5..5', 'negative bound'],
+      ['publication_year', '<=-2022', 'negative bound'],
+      ['publication_year', '2024..2020', 'high bound first'],
+      ['publication_year', '2024-2020', 'high bound first'],
+      ['publication_year', '!2024-2020', 'high bound first'],
+      ['fwci', '2.5..1.5', 'high bound first'],
+      ['fwci', '0.30000000000000001..0.3', 'high bound first'],
+      ['cited_by_count', '!>=50', 'negates'],
+      ['cited_by_count', '!>50', 'negates'],
+      ['cited_by_count', '!<50', 'negates'],
+      ['publication_year', '!2020..', 'negates'],
+      ['publication_year', '!..2022', 'negates'],
+      ['publication_year', '!2020-', 'negates'],
+      ['publication_year', '!-2022', 'negates'],
+      ['cited_by_count', '>=1e3', 'plain decimal'],
+      ['fwci', '>=.5', 'plain decimal'],
+      ['fwci', '>=5.', 'plain decimal'],
+      ['publication_year', '>=2020+<=2022', 'cannot AND two comparisons'],
+      ['publication_year', '..', 'plain decimal'],
+      ['publication_year', '>=', 'plain decimal'],
+      ['publication_year', '2020...2022', 'plain decimal'],
+      ['publication_year', '5>=3', 'plain decimal'],
+      ['publication_year', '">=2020"', 'plain decimal'],
+    ])('refuses %s:%s before any request (%s)', async (key, value, why) => {
+      routeFetch({});
+      const service = await getService();
+      const error = await service
+        .search({ entityType: 'works', filters: { [key]: value } }, createMockContext())
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown as { code: number; message: string; data: object },
+        );
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_range_in_filter_value', filterKey: key },
+      });
+      expect(
+        error?.message.startsWith(`Filter ${JSON.stringify(key)} value ${JSON.stringify(value)} `),
+      ).toBe(true);
+      expect(error?.message).toContain(why);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Each refusal states its own cause: only a `+` joining two terms earns the AND clause, and
+     * the `+` that signs an exponent (`1e+3`) does not.
+     */
+    it.each([
+      ['cited_by_count', '>=1e3', false],
+      ['cited_by_count', '>=1e+3', false],
+      ['fwci', '>=.5', false],
+      ['fwci', '>=5.', false],
+      ['publication_year', '..', false],
+      ['publication_year', '>=', false],
+      ['publication_year', '2020...2022', false],
+      ['publication_year', '5>=3', false],
+      ['publication_year', '>=2020+<=2022', true],
+      ['publication_year', '2020..2021+2023', true],
+      ['publication_year', '2020+>=2021', true],
+    ])('refuses %s:%s naming its own cause (AND clause: %s)', async (key, value, ands) => {
+      routeFetch({});
+      const service = await getService();
+      const error = await service
+        .search({ entityType: 'works', filters: { [key]: value } }, createMockContext())
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown as { message: string; data: object },
+        );
+      expect(error?.data).toMatchObject({ reason: 'invalid_range_in_filter_value' });
+      expect(error?.message.includes('one value cannot AND two comparisons')).toBe(ands);
+      expect(error?.message.includes('each bound is a plain decimal number')).toBe(!ands);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('names the alternative it refuses inside a "|" value', async () => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search(
+          { entityType: 'works', filters: { publication_year: '2010|2024..2020' } },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        message: expect.stringContaining(
+          'Filter "publication_year" value "2010|2024..2020" (alternative "2024..2020")',
+        ),
+        data: { reason: 'invalid_range_in_filter_value' },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['cited_by_count', '>=1,000', 'comma_in_filter_value'],
+      ['publication_year', '>=2020|2010+2011', 'mixed_and_or_in_filter_value'],
+    ])('still refuses %s:%s as %s', async (key, value, reason) => {
+      routeFetch({});
+      const service = await getService();
+      await expect(
+        service.search({ entityType: 'works', filters: { [key]: value } }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason, filterKey: key } });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    });
+
+    it('rewrites an autocomplete filter, which skips key translation', async () => {
+      routeFetch({ '/autocomplete/institutions': () => jsonResponse({ results: [] }) });
+      const service = await getService();
+      await service.autocomplete(
+        { entityType: 'institutions', query: 'MIT', filters: { works_count: '>=1000' } },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().searchParams.get('filter')).toBe('works_count:1000-');
+    });
+  });
+
+  /**
    * OpenAlex country fields hold ISO 3166-1 alpha-2 codes and `language` holds ISO 639-1 codes;
    * any other spelling still gets HTTP 200 and matches nothing (or, negated, everything). Each
    * `|`/`+` segment is trimmed and converted where the mapping is certain, a country segment that
@@ -4225,6 +4512,233 @@ describe('OpenAlexService', () => {
     });
   });
 
+  // --- Select widening and comma-joined names (gh #135) ---
+
+  describe('translateSelect widening and splitting (gh #135)', () => {
+    type Entity = Parameters<Awaited<ReturnType<typeof getService>>['search']>[0]['entityType'];
+
+    /** The `select` the list request sent for `select` on `entityType`, or null when none was. */
+    async function sentSelect(entityType: Entity, select: string[] | undefined) {
+      const service = await getService();
+      await service.search({ entityType, select }, createMockContext());
+      return lastFetchUrl().searchParams.get('select');
+    }
+
+    /**
+     * Characterization: what 0.11.0 sent for each select it accepted. A comma-free entry keeps
+     * its bytes — `[""]` still sends a trailing empty name, `" doi"` its space — so every request
+     * that worked unsplit is unchanged.
+     */
+    const curatedWorks =
+      'id,display_name,doi,publication_year,type,cited_by_count,open_access,primary_topic,primary_location,best_oa_location';
+    it.each([
+      [undefined, curatedWorks],
+      [[], curatedWorks],
+      [[''], 'id,display_name,'],
+      [['doi'], 'id,display_name,doi'],
+      [[' doi'], 'id,display_name, doi'],
+      [
+        ['year', 'authors', 'abstract'],
+        'id,display_name,publication_year,authorships,abstract_inverted_index',
+      ],
+      [['author_list'], 'id,display_name,authorships'],
+      [['doi,title'], 'id,display_name,doi,title'],
+    ])('sends works select %j as 0.11.0 did', async (select, sent) => {
+      expect(await sentSelect('works', select)).toBe(sent);
+    });
+
+    it.each(['is_oa', 'oa_status', 'oa_url', 'any_repository_has_fulltext'])(
+      'widens works %s to open_access',
+      async (leaf) => {
+        expect(await sentSelect('works', [leaf])).toBe('id,display_name,open_access');
+      },
+    );
+
+    it('sends open_access once for two leaves beside the parent itself', async () => {
+      expect(await sentSelect('works', ['is_oa', 'oa_status', 'open_access'])).toBe(
+        'id,display_name,open_access',
+      );
+    });
+
+    it.each([
+      ['works', ['primary_location.source.display_name'], 'id,display_name,primary_location'],
+      ['works', ['authorships', 'authorships.author'], 'id,display_name,authorships'],
+      ['works', ['authorships.institutions.country_code'], 'id,display_name,authorships'],
+      ['works', ['open_access.is_oa'], 'id,display_name,open_access'],
+      ['authors', ['summary_stats.h_index'], 'id,display_name,summary_stats'],
+      [
+        'authors',
+        ['last_known_institutions.country_code'],
+        'id,display_name,last_known_institutions',
+      ],
+      ['awards', ['funder.display_name'], 'id,display_name,funder'],
+    ] as const)(
+      'widens %s dotted select %j to its first segment',
+      async (entityType, select, sent) => {
+        expect(await sentSelect(entityType, [...select])).toBe(sent);
+      },
+    );
+
+    /** Fail-open: what no rule maps keeps its name, so OpenAlex's 400 names it. */
+    it.each([
+      ['works', 'summary_stats.h_index', 'works carries no summary_stats'],
+      ['works', 'foo.bar', 'no select field foo'],
+      ['works', '.doi', 'an empty first segment'],
+      ['works', 'constructor.name', 'a prototype member as first segment'],
+      ['works', '__proto__.x', 'a prototype member as first segment'],
+      ['authors', 'oa_works_count', 'authors carry no OA leaf map'],
+      ['sources', 'is_oa', 'sources project is_oa themselves'],
+      ['topics', 'h_index', 'topics carry no summary_stats'],
+      ['institutions', 'is_oa', 'the open_access map is works-only'],
+    ] as const)('passes %s %s through unchanged — %s', async (entityType, name, _why) => {
+      expect(await sentSelect(entityType, [name])).toBe(`id,display_name,${name}`);
+    });
+
+    it.each([
+      [['doi,abstract'], 'id,display_name,doi,abstract_inverted_index'],
+      [[' doi , title '], 'id,display_name,doi,title'],
+      [['doi,,title'], 'id,display_name,doi,title'],
+      [['doi,title,', ',year'], 'id,display_name,doi,title,publication_year'],
+      [['id, display_name, is_oa'], 'id,display_name,open_access'],
+      [[','], 'id,display_name'],
+      [['doi,*'], null],
+    ])('splits comma-joined select %j before translating', async (select, sent) => {
+      expect(await sentSelect('works', select)).toBe(sent);
+    });
+
+    it('reconstructs the abstract a comma-joined entry names', async () => {
+      routeFetch({
+        '/works': () =>
+          jsonResponse({
+            meta: { count: 1, per_page: 25 },
+            results: [
+              { id: 'W1', display_name: 'T', doi: 'd', abstract_inverted_index: { Hi: [0] } },
+            ],
+          }),
+      });
+      const service = await getService();
+      const result = await service.search(
+        { entityType: 'works', select: ['doi,abstract'] },
+        createMockContext(),
+      );
+      expect(result.results[0]).toEqual({ id: 'W1', display_name: 'T', doi: 'd', abstract: 'Hi' });
+    });
+
+    /**
+     * `author_list` reads the split names: named inside a comma-joined entry it is derived, and a
+     * dotted `authorships.*` name keeps `authorships` beside it, as `authorships` does.
+     */
+    it.each([
+      [['author_list', 'authorships.author'], true],
+      [['author_list,authorships.author'], true],
+      [['author_list', 'authorships'], true],
+      [['doi,author_list'], false],
+    ])('derives author_list for %j, keeping authorships: %s', async (select, keep) => {
+      const authorships = [{ author: { id: 'A1', display_name: 'Ada', orcid: null } }];
+      routeFetch({
+        '/works': () =>
+          jsonResponse({
+            meta: { count: 1, per_page: 25 },
+            results: [{ id: 'W1', display_name: 'T', authorships }],
+          }),
+      });
+      const service = await getService();
+      const result = await service.search({ entityType: 'works', select }, createMockContext());
+      expect(lastFetchUrl().searchParams.get('select')).toContain('authorships');
+      const [record] = result.results;
+      expect(record?.author_list).toEqual([{ id: 'A1', display_name: 'Ada', orcid: null }]);
+      expect(record?.authorships === undefined).toBe(!keep);
+    });
+
+    it('widens and splits on a singleton id lookup too', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        new Response(JSON.stringify({ id: 'W1', display_name: 'Test' }), { status: 200 }),
+      );
+      const service = await getService();
+      await service.search(
+        { entityType: 'works', id: 'W2626778328', select: ['is_oa,primary_location.source'] },
+        createMockContext(),
+      );
+      expect(lastFetchUrl().pathname).toBe('/works/W2626778328');
+      expect(lastFetchUrl().searchParams.get('select')).toBe(
+        'id,display_name,open_access,primary_location',
+      );
+    });
+  });
+
+  describe('reportSelect (gh #135)', () => {
+    async function report(entityType: EntityType, select: string[] | undefined) {
+      const { reportSelect } = await import('@/services/openalex/openalex-service.js');
+      return reportSelect(entityType, select);
+    }
+
+    it.each([
+      ['omitted', undefined],
+      ['empty', []],
+      ['a blank name', ['']],
+      ['plain fields', ['doi', 'title']],
+      ['renames', ['year', 'authors', 'abstract', 'author_list']],
+    ])('reports nothing for %s', async (_label, select) => {
+      expect(await report('works', select)).toEqual({ splits: [], widenings: [] });
+    });
+
+    it('reports the sources publisher rename as nothing, and its summary_stats leaf', async () => {
+      expect(await report('sources', ['publisher', 'h_index'])).toEqual({
+        splits: [],
+        widenings: [{ name: 'h_index', field: 'summary_stats' }],
+      });
+    });
+
+    it('reports each widening once, in the order named, past the first nesting level', async () => {
+      expect(
+        await report('works', [
+          'is_oa',
+          'authorships.institutions.country_code',
+          'is_oa',
+          'primary_location.source.host_organization.display_name',
+        ]),
+      ).toEqual({
+        splits: [],
+        widenings: [
+          { name: 'is_oa', field: 'open_access' },
+          { name: 'authorships.institutions.country_code', field: 'authorships' },
+          {
+            name: 'primary_location.source.host_organization.display_name',
+            field: 'primary_location',
+          },
+        ],
+      });
+    });
+
+    it('reports each split entry once with its names, and widenings inside it', async () => {
+      expect(await report('works', [' doi , is_oa ', 'doi', ' doi , is_oa ', ','])).toEqual({
+        splits: [
+          { entry: ' doi , is_oa ', names: ['doi', 'is_oa'] },
+          { entry: ',', names: [] },
+        ],
+        widenings: [{ name: 'is_oa', field: 'open_access' }],
+      });
+    });
+
+    it('reports no widening under `*`, which projects the whole record', async () => {
+      expect(await report('works', ['*', 'is_oa'])).toEqual({ splits: [], widenings: [] });
+      expect(await report('works', ['*,is_oa'])).toEqual({
+        splits: [{ entry: '*,is_oa', names: ['*', 'is_oa'] }],
+        widenings: [],
+      });
+    });
+
+    it('agrees with the request: each reported field is what the projection sent', async () => {
+      const select = ['is_oa,doi', 'authorships.author', 'summary_stats.h_index'];
+      const { widenings } = await report('works', select);
+      const service = await getService();
+      await service.search({ entityType: 'works', select }, createMockContext());
+      const sent = lastFetchUrl().searchParams.get('select')?.split(',') ?? [];
+      for (const { field } of widenings) expect(sent).toContain(field);
+      expect(sent).toContain('summary_stats.h_index');
+    });
+  });
+
   // --- Filter key translation (gh #17) ---
 
   describe('translateFilters', () => {
@@ -5609,8 +6123,30 @@ describe('OpenAlexService', () => {
 
   // --- Response metrics ---
 
-  describe('response metrics logging', () => {
-    it('logs header budget figures and db_response_time_ms from meta at debug level', async () => {
+  /**
+   * One `OpenAlex response metrics` record per billed (2xx) response, at `info`, through the
+   * framework's module `logger` — never `ctx.log`, which would also send it to the client. It is
+   * written once the response is billed, parsed or not, so a call's records sum to the `budget`
+   * it returns. It names the endpoint by route and the request by parameter names only. (gh #140)
+   */
+  describe('response metrics logging (gh #140)', () => {
+    /** Every message `ctx.log` received, at any level. */
+    function ctxLogMessages(ctx: Context): () => unknown[] {
+      const spies = (['debug', 'info', 'notice', 'warning', 'error'] as const).map((level) =>
+        vi.spyOn(ctx.log, level),
+      );
+      return () => spies.flatMap((spy) => spy.mock.calls.map(([msg]) => msg));
+    }
+
+    /** A 200 carrying the budget headers, with a body every request shape reads. */
+    function billed(cost: number, body: unknown = { meta: { count: 0 }, results: [] }) {
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: budgetHeaders({ cost, remaining: 0.5, reset: 3600 }),
+      });
+    }
+
+    it('writes header budget figures, db latency, route, and param names through the module logger', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(
           JSON.stringify({
@@ -5620,18 +6156,33 @@ describe('OpenAlexService', () => {
           { status: 200, headers: budgetHeaders({ cost: 0.0002, remaining: 0.0688, reset: 5554 }) },
         ),
       );
+      const { contexts, records } = await spyMetricsRecords();
       const service = await getService();
       const ctx = createMockContext();
-      const debug = vi.spyOn(ctx.log, 'debug');
+      const ctxMessages = ctxLogMessages(ctx);
 
-      await service.search({ entityType: 'works' }, ctx);
+      await service.search(
+        { entityType: 'works', query: 'machine learning', filters: { publication_year: '2020' } },
+        ctx,
+      );
 
-      expect(findMetricsLog(debug)).toMatchObject({
-        costUsd: 0.0002,
-        budgetRemainingUsd: 0.0688,
-        budgetResetsInSeconds: 5554,
-        dbResponseTimeMs: 42,
-      });
+      expect(records()).toEqual([
+        {
+          route: '/works',
+          params: ['search', 'filter', 'select', 'per_page', 'cursor'],
+          costUsd: 0.0002,
+          budgetRemainingUsd: 0.0688,
+          budgetResetsInSeconds: 5554,
+          dbResponseTimeMs: 42,
+        },
+      ]);
+      // The fields the service adds; the logger projects the rest of the context to its
+      // canonical correlation fields (requestId, traceId, tenantId, …).
+      const written = JSON.stringify(records());
+      expect(contexts()[0]?.requestId).toBe(ctx.requestId);
+      expect(written).not.toContain('machine learning');
+      expect(written).not.toContain('2020');
+      expect(ctxMessages()).not.toContain('OpenAlex response metrics');
     });
 
     it('logs db latency alone when the response carries no budget headers', async () => {
@@ -5641,28 +6192,237 @@ describe('OpenAlexService', () => {
           { status: 200 },
         ),
       );
+      const { records } = await spyMetricsRecords();
       const service = await getService();
-      const ctx = createMockContext();
-      const debug = vi.spyOn(ctx.log, 'debug');
 
-      await service.search({ entityType: 'works' }, ctx);
+      await service.search({ entityType: 'works' }, createMockContext());
 
-      const metrics = findMetricsLog(debug);
-      expect(metrics).toMatchObject({ dbResponseTimeMs: 42 });
-      expect(metrics).not.toHaveProperty('costUsd');
+      expect(records()).toHaveLength(1);
+      expect(records()[0]).toMatchObject({ dbResponseTimeMs: 42 });
+      expect(records()[0]).not.toHaveProperty('costUsd');
     });
 
     it('does not log metrics when neither headers nor meta carry them', async () => {
       vi.mocked(globalThis.fetch).mockResolvedValue(
         new Response(JSON.stringify({ meta: { count: 0 }, results: [] }), { status: 200 }),
       );
+      const { records } = await spyMetricsRecords();
       const service = await getService();
       const ctx = createMockContext();
-      const debug = vi.spyOn(ctx.log, 'debug');
+      const ctxMessages = ctxLogMessages(ctx);
 
       await service.search({ entityType: 'works' }, ctx);
 
-      expect(findMetricsLog(debug)).toBeUndefined();
+      expect(records()).toEqual([]);
+      expect(ctxMessages()).not.toContain('OpenAlex response metrics');
+    });
+
+    type Call = (service: Awaited<ReturnType<typeof getService>>, ctx: Context) => Promise<unknown>;
+    it.each<[string, Call, string, string, string]>([
+      [
+        'a DOI lookup',
+        (service, ctx) => service.search({ entityType: 'works', id: '10.1038/nature12373' }, ctx),
+        '/works/doi:10.1038/nature12373',
+        '/works/{id}',
+        'nature12373',
+      ],
+      [
+        'a keyword slug lookup',
+        (service, ctx) => service.search({ entityType: 'keywords', id: 'groundwater' }, ctx),
+        '/keywords/groundwater',
+        '/keywords/{id}',
+        'groundwater',
+      ],
+      [
+        'a works list',
+        (service, ctx) => service.search({ entityType: 'works', query: 'karst aquifers' }, ctx),
+        '/works',
+        '/works',
+        'karst aquifers',
+      ],
+      [
+        'a typed autocomplete',
+        (service, ctx) => service.autocomplete({ entityType: 'works', query: 'Hinton' }, ctx),
+        '/autocomplete/works',
+        '/autocomplete/works',
+        'Hinton',
+      ],
+      [
+        'a cross-entity autocomplete',
+        (service, ctx) => service.autocomplete({ query: 'Hinton' }, ctx),
+        '/autocomplete',
+        '/autocomplete',
+        'Hinton',
+      ],
+    ])(
+      'names %s by route, with no caller text on the record',
+      async (_label, call, path, route, callerText) => {
+        vi.mocked(globalThis.fetch).mockImplementation(() =>
+          Promise.resolve(
+            billed(0, {
+              id: 'https://openalex.org/W1',
+              display_name: 'Record',
+              meta: { count: 0 },
+              results: [],
+            }),
+          ),
+        );
+        const { records } = await spyMetricsRecords();
+        const service = await getService();
+
+        await call(service, createMockContext());
+
+        expect(lastFetchUrl().pathname).toBe(path);
+        expect(records()).toHaveLength(1);
+        expect(records()[0]?.route).toBe(route);
+        expect(JSON.stringify(records())).not.toContain(callerText);
+      },
+    );
+
+    it("carries the tool call's requestId and toolName on the record", async () => {
+      vi.mocked(globalThis.fetch).mockImplementation(() => Promise.resolve(billed(0.0001)));
+      const { contexts } = await spyMetricsRecords();
+      const service = await getService();
+      const ctx: Context = {
+        ...createMockContext({ requestId: 'req-140' }),
+        extra: { toolName: 'openalex_search_entities' },
+      };
+
+      await service.search({ entityType: 'works' }, ctx);
+
+      expect(contexts()).toHaveLength(1);
+      expect(contexts()[0]).toMatchObject({
+        requestId: 'req-140',
+        extra: { toolName: 'openalex_search_entities', route: '/works', costUsd: 0.0001 },
+      });
+    });
+
+    it('sums to the returned budget across the two requests a sampled search issues', async () => {
+      const responses = [billed(0.001), billed(0.0005)];
+      vi.mocked(globalThis.fetch).mockImplementation(() => {
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error('extra fetch'));
+      });
+      const { records } = await spyMetricsRecords();
+      const service = await getService();
+      const ctx = createMockContext();
+
+      await service.search({ entityType: 'works', sample: 5 }, ctx);
+
+      const logged = records().map((record) => record.costUsd as number);
+      expect(logged.sort()).toEqual([0.0005, 0.001]);
+      expect(getEnrichment(ctx).budget).toMatchObject({
+        costUsd: logged.reduce((sum, cost) => sum + cost, 0),
+      });
+    });
+
+    it('logs the billed attempt whose truncated body was retried, so the records sum to the returned cost', async () => {
+      vi.useFakeTimers();
+      const responses = [
+        new Response('{"meta": {"count": 5, "per_p', {
+          status: 200,
+          headers: budgetHeaders({ cost: 0.001, remaining: 0.069, reset: 5560 }),
+        }),
+        new Response(
+          JSON.stringify({ meta: { count: 5, per_page: 5, db_response_time_ms: 7 }, results: [] }),
+          { status: 200, headers: budgetHeaders({ cost: 0.001, remaining: 0.068, reset: 5558 }) },
+        ),
+      ];
+      vi.mocked(globalThis.fetch).mockImplementation(() => {
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error('extra fetch'));
+      });
+      const { records } = await spyMetricsRecords();
+      const service = await getService();
+      const ctx = createMockContext();
+
+      const pending = service.search({ entityType: 'works' }, ctx);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+      expect(records()).toEqual([
+        expect.not.objectContaining({ dbResponseTimeMs: expect.anything() }),
+        expect.objectContaining({ dbResponseTimeMs: 7 }),
+      ]);
+      expect(records().map((record) => record.costUsd)).toEqual([0.001, 0.001]);
+      expect(getEnrichment(ctx).budget).toMatchObject({ costUsd: 0.002 });
+    });
+
+    it.each<[string, (() => Promise<Response>)[], number]>([
+      ['a 400', [() => Promise.resolve(jsonResponse({ message: 'Invalid cursor.' }, 400))], 0],
+      [
+        'a 503 on every attempt',
+        Array.from({ length: 3 }, () => () => Promise.resolve(new Response('', { status: 503 }))),
+        0,
+      ],
+      [
+        'a 503, then a billed 200',
+        [
+          () => Promise.resolve(new Response('', { status: 503 })),
+          () => Promise.resolve(billed(0.0001)),
+        ],
+        1,
+      ],
+      [
+        'a network failure, then a billed 200',
+        [
+          () => Promise.reject(new TypeError('fetch failed')),
+          () => Promise.resolve(billed(0.0001)),
+        ],
+        1,
+      ],
+    ])('writes a record only for the 2xx response after %s', async (_label, answers, expected) => {
+      vi.useFakeTimers();
+      vi.mocked(globalThis.fetch).mockImplementation(() => {
+        const answer = answers.shift();
+        return answer ? answer() : Promise.reject(new Error('extra fetch'));
+      });
+      const { records } = await spyMetricsRecords();
+      const service = await getService();
+      const ctx = createMockContext();
+      const ctxMessages = ctxLogMessages(ctx);
+
+      const pending = service.search({ entityType: 'works' }, ctx).catch(() => undefined);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(records()).toHaveLength(expected);
+      for (const record of records()) expect(record.costUsd).toBe(0.0001);
+      expect(answers).toHaveLength(0);
+      expect(ctxMessages()).not.toContain('OpenAlex response metrics');
+    });
+  });
+
+  /**
+   * The one parse of a request path: the entity type field suggestions rank against, and the
+   * route a metrics record names. Every shape the service builds. (gh #139, #140)
+   */
+  describe('parseRequestPath (gh #139, #140)', () => {
+    it.each([
+      ['/works', 'works', '/works'],
+      ['/authors', 'authors', '/authors'],
+      ['/funders', 'funders', '/funders'],
+      ['/works/W2741809807', 'works', '/works/{id}'],
+      ['/works/doi:10.1038/nature12373', 'works', '/works/{id}'],
+      ['/works/W2741809807%23x', 'works', '/works/{id}'],
+      ['/keywords/groundwater', 'keywords', '/keywords/{id}'],
+      ['/autocomplete', undefined, '/autocomplete'],
+    ] as const)('%s reads entity type %s and route %s', async (path, entityType, route) => {
+      const { parseRequestPath } = await import('@/services/openalex/openalex-service.js');
+      expect(parseRequestPath(path)).toEqual({ entityType, route });
+    });
+
+    it('reads /autocomplete/<type> as <type> for every autocomplete entity type', async () => {
+      const { parseRequestPath } = await import('@/services/openalex/openalex-service.js');
+      const { AUTOCOMPLETE_ENTITY_TYPES } = await import('@/services/openalex/types.js');
+      expect(AUTOCOMPLETE_ENTITY_TYPES).toHaveLength(8);
+      for (const entityType of AUTOCOMPLETE_ENTITY_TYPES) {
+        expect(parseRequestPath(`/autocomplete/${entityType}`)).toEqual({
+          entityType,
+          route: `/autocomplete/${entityType}`,
+        });
+      }
     });
   });
 
@@ -6434,6 +7194,201 @@ describe('OpenAlexService', () => {
     });
 
     /**
+     * OpenAlex refuses two wildcard mistakes with HTTP 400: a `*`/`?` in stemmed works search
+     * (`query` under keyword mode, or a `.search` filter with a `.search.exact` form), and a `*`
+     * with fewer than three characters before it. Each gets its own reason, keyed on the upstream
+     * `message`, which stays the error message. Bodies are verbatim upstream responses
+     * (2026-11-10). (gh #134)
+     */
+    describe('wildcard 400s (gh #134)', () => {
+      const wildcardSearchMessage = (query: string) =>
+        `Wildcards (* or ?) require exact (no-stem) search. The default search is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use the search.exact= parameter instead (or the default.search.exact filter), e.g. search.exact=${query}.`;
+      const wildcardFilterMessage = (key: string, value: string) =>
+        `Wildcards (* or ?) require the exact (no-stem) field. "${key}" is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use "${key}.exact" instead, e.g. ${key}.exact:${value}.`;
+      const PREFIX_TOO_SHORT =
+        'A * wildcard needs at least 3 leading characters: "A*". Add characters before the *, e.g. abc*.';
+
+      function mock400(message: string): void {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          jsonResponse({ error: 'Invalid query parameters error.', message }, 400),
+        );
+      }
+
+      /** The error a works search with `params` fails with. */
+      async function searchError(
+        params: Omit<import('@/services/openalex/types.js').SearchParams, 'entityType'>,
+      ) {
+        const service = await getService();
+        return (await service.search({ entityType: 'works', ...params }, createMockContext()).then(
+          () => {
+            throw new Error('expected the search to fail');
+          },
+          (error: unknown) => error,
+        )) as { code: number; message: string; data: Record<string, unknown> };
+      }
+
+      it.each([
+        [
+          'the search= wording',
+          wildcardSearchMessage('karst AND microplastic*'),
+          'upstream_wildcard_requires_exact',
+          { query: 'karst AND microplastic*' },
+        ],
+        [
+          'the filter wording',
+          wildcardFilterMessage('title_and_abstract.search', 'karst AND microplastic*'),
+          'upstream_wildcard_requires_exact',
+          { filters: { 'title_and_abstract.search': 'karst AND microplastic*' } },
+        ],
+        [
+          'a short wildcard prefix',
+          PREFIX_TOO_SHORT,
+          'upstream_wildcard_prefix_too_short',
+          { query: 'A* search algorithm' },
+        ],
+      ] as const)(
+        'maps %s to its own reason, keeping the upstream message',
+        async (_label, message, reason, params) => {
+          mock400(message);
+
+          const error = await searchError(params);
+
+          expect(error).toMatchObject({
+            code: JsonRpcErrorCode.InvalidParams,
+            message,
+            data: {
+              reason,
+              upstreamMessage: message,
+              upstreamError: 'Invalid query parameters error.',
+            },
+          });
+          // No pre-flight and no retry: the one request was sent, and the 400 ended the call.
+          expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      /**
+       * The requires-exact message ends by quoting the caller's query, so caller text can carry
+       * another 400's wording into it. The wildcard checks are anchored at the message start and
+       * run first, so an unanchored probe later in the chain never sees that quote.
+       */
+      it.each([
+        ['"Cannot group by"', 'cannot group by microplastic*'],
+        ['"search too long"', 'search too long micro*'],
+        ['"is not a valid OpenAlex ID"', "'x' is not a valid OpenAlex ID micro*"],
+        ['"Must include a search query"', 'must include a search query micro*'],
+      ])('keeps the wildcard reason when the quoted query holds %s', async (_label, query) => {
+        mock400(wildcardSearchMessage(query));
+
+        const error = await searchError({ query });
+
+        expect(error.data.reason).toBe('upstream_wildcard_requires_exact');
+      });
+
+      it('keeps the wildcard reason when a long query truncates the body', async () => {
+        const query = `${'microplastic '.repeat(60)}karst*`;
+        mock400(wildcardSearchMessage(query));
+
+        const error = await searchError({ query });
+
+        expect(error.data.reason).toBe('upstream_wildcard_requires_exact');
+        expect(error.message).toMatch(/^Wildcards \(\* or \?\) require exact \(no-stem\) search\./);
+      });
+
+      it('classifies the bare wildcard message on the error field too', async () => {
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          jsonResponse({ error: PREFIX_TOO_SHORT }, 400),
+        );
+
+        const error = await searchError({ query: 'A* search algorithm' });
+
+        expect(error.data.reason).toBe('upstream_wildcard_prefix_too_short');
+      });
+
+      it.each([
+        [
+          'two search methods at once',
+          'Cannot combine search.semantic with filter=title.search. Use only one search method per request.',
+          'upstream_invalid_params_other',
+        ],
+        [
+          'a rejected field',
+          'x is not a valid field. Valid fields are underscore or hyphenated versions of: abstract.search, title.search.',
+          'upstream_invalid_params',
+        ],
+        [
+          'the wildcard wording anywhere but the start',
+          `Query rejected. ${PREFIX_TOO_SHORT}`,
+          'upstream_invalid_params_other',
+        ],
+        [
+          'a wildcard message of another shape',
+          'Wildcards are not supported on this field.',
+          'upstream_invalid_params_other',
+        ],
+      ])('keeps %s on its previous reason', async (_label, message, reason) => {
+        mock400(message);
+
+        const error = await searchError({ query: 'graph networks' });
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          message,
+          data: { reason },
+        });
+      });
+
+      it.each([
+        ['exact mode', { query: 'microplastic*', searchMode: 'exact' as const }, 'search.exact'],
+        ['a keyword.search filter', { filters: { 'keyword.search': 'microplast*' } }, 'filter'],
+      ])('sends a wildcard OpenAlex accepts unchanged under %s', async (_label, params, param) => {
+        const service = await getService();
+
+        await service.search({ entityType: 'works', ...params }, createMockContext());
+
+        const sent = lastFetchUrl().searchParams.get(param);
+        expect(sent).toMatch(/microplast(?:ic)?\*$/);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('resolves each wildcard reason recovery from the caller contract', async () => {
+        const service = await getService();
+        const contract = [
+          {
+            reason: 'upstream_wildcard_requires_exact',
+            code: JsonRpcErrorCode.InvalidParams,
+            when: 'a wildcard in stemmed works search',
+            recovery: 'DISTINCTIVE_EXACT_HINT rerun with search_mode "exact".',
+          },
+          {
+            reason: 'upstream_wildcard_prefix_too_short',
+            code: JsonRpcErrorCode.InvalidParams,
+            when: 'a wildcard with fewer than three leading characters',
+            recovery: 'DISTINCTIVE_PREFIX_HINT put three characters before the wildcard.',
+          },
+        ] as const;
+
+        mock400(wildcardSearchMessage('microplastic*'));
+        const exact = await failThroughContract(contract, (ctx) =>
+          service.search({ entityType: 'works', query: 'microplastic*' }, ctx),
+        );
+        mock400(PREFIX_TOO_SHORT);
+        const prefix = await failThroughContract(contract, (ctx) =>
+          service.search({ entityType: 'works', query: 'A* search algorithm' }, ctx),
+        );
+
+        expect(exact.data).toMatchObject({
+          reason: 'upstream_wildcard_requires_exact',
+          recovery: { hint: contract[0].recovery },
+        });
+        expect(prefix.data).toMatchObject({
+          reason: 'upstream_wildcard_prefix_too_short',
+          recovery: { hint: contract[1].recovery },
+        });
+      });
+    });
+
+    /**
      * Two group_by rejections arrive without "Cannot group by": the concept keys on authors
      * come back as an invalid-ID 400 naming a concept ID the caller never sent, and
      * `referenced_works` as "Group by … is not supported at this time." An invalid-ID 400 whose
@@ -7114,9 +8069,11 @@ describe('OpenAlexService', () => {
               recovery: { hint: recovery },
               upstreamError: 'Plan upgrade required',
               upstreamMessage: JSON.parse(CREATED_BODY).message,
-              responseBody: CREATED_BODY,
             },
           });
+          // The raw body stays on the server; its two fields above are what the client receives.
+          expect(error.data).not.toHaveProperty('body');
+          expect(error.data).not.toHaveProperty('responseBody');
 
           // The text a client reads, through a CommonMark parse.
           const text = renderedText(
@@ -7348,13 +8305,12 @@ describe('OpenAlexService', () => {
     });
 
     /**
-     * OpenAlex indexes no PMCIDs at all, so a `pmcid:` lookup 404s however well formed it is.
-     * The generic recovery ("verify the ID format") sends a caller back to retry an identifier
-     * that can never resolve, so the 404 mapping substitutes the conversion guidance for that
-     * one scheme — in the service, where all three ID-accepting tools inherit it.
+     * OpenAlex indexes PMCIDs, so a `pmcid:` lookup that 404s is an ordinary miss — a PMCID
+     * OpenAlex does not hold — and carries the calling tool's generic not-found recovery, as
+     * every other identifier's 404 does.
      */
     describe('PMCID 404 recovery (gh #67)', () => {
-      /** Contract with a distinctive generic recovery, so a substitution is unmistakable. */
+      /** Contract with a distinctive generic recovery, so any substitution is unmistakable. */
       const notFoundContract = [
         {
           reason: 'entity_not_found',
@@ -7378,7 +8334,7 @@ describe('OpenAlexService', () => {
         ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
         ['a legacy PMC URL', 'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3084216/'],
         ['an uppercase-scheme PMCID', 'PMCID:PMC3084216'],
-      ])('substitutes the conversion recovery for %s', async (_label, id) => {
+      ])('gives %s the generic not-found recovery', async (_label, id) => {
         mock404();
         const service = await getService();
 
@@ -7392,25 +8348,10 @@ describe('OpenAlexService', () => {
             reason: 'entity_not_found',
             path: '/works/pmcid:PMC3084216',
             recovery: {
-              hint: expect.stringContaining('OpenAlex indexes no PMCIDs'),
+              hint: 'GENERIC_NOT_FOUND_HINT verify the ID format or resolve the name first.',
             },
           },
         });
-      });
-
-      it('names the NCBI ID Converter and the PMID/DOI conversion in the hint', async () => {
-        mock404();
-        const service = await getService();
-
-        const envelope = await failThroughContract(notFoundContract, (ctx) =>
-          service.search({ entityType: 'works', id: 'PMC3084216' }, ctx),
-        );
-
-        const hint = (envelope.data.recovery as { hint: string }).hint;
-        expect(hint).toContain('PMID');
-        expect(hint).toContain('DOI');
-        expect(hint).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
-        expect(hint).not.toContain('GENERIC_NOT_FOUND_HINT');
       });
 
       it.each([
@@ -7669,6 +8610,216 @@ describe('OpenAlexService', () => {
       );
     });
 
+    /**
+     * Suggestions rank against the entity type the request path reads: the first segment of
+     * `/<entity_type>` and `/<entity_type>/<id>`, the segment after `/autocomplete/` on a typed
+     * autocomplete, and none on cross-entity `/autocomplete`. Each body is cut at the framework's
+     * 500-byte capture, the only case that replaces the upstream list. (gh #139)
+     */
+    describe('field suggestions per request path (gh #139)', () => {
+      /** A truncated invalid-field 400 naming `field`, worded as OpenAlex words it. */
+      function mockTruncatedRejection(field: string, context: 'filter' | 'select' = 'filter') {
+        const lead =
+          context === 'select'
+            ? `${field} is not a valid select field. Valid fields for select are: `
+            : `${field} is not a valid field. Valid fields are underscore or hyphenated versions of: `;
+        const message = `${lead}${'abstract.search, '.repeat(40)}x_concepts.id`;
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          jsonResponse({ error: 'Invalid query parameters error.', message }, 400),
+        );
+      }
+
+      /** The names a "Did you mean" line suggests, or undefined when the message has none. */
+      const suggestionsIn = (message: string) =>
+        /Did you mean: (.+)\? Browse all with openalex_describe_fields/
+          .exec(message)?.[1]
+          ?.split(', ');
+
+      async function failure(call: Promise<unknown>) {
+        return (await call.then(
+          () => {
+            throw new Error('expected the call to fail');
+          },
+          (error: unknown) => error,
+        )) as { message: string; data: Record<string, unknown> };
+      }
+
+      it('ranks a rejected autocomplete filter key against the type after /autocomplete/', async () => {
+        mockTruncatedRejection('institutions.id');
+        const service = await getService();
+
+        const error = await failure(
+          service.autocomplete(
+            {
+              entityType: 'authors',
+              query: 'Hinton',
+              filters: { 'institutions.id': 'I185261750' },
+            },
+            createMockContext(),
+          ),
+        );
+
+        expect(lastFetchUrl().pathname).toBe('/autocomplete/authors');
+        expect(error.message).toMatch(
+          /^institutions\.id is not a valid field\. Did you mean: last_known_institutions\.id, .+\? Browse all with openalex_describe_fields/,
+        );
+        expect(error.message).not.toContain('list of valid fields omitted');
+        expect(error.data).toMatchObject({
+          reason: 'upstream_invalid_params',
+          upstreamMessage: expect.stringContaining('Valid fields are underscore'),
+        });
+      });
+
+      it.each([
+        'works',
+        'authors',
+        'sources',
+        'institutions',
+        'topics',
+        'keywords',
+        'publishers',
+        'funders',
+      ] as const satisfies readonly AutocompleteEntityType[])(
+        'draws suggestions from the %s filter fields on its typed autocomplete',
+        async (entityType) => {
+          const { default: generated } = await import('@/services/openalex/field-catalog.json');
+          mockTruncatedRejection('display_nam');
+          const service = await getService();
+
+          const error = await failure(
+            service.autocomplete(
+              { entityType, query: 'x', filters: { display_nam: 'x' } },
+              createMockContext(),
+            ),
+          );
+
+          const suggestions = suggestionsIn(error.message);
+          expect(suggestions, error.message).toContain('display_name');
+          for (const field of suggestions ?? []) {
+            expect(generated[entityType].filter).toContain(field);
+          }
+        },
+      );
+
+      it('suggests nothing on cross-entity /autocomplete, which names no entity type', async () => {
+        mockTruncatedRejection('display_nam');
+        const service = await getService();
+
+        const error = await failure(
+          service.autocomplete({ query: 'x', filters: { display_nam: 'x' } }, createMockContext()),
+        );
+
+        expect(lastFetchUrl().pathname).toBe('/autocomplete');
+        expect(suggestionsIn(error.message)).toBeUndefined();
+        expect(error.message).toBe(
+          'display_nam is not a valid field. (list of valid fields omitted — was truncated upstream; see OpenAlex docs)',
+        );
+      });
+
+      it('ranks a by-ID select rejection against the type before the ID', async () => {
+        mockTruncatedRejection('author_names', 'select');
+        const service = await getService();
+
+        const error = await failure(
+          service.search(
+            { entityType: 'works', id: 'W2741809807', select: ['author_names'] },
+            createMockContext(),
+          ),
+        );
+
+        expect(lastFetchUrl().pathname).toBe('/works/W2741809807');
+        expect(suggestionsIn(error.message)?.[0]).toBe('author_list');
+      });
+
+      it('ranks a rejected list filter key against its own entity type', async () => {
+        mockTruncatedRejection('institutions.id');
+        const service = await getService();
+
+        const error = await failure(
+          service.search(
+            { entityType: 'authors', filters: { 'institutions.id': 'I185261750' } },
+            createMockContext(),
+          ),
+        );
+
+        expect(lastFetchUrl().pathname).toBe('/authors');
+        expect(suggestionsIn(error.message)?.[0]).toBe('last_known_institutions.id');
+      });
+    });
+
+    /**
+     * OpenAlex words a rejected group_by key exactly as it does a rejected filter key ("x is not
+     * a valid field."), so the request's own `group_by` decides which pool ranks it: a rejected
+     * group_by key never gets a suggestion a group_by retry would fail on. Raw dates and range
+     * modifiers are filter fields, not groupable ones. Bodies are cut at the 500-byte capture.
+     */
+    describe('suggestions for a rejected group_by key', () => {
+      function mockTruncatedRejection(field: string) {
+        const message = `${field} is not a valid field. Valid fields are underscore or hyphenated versions of: ${'abstract.search, '.repeat(40)}x_concepts.id`;
+        vi.mocked(globalThis.fetch).mockResolvedValue(
+          jsonResponse({ error: 'Invalid query parameters error.', message }, 400),
+        );
+      }
+
+      const suggestionsIn = (message: string) =>
+        /Did you mean: (.+)\? Browse all with openalex_describe_fields/
+          .exec(message)?.[1]
+          ?.split(', ');
+
+      async function analyzeMessage(params: {
+        groupBy: string;
+        filters?: Record<string, string>;
+        includeUnknown?: boolean;
+      }) {
+        const service = await getService();
+        const error = (await service
+          .analyze({ entityType: 'works', ...params }, createMockContext())
+          .then(
+            () => {
+              throw new Error('expected analyze to fail');
+            },
+            (e: unknown) => e,
+          )) as { message: string; data: { reason?: unknown } };
+        expect(error.data.reason).toBe('upstream_invalid_params');
+        return error.message;
+      }
+
+      it.each([
+        ['as sent', { groupBy: 'publication_dat' }],
+        ['with the :include_unknown suffix', { groupBy: 'publication_dat:include_unknown' }],
+        ['under include_unknown', { groupBy: 'publication_dat', includeUnknown: true }],
+      ])(
+        'ranks the rejected group_by key against groupable fields only, %s',
+        async (_label, params) => {
+          mockTruncatedRejection('publication_dat');
+
+          const suggestions = suggestionsIn(await analyzeMessage(params));
+
+          expect(suggestions?.[0]).toBe('publication_year');
+          for (const ungroupable of [
+            'publication_date',
+            'from_publication_date',
+            'to_publication_date',
+          ]) {
+            expect(suggestions).not.toContain(ungroupable);
+          }
+        },
+      );
+
+      it('ranks a rejected filter key on a group_by request against every filter field', async () => {
+        mockTruncatedRejection('publication_dat');
+
+        const suggestions = suggestionsIn(
+          await analyzeMessage({
+            groupBy: 'publication_year',
+            filters: { publication_dat: '2020' },
+          }),
+        );
+
+        expect(suggestions?.[0]).toBe('publication_date');
+      });
+    });
+
     it('marks a syntactically valid head-tail elision as truncated', async () => {
       const longMessage =
         'This combination of fields is not allowed. Valid fields are: ' +
@@ -7734,6 +8885,712 @@ describe('OpenAlexService', () => {
 
       await rejection;
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * A works `id` read as an arXiv ID is looked up by the DOI arXiv registers for it, then by its
+   * arXiv landing page when no work carries that DOI, then refetched by ID. Every case runs the
+   * real service against a routed `fetch`. (gh #137)
+   */
+  describe('arXiv identifiers (gh #137)', () => {
+    const DOI_PATH = '/works/doi:10.48550/arXiv.1706.03762';
+    const ATTENTION = { id: 'https://openalex.org/W2626778328', display_name: 'Attention' };
+    const LANDING_FILTER =
+      'locations.landing_page_url:http://arxiv.org/abs/2608.25542|https://arxiv.org/abs/2608.25542';
+    const ARXIV_SOURCE = { id: 'https://openalex.org/S4306400194', display_name: 'arXiv' };
+    const DEEP_BLUE = { id: 'https://openalex.org/S4306400393', display_name: 'Deep Blue' };
+
+    /** A landing-page list row whose matching location is served by `source`. */
+    function landingRow(id: string, source: unknown, url = 'https://arxiv.org/abs/2608.25542') {
+      return {
+        id: `https://openalex.org/${id}`,
+        locations: [
+          { landing_page_url: 'https://doi.org/10.1/other', source: DEEP_BLUE },
+          { landing_page_url: url, source },
+        ],
+      };
+    }
+
+    function listOf(...rows: unknown[]): Response {
+      return new Response(JSON.stringify({ meta: { count: rows.length }, results: rows }), {
+        status: 200,
+        headers: budgetHeaders({ cost: 0.0001, remaining: 0.5, reset: 100 }),
+      });
+    }
+
+    function work(id: string): Response {
+      return new Response(JSON.stringify({ id: `https://openalex.org/${id}`, display_name: id }), {
+        status: 200,
+        headers: budgetHeaders({ cost: 0, remaining: 0.5, reset: 99 }),
+      });
+    }
+
+    /** A fetch that never settles on its own — only an abort of its signal ends it. */
+    function hang(init: RequestInit | undefined): Promise<Response> {
+      return new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }
+
+    /** Every request sent, as `<path>` or `<path>?filter=…&select=…` for a list request. */
+    function requests(): string[] {
+      return vi.mocked(globalThis.fetch).mock.calls.map(([input]) => {
+        const url = new URL(String(input));
+        const filter = url.searchParams.get('filter');
+        return filter === null
+          ? url.pathname
+          : `${url.pathname}?filter=${filter}&select=${url.searchParams.get('select')}`;
+      });
+    }
+
+    /** The 404 answer for the 2608.25542 DOI, the landing-page list, and the refetch. */
+    function landingRoutes(
+      list: () => Response,
+      refetch: () => Response = () => work('W7204606861'),
+    ) {
+      routeFetch({
+        '/works/doi:10.48550/arXiv.2608.25542': html404,
+        '/works': list,
+        '/works/W7204606861': refetch,
+      });
+    }
+
+    /** The error a `search()` by `id` rejects with. */
+    async function failure(id = '2608.25542', ctx = createMockContext()) {
+      const service = await getService();
+      return service.search({ entityType: 'works', id }, ctx).then(
+        () => {
+          throw new Error('expected the lookup to fail');
+        },
+        (error: unknown) =>
+          error as { code: number; message: string; data: Record<string, unknown> },
+      );
+    }
+
+    describe('the identifier forms', () => {
+      it.each([
+        ['1706.03762'],
+        ['arXiv:1706.03762'],
+        ['ARXIV:1706.03762'],
+        ['http://arxiv.org/abs/1706.03762'],
+        ['https://www.arxiv.org/abs/1706.03762'],
+        ['https://export.arxiv.org/abs/1706.03762'],
+        ['arxiv.org/abs/1706.03762'],
+        ['https://arxiv.org/pdf/1706.03762'],
+        ['https://arxiv.org/pdf/1706.03762.pdf'],
+        ['https://arxiv.org/abs/1706.03762/'],
+        ['https://arxiv.org/abs/1706.03762?context=cs#top'],
+        ['10.48550/arXiv.1706.03762'],
+        ['10.48550/ARXIV.1706.03762'],
+        ['https://doi.org/10.48550/arXiv.1706.03762'],
+      ])('looks %s up by its arXiv DOI alone, unbilled', async (id) => {
+        routeFetch({ [DOI_PATH]: () => work('W2626778328') });
+        const service = await getService();
+        const ctx = createMockContext();
+
+        const result = await service.search({ entityType: 'works', id }, ctx);
+
+        expect(requests()).toEqual([DOI_PATH]);
+        expect(result.results).toEqual([
+          { id: 'https://openalex.org/W2626778328', display_name: 'W2626778328' },
+        ]);
+        expect(result.arxiv).toEqual({ arxivId: '1706.03762', via: 'doi' });
+        expect(getEnrichment(ctx).budget).toMatchObject({ costUsd: 0 });
+      });
+
+      it.each([
+        ['1706.03762v5'],
+        ['https://arxiv.org/abs/1706.03762v5'],
+        ['https://arxiv.org/pdf/1706.03762v5'],
+        ['https://arxiv.org/pdf/1706.03762v5.pdf'],
+        ['10.48550/arXiv.1706.03762v5'],
+      ])('drops the version %s names and reports it', async (id) => {
+        routeFetch({ [DOI_PATH]: () => jsonResponse(ATTENTION) });
+        const service = await getService();
+
+        const result = await service.search({ entityType: 'works', id }, createMockContext());
+
+        expect(requests()).toEqual([DOI_PATH]);
+        expect(result.arxiv).toEqual({ arxivId: '1706.03762', droppedVersion: 'v5', via: 'doi' });
+      });
+
+      it.each([
+        ['hep-th/9901001', '/works/doi:10.48550/arXiv.hep-th/9901001'],
+        ['HEP-TH/9901001', '/works/doi:10.48550/arXiv.hep-th/9901001'],
+        ['arXiv:hep-th/9901001', '/works/doi:10.48550/arXiv.hep-th/9901001'],
+        ['https://arxiv.org/abs/hep-th/9901001', '/works/doi:10.48550/arXiv.hep-th/9901001'],
+        ['math.GT/0309136', '/works/doi:10.48550/arXiv.math/0309136'],
+        ['1412.6980', '/works/doi:10.48550/arXiv.1412.6980'],
+      ])('sends the arXiv ID %s as the DOI arXiv registered for it', async (id, path) => {
+        routeFetch({ [path]: () => jsonResponse(ATTENTION) });
+        const service = await getService();
+
+        await service.search({ entityType: 'works', id }, createMockContext());
+
+        expect(requests()).toEqual([path]);
+      });
+
+      it('sends the caller select on the DOI lookup', async () => {
+        routeFetch({ [DOI_PATH]: () => jsonResponse(ATTENTION) });
+        const service = await getService();
+
+        await service.search(
+          { entityType: 'works', id: '1706.03762', select: ['doi'] },
+          createMockContext(),
+        );
+
+        expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,doi');
+      });
+    });
+
+    /**
+     * Characterization: every identifier form the previous release resolved sends the request it
+     * sent then, and a miss outside the arXiv DOI prefix sends no landing-page lookup.
+     */
+    describe('identifiers that are not arXiv IDs', () => {
+      it.each([
+        ['10.1038/nature12373', '/works/doi:10.1038/nature12373'],
+        ['12345678', '/works/pmid:12345678'],
+        ['1234-5678', '/works/issn:1234-5678'],
+        ['0000-0002-1825-0097', '/works/orcid:0000-0002-1825-0097'],
+        ['013meh722', '/works/ror:013meh722'],
+        ['PMC1234567', '/works/pmcid:PMC1234567'],
+        ['W2741809807', '/works/W2741809807'],
+        ['https://openalex.org/works/W2741809807', '/works/W2741809807'],
+      ])('sends %s as before', async (id, path) => {
+        routeFetch({ [path]: () => jsonResponse(ATTENTION) });
+        const service = await getService();
+
+        const result = await service.search({ entityType: 'works', id }, createMockContext());
+
+        expect(requests()).toEqual([path]);
+        expect(result.arxiv).toBeUndefined();
+      });
+
+      it('fails a DOI outside the arXiv prefix on its one 404', async () => {
+        routeFetch({ '/works/doi:10.1038/nonexistent': html404 });
+
+        const error = await failure('10.1038/nonexistent');
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          data: { reason: 'entity_not_found', path: '/works/doi:10.1038/nonexistent' },
+        });
+        expect(requests()).toEqual(['/works/doi:10.1038/nonexistent']);
+      });
+
+      it.each([
+        ['authors', '/authors/1706.03762'],
+        ['sources', '/sources/1706.03762'],
+      ] as const)(
+        'sends an arXiv-shaped id under %s as written, with no fallback',
+        async (entityType, path) => {
+          routeFetch({ [path]: html404 });
+          const service = await getService();
+
+          await expect(
+            service.search({ entityType, id: '1706.03762' }, createMockContext()),
+          ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound });
+          expect(requests()).toEqual([path]);
+        },
+      );
+    });
+
+    describe('the landing-page lookup', () => {
+      it('finds a work without the DOI, refetches it with the caller select, and bills the list request', async () => {
+        landingRoutes(() => listOf(landingRow('W7204606861', ARXIV_SOURCE)));
+        const service = await getService();
+        const ctx = createMockContext();
+
+        const result = await service.search(
+          { entityType: 'works', id: '10.48550/arXiv.2608.25542', select: ['authorships'] },
+          ctx,
+        );
+
+        expect(requests()).toEqual([
+          '/works/doi:10.48550/arXiv.2608.25542',
+          `/works?filter=${LANDING_FILTER}&select=id,locations`,
+          '/works/W7204606861',
+        ]);
+        expect(lastFetchUrl().searchParams.get('select')).toBe('id,display_name,authorships');
+        expect(result.results).toEqual([
+          { id: 'https://openalex.org/W7204606861', display_name: 'W7204606861' },
+        ]);
+        expect(result.arxiv).toEqual({ arxivId: '2608.25542', via: 'landing_page' });
+        expect(getEnrichment(ctx).budget).toEqual({
+          costUsd: 0.0001,
+          remainingUsd: 0.5,
+          resetsInSeconds: 99,
+        });
+      });
+
+      it('carries the dropped version through the landing-page path', async () => {
+        landingRoutes(() => listOf(landingRow('W7204606861', ARXIV_SOURCE)));
+        const service = await getService();
+
+        const result = await service.search(
+          { entityType: 'works', id: 'https://arxiv.org/abs/2608.25542v1' },
+          createMockContext(),
+        );
+
+        expect(result.arxiv).toEqual({
+          arxivId: '2608.25542',
+          droppedVersion: 'v1',
+          via: 'landing_page',
+        });
+      });
+
+      it('counts only a row whose matching location arXiv itself serves', async () => {
+        routeFetch({
+          '/works/doi:10.48550/arXiv.1412.6980': html404,
+          '/works': () =>
+            listOf(
+              landingRow('W4366084169', DEEP_BLUE, 'http://arxiv.org/abs/1412.6980'),
+              landingRow('W1522301498', ARXIV_SOURCE, 'http://arxiv.org/abs/1412.6980'),
+            ),
+          '/works/W1522301498': () => work('W1522301498'),
+        });
+        const service = await getService();
+
+        const result = await service.search(
+          { entityType: 'works', id: '1412.6980' },
+          createMockContext(),
+        );
+
+        expect(result.results[0]?.id).toBe('https://openalex.org/W1522301498');
+        expect(requests().at(-1)).toBe('/works/W1522301498');
+      });
+
+      it('ignores an arXiv-served location at another page, and a location with no source', async () => {
+        landingRoutes(() =>
+          listOf(
+            landingRow('W1', ARXIV_SOURCE, 'https://arxiv.org/abs/2608.25541'),
+            landingRow('W2', null),
+            { id: 'https://openalex.org/W3', locations: null },
+          ),
+        );
+
+        const error = await failure();
+
+        expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+        expect(error.data).not.toHaveProperty('candidates');
+        expect(requests()).toHaveLength(2);
+      });
+    });
+
+    describe('the failure table', () => {
+      it('fails a miss on both lookups as entity_not_found naming both', async () => {
+        landingRoutes(() => listOf());
+
+        const error = await failure();
+
+        expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+        expect(error.message).toBe(
+          'No work in OpenAlex carries the DOI 10.48550/arXiv.2608.25542, and none has an arXiv location at its landing page https://arxiv.org/abs/2608.25542.',
+        );
+        expect(error.data).toMatchObject({ reason: 'entity_not_found', arxivId: '2608.25542' });
+        expect(error.data).not.toHaveProperty('candidates');
+        expect(error.data).not.toHaveProperty('fallbackFailedReason');
+        expect(error.data).not.toHaveProperty('recovery');
+        expect(requests()).toHaveLength(2);
+      });
+
+      it('fails rows none of which arXiv serves as the same miss', async () => {
+        landingRoutes(() => listOf(landingRow('W4366084169', DEEP_BLUE)));
+
+        const error = await failure();
+
+        expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+        expect(error.data).not.toHaveProperty('candidates');
+        expect(requests()).toHaveLength(2);
+      });
+
+      it('lists two or more counted rows as candidates, with a hint to pass one', async () => {
+        landingRoutes(() =>
+          listOf(landingRow('W11', ARXIV_SOURCE), landingRow('W22', ARXIV_SOURCE)),
+        );
+
+        const error = await failure();
+
+        expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+        expect(error.message).toContain('2 works have an arXiv location at its landing page');
+        expect(error.message).toContain('W11, W22');
+        expect(error.data).toMatchObject({
+          reason: 'entity_not_found',
+          candidates: ['W11', 'W22'],
+          recovery: { hint: expect.stringContaining('data.candidates') },
+        });
+        expect(requests()).toHaveLength(2);
+      });
+
+      it.each([
+        ['an outage', 503, { error: 'Service Unavailable' }, 'upstream_unavailable', 3],
+        [
+          'a burst throttle after its retries',
+          429,
+          { error: 'Rate limit exceeded' },
+          'rate_limited',
+          3,
+        ],
+        [
+          'a spent daily budget',
+          429,
+          { error: 'Rate limit exceeded', message: 'Insufficient budget. Resets at midnight UTC.' },
+          'upstream_budget_exhausted',
+          1,
+        ],
+      ])(
+        'keeps %s on the landing-page lookup a miss, naming the failure',
+        async (_label, status, body, fallbackFailedReason, attempts) => {
+          vi.useFakeTimers();
+          landingRoutes(() => jsonResponse(body, status));
+
+          const pending = failure();
+          await vi.runAllTimersAsync();
+          const error = await pending;
+
+          expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+          expect(error.data).toMatchObject({
+            reason: 'entity_not_found',
+            fallbackFailedReason,
+            recovery: { hint: expect.any(String) },
+          });
+          expect(requests()).toHaveLength(1 + attempts);
+        },
+      );
+
+      it('says a retry may find the work after an outage, and to wait for the reset after a spent budget', async () => {
+        vi.useFakeTimers();
+        landingRoutes(() => jsonResponse({ error: 'Service Unavailable' }, 503));
+        const outage = failure();
+        await vi.runAllTimersAsync();
+        expect((await outage).data.recovery).toEqual({
+          hint: expect.stringMatching(/^Retry the call/),
+        });
+
+        landingRoutes(() =>
+          jsonResponse({ error: 'Rate limit exceeded', message: 'Insufficient budget.' }, 429),
+        );
+        const spent = failure();
+        await vi.runAllTimersAsync();
+        expect((await spent).data.recovery).toEqual({
+          hint: expect.stringContaining('midnight UTC'),
+        });
+      });
+
+      it.each([
+        ['an HTML body', () => new Response('<!DOCTYPE html><p>busy</p>', { status: 200 })],
+        ['a truncated body', () => new Response('{"results": [', { status: 200 })],
+        ['a body with no results array', () => jsonResponse({ meta: { count: 1 } })],
+      ])(
+        'keeps %s from the landing-page lookup a miss as upstream_unavailable',
+        async (_label, body) => {
+          vi.useFakeTimers();
+          landingRoutes(body);
+
+          const pending = failure();
+          await vi.runAllTimersAsync();
+          const error = await pending;
+
+          expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+          expect(error.data).toMatchObject({ fallbackFailedReason: 'upstream_unavailable' });
+        },
+      );
+
+      it.each([
+        [
+          400,
+          { error: 'Invalid query parameters error.', message: 'bogus.' },
+          JsonRpcErrorCode.InvalidParams,
+        ],
+        [401, { error: 'Unauthorized' }, JsonRpcErrorCode.Unauthorized],
+        [403, { error: 'Forbidden' }, JsonRpcErrorCode.Forbidden],
+      ])('throws a %s on the landing-page lookup as classified', async (status, body, code) => {
+        landingRoutes(() => jsonResponse(body, status));
+
+        const error = await failure();
+
+        expect(error.code).toBe(code);
+        expect(error.data).not.toHaveProperty('fallbackFailedReason');
+        expect(requests()).toHaveLength(2);
+      });
+
+      it('propagates a caller cancellation during the landing-page lookup instead of degrading it', async () => {
+        const controller = new AbortController();
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const { pathname } = new URL(String(input));
+          if (pathname === '/works/doi:10.48550/arXiv.2608.25542') {
+            return Promise.resolve(html404());
+          }
+          if (pathname === '/works') {
+            setTimeout(() => controller.abort(), 0);
+            return hang(init);
+          }
+          return Promise.reject(new Error(`unmocked fetch: ${pathname}`));
+        });
+
+        const error = await failure('2608.25542', createMockContext({ signal: controller.signal }));
+
+        expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(error.data ?? {}).not.toHaveProperty('fallbackFailedReason');
+        expect(requests()).toHaveLength(2);
+      });
+
+      it.each([
+        ['a 404', html404, JsonRpcErrorCode.NotFound, 'entity_not_found'],
+        [
+          'an outage',
+          () => jsonResponse({ error: 'Service Unavailable' }, 503),
+          JsonRpcErrorCode.ServiceUnavailable,
+          'upstream_unavailable',
+        ],
+      ])('throws %s on the refetch as classified', async (_label, refetch, code, reason) => {
+        vi.useFakeTimers();
+        landingRoutes(() => listOf(landingRow('W7204606861', ARXIV_SOURCE)), refetch);
+
+        const pending = failure();
+        await vi.runAllTimersAsync();
+        const error = await pending;
+
+        expect(error.code).toBe(code);
+        expect(error.data).toMatchObject({ reason, path: '/works/W7204606861' });
+        expect(error.data).not.toHaveProperty('fallbackFailedReason');
+      });
+
+      it('fails the DOI lookup other than by a 404 as before, with no landing-page lookup', async () => {
+        vi.useFakeTimers();
+        routeFetch({ [DOI_PATH]: () => jsonResponse({ error: 'Service Unavailable' }, 503) });
+
+        const pending = failure('1706.03762');
+        await vi.runAllTimersAsync();
+        const error = await pending;
+
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(requests()).toEqual([DOI_PATH, DOI_PATH, DOI_PATH]);
+      });
+    });
+
+    describe('the 45-second fallback window', () => {
+      it('settles a slow DOI miss and a hung landing-page lookup inside the window', async () => {
+        vi.useFakeTimers();
+        let doiAttempts = 0;
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const { pathname } = new URL(String(input));
+          // Two DOI attempts time out before the third answers 404; the list request never answers.
+          if (pathname === '/works/doi:10.48550/arXiv.2608.25542') {
+            doiAttempts += 1;
+            return doiAttempts < 3 ? hang(init) : Promise.resolve(html404());
+          }
+          if (pathname === '/works') return hang(init);
+          return Promise.reject(new Error(`unmocked fetch: ${pathname}`));
+        });
+        const service = await getService();
+        const startedAt = Date.now();
+        let settledAt = 0;
+
+        const pending = service
+          .search({ entityType: 'works', id: '2608.25542' }, createMockContext())
+          .finally(() => {
+            settledAt = Date.now();
+          });
+        const outcome = expect(pending).rejects.toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          data: { reason: 'entity_not_found', fallbackFailedReason: 'upstream_timeout' },
+        });
+        await vi.runAllTimersAsync();
+        await outcome;
+
+        expect(doiAttempts).toBe(3);
+        expect(settledAt - startedAt).toBeLessThanOrEqual(45_000);
+        // The DOI phase alone took over 20 s, so the window — not the list request's own retry
+        // budget, which outlasts what was left — is what ended the call.
+        expect(settledAt - startedAt).toBeGreaterThan(40_000);
+      });
+
+      it('sends no landing-page lookup when the DOI lookup used up the window', async () => {
+        vi.useFakeTimers();
+        let doiAttempts = 0;
+        vi.mocked(globalThis.fetch).mockImplementation((input) => {
+          const { pathname } = new URL(String(input));
+          if (pathname === '/works/doi:10.48550/arXiv.2608.25542') {
+            doiAttempts += 1;
+            // Two throttles that each ask for 25 s, then the 404 — 50 s in.
+            return Promise.resolve(
+              doiAttempts < 3
+                ? new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+                    status: 429,
+                    headers: { 'Retry-After': '25' },
+                  })
+                : html404(),
+            );
+          }
+          return Promise.reject(new Error(`unmocked fetch: ${pathname}`));
+        });
+
+        const pending = failure();
+        await vi.runAllTimersAsync();
+        const error = await pending;
+
+        expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+        expect(error.data).toMatchObject({ fallbackFailedReason: 'upstream_timeout' });
+        expect(requests()).toEqual(Array(3).fill('/works/doi:10.48550/arXiv.2608.25542'));
+      });
+    });
+
+    describe('as a resolve_name query', () => {
+      async function infer(query: string, requested?: AutocompleteEntityType) {
+        const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+        return inferIdentifier(query, requested);
+      }
+
+      it.each([
+        ['1706.03762', undefined],
+        ['arXiv:1706.03762v5', 'authors'],
+        ['https://arxiv.org/abs/1706.03762', 'keywords'],
+        ['10.48550/arXiv.1706.03762', 'funders'],
+        ['https://doi.org/10.48550/arXiv.1706.03762', 'works'],
+      ] as const)('reads %s as an arXiv ID of a work under entity_type %s', async (query, type) => {
+        expect(await infer(query, type)).toEqual({
+          entityTypes: ['works'],
+          id: 'doi:10.48550/arXiv.1706.03762',
+          scheme: 'arxiv',
+        });
+      });
+
+      it.each([
+        ['10.1038/nature12373', 'doi'],
+        ['0000-0002-1825-0097', 'orcid'],
+        ['1234-5678', 'issn'],
+        ['PMC1234567', 'pmcid'],
+        ['12345678', 'pmid'],
+      ])('keeps %s under its own scheme %s', async (query, scheme) => {
+        expect((await infer(query))?.scheme).toBe(scheme);
+      });
+
+      it('carries how the work was found, and a tie or failed lookup past the plain miss', async () => {
+        const service = await getService();
+        const arxiv = {
+          entityTypes: ['works'] as const,
+          id: 'doi:10.48550/arXiv.x',
+          scheme: 'arxiv',
+        };
+
+        landingRoutes(() => listOf(landingRow('W7204606861', ARXIV_SOURCE)));
+        const hit = await service.resolveIdentifier(
+          arxiv,
+          createMockContext(),
+          undefined,
+          '2608.25542v1',
+        );
+        expect(hit).toEqual({
+          results: [expect.objectContaining({ id: 'https://openalex.org/W7204606861' })],
+          arxiv: { arxivId: '2608.25542', droppedVersion: 'v1', via: 'landing_page' },
+        });
+
+        landingRoutes(() => listOf(landingRow('W1', ARXIV_SOURCE), landingRow('W2', ARXIV_SOURCE)));
+        const tie = await service.resolveIdentifier(
+          arxiv,
+          createMockContext(),
+          undefined,
+          '2608.25542',
+        );
+        expect(tie).toEqual({ results: [], arxivMiss: { candidates: ['W1', 'W2'] } });
+
+        landingRoutes(() =>
+          jsonResponse({ error: 'Rate limit exceeded', message: 'Insufficient budget.' }, 429),
+        );
+        const spent = await service.resolveIdentifier(
+          arxiv,
+          createMockContext(),
+          undefined,
+          '2608.25542',
+        );
+        expect(spent).toEqual({
+          results: [],
+          arxivMiss: { fallbackFailedReason: 'upstream_budget_exhausted' },
+        });
+
+        landingRoutes(() => listOf());
+        const plain = await service.resolveIdentifier(
+          arxiv,
+          createMockContext(),
+          undefined,
+          '2608.25542',
+        );
+        expect(plain).toEqual({ results: [] });
+      });
+    });
+
+    /** `deadlineMs` bounds every request a search sends, the singleton's and the list's alike. */
+    describe('a caller deadline', () => {
+      it('fails a hung list request as upstream_timeout once the deadline passes', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation((_input, init) => hang(init));
+        const service = await getService();
+        const startedAt = Date.now();
+        let settledAt = 0;
+
+        const pending = service
+          .search(
+            { entityType: 'works', filters: { cites: 'W1' }, deadlineMs: 15_000 },
+            createMockContext(),
+          )
+          .finally(() => {
+            settledAt = Date.now();
+          });
+        const outcome = expect(pending).rejects.toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          data: { reason: 'upstream_timeout', path: '/works' },
+        });
+        await vi.runAllTimersAsync();
+        await outcome;
+
+        expect(settledAt - startedAt).toBe(15_000);
+      });
+
+      it('sends nothing once the deadline has already passed', async () => {
+        const service = await getService();
+
+        await expect(
+          service.search({ entityType: 'works', id: 'W1', deadlineMs: 0 }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          data: { reason: 'upstream_timeout', path: '/works/W1' },
+        });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      });
+
+      it('gives the landing-page lookup the smaller of the window and the deadline', async () => {
+        vi.useFakeTimers();
+        vi.mocked(globalThis.fetch).mockImplementation((input, init) => {
+          const { pathname } = new URL(String(input));
+          if (pathname === '/works/doi:10.48550/arXiv.2608.25542') {
+            return Promise.resolve(html404());
+          }
+          return hang(init);
+        });
+        const service = await getService();
+        const startedAt = Date.now();
+        let settledAt = 0;
+
+        const pending = service
+          .search(
+            { entityType: 'works', id: '2608.25542', deadlineMs: 12_000 },
+            createMockContext(),
+          )
+          .finally(() => {
+            settledAt = Date.now();
+          });
+        const outcome = expect(pending).rejects.toMatchObject({
+          data: { fallbackFailedReason: 'upstream_timeout' },
+        });
+        await vi.runAllTimersAsync();
+        await outcome;
+
+        expect(settledAt - startedAt).toBe(12_000);
+      });
     });
   });
 });

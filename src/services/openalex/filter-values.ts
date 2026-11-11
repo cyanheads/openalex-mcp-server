@@ -9,7 +9,9 @@
  * in quotes. A value that puts an AND operator beside a `|` (OR) fails, since OpenAlex splits on
  * `|` first and drops every alternative that ANDs more than one value. A value sent double-quoted
  * holds no `"` of its own, which would end the quoted phrase early and let the text after it
- * parse as further filter clauses.
+ * parse as further filter clauses. On a numeric key, a `|` alternative written `>=N`, `<=N`, or
+ * `a..b` goes out as the hyphen range OpenAlex reads (`N-`, `-N`, `a-b`), and a range it cannot
+ * read — a negative bound, a reversed range, a negated comparison or open range — fails.
  * @module services/openalex/filter-values
  */
 
@@ -324,9 +326,202 @@ function mixedAndOrError(key: string) {
 }
 
 /**
+ * The (hyphen-normalized) filter keys whose values OpenAlex reads as numbers: every catalog key
+ * that answers `>=1` with "must be a number", across all nine entity types. Each is numeric on
+ * every type that has it, so the set is not keyed by type.
+ */
+export const NUMERIC_FILTER_KEYS: ReadonlySet<string> = new Set([
+  'amount',
+  'amount_usd',
+  'apc_list.value',
+  'apc_list.value_usd',
+  'apc_paid.value',
+  'apc_paid.value_usd',
+  'apc_prices.price',
+  'apc_usd',
+  'authors_count',
+  'awards_count',
+  'citation_normalized_percentile.value',
+  'cited_by_count',
+  'cited_by_percentile_year.max',
+  'cited_by_percentile_year.min',
+  'concepts_count',
+  'countries_distinct_count',
+  'end_year',
+  'first_publication_year',
+  'funded_outputs_count',
+  'fwci',
+  'hierarchy_level',
+  'institutions_distinct_count',
+  'is_high_oa_rate_since_year',
+  'is_in_doaj_since_year',
+  'last_publication_year',
+  'locations_count',
+  'oa_flip_year',
+  'primary_location.source.summary_stats.2yr_mean_citedness',
+  'primary_location.source.summary_stats.h_index',
+  'publication_year',
+  'referenced_works_count',
+  'start_year',
+  'sub_awards_count',
+  'summary_stats.2yr_mean_citedness',
+  'summary_stats.h_index',
+  'summary_stats.i10_index',
+  'sustainable_development_goals.score',
+  'works_count',
+  'works_count_with_children',
+  'works_count_with_children_and_predecessors',
+]);
+
+/** A range bound OpenAlex reads: digits, optionally a `.` and more digits. */
+const PLAIN_DECIMAL = /^\d+(?:\.\d+)?$/;
+
+/** `digits` without its leading zeros, keeping one digit (`007` → `7`, `0` → `0`). */
+function withoutLeadingZeros(digits: string): string {
+  let start = 0;
+  while (start < digits.length - 1 && digits[start] === '0') start++;
+  return digits.slice(start);
+}
+
+/**
+ * Whether plain decimal `low` is greater than plain decimal `high`, compared exactly: a bound of
+ * any length is read digit by digit, never through a float, so `0.30000000000000001..0.3` is
+ * reversed and a bound past `Number.MAX_VALUE` still compares.
+ */
+function isAbove(low: string, high: string): boolean {
+  const [lowWhole = '', lowFraction = ''] = low.split('.');
+  const [highWhole = '', highFraction = ''] = high.split('.');
+  const a = withoutLeadingZeros(lowWhole);
+  const b = withoutLeadingZeros(highWhole);
+  if (a.length !== b.length) return a.length > b.length;
+  if (a !== b) return a > b;
+  const width = Math.max(lowFraction.length, highFraction.length);
+  return lowFraction.padEnd(width, '0') > highFraction.padEnd(width, '0');
+}
+
+const NEGATIVE_BOUND =
+  'has a negative bound, which OpenAlex cannot read: "-" is its range separator, so "-5" means at most 5.';
+const REVERSED_RANGE =
+  'puts its high bound first; OpenAlex answers a reversed range with no records, or negated with every record.';
+const NEGATED_OPEN_RANGE =
+  'negates a comparison or an open range, which OpenAlex refuses; "!" negates only an exact value or a closed range.';
+const UNREADABLE_RANGE =
+  'is not a range OpenAlex reads: each bound is a plain decimal number such as 50 or 1.5.';
+const ANDED_RANGE =
+  'is not a range OpenAlex reads: one value cannot AND two comparisons; write both bounds as one range, such as "2020..2022".';
+
+/**
+ * Why `text` is not a range OpenAlex reads: a `+` ANDing two terms, or a bound that is not a plain
+ * decimal. Text holding an `e` gets the second, since its `+` may sign an exponent (`1e+3`).
+ */
+function unreadableRange(text: string): string {
+  return text.includes('+') && !text.includes('e') && !text.includes('E')
+    ? ANDED_RANGE
+    : UNREADABLE_RANGE;
+}
+
+function invalidRangeError(key: string, value: string, alternative: string, why: string) {
+  const where = alternative === value ? '' : ` (alternative ${quoteCallerText(alternative)})`;
+  return validationError(
+    `Filter ${quoteCallerText(key)} value ${quoteCallerText(value)}${where} ${why}`,
+    { reason: 'invalid_range_in_filter_value', filterKey: key },
+  );
+}
+
+/** Why `bound` cannot be a range bound, or undefined when it is a plain decimal. */
+function boundProblem(bound: string): string | undefined {
+  if (PLAIN_DECIMAL.test(bound)) return;
+  return bound.startsWith('-') && PLAIN_DECIMAL.test(bound.slice(1))
+    ? NEGATIVE_BOUND
+    : unreadableRange(bound);
+}
+
+/**
+ * One `|` alternative of a numeric key's value as OpenAlex reads it. An alternative written with
+ * `>=`, `<=`, or `..` becomes OpenAlex's own inclusive range — `>=N` → `N-`, `<=N` → `-N`,
+ * `a..b` → `a-b`, `a..` → `a-`, `..b` → `-b`, `!a..b` → `!a-b` — with the whitespace around its
+ * operator and bounds trimmed. Any other alternative goes out byte-for-byte, except three native
+ * forms OpenAlex cannot answer truthfully, which fail with the rewritten ones it cannot read: a
+ * negated comparison or open range (`!>50`, `!2020-`), refused upstream as "must be a number";
+ * and a reversed range (`2024-2020`), answered with no records — or, negated, with every record.
+ * A bound is a plain non-negative decimal: `-` is OpenAlex's range separator, so no form carries
+ * a negative bound, and the exponent and AND forms (`>=1e3`, `>=2020+<=2022`) have no range form.
+ */
+function numericAlternative(key: string, value: string, alternative: string): string {
+  const fail = (why: string) => invalidRangeError(key, value, alternative, why);
+  let body = alternative.trim();
+  const negated = body.startsWith('!');
+  if (negated) body = body.slice(1).trim();
+
+  if (!(alternative.includes('>=') || alternative.includes('<=') || alternative.includes('..'))) {
+    if (negated && (body.startsWith('>') || body.startsWith('<'))) throw fail(NEGATED_OPEN_RANGE);
+    const dash = body.indexOf('-');
+    if (dash === -1) return alternative;
+    const low = body.slice(0, dash);
+    const high = body.slice(dash + 1);
+    const lowIsBound = PLAIN_DECIMAL.test(low);
+    const highIsBound = PLAIN_DECIMAL.test(high);
+    if (negated && ((low === '' && highIsBound) || (high === '' && lowIsBound))) {
+      throw fail(NEGATED_OPEN_RANGE);
+    }
+    if (lowIsBound && highIsBound && isAbove(low, high)) throw fail(REVERSED_RANGE);
+    return alternative;
+  }
+
+  if (body.startsWith('>=') || body.startsWith('<=')) {
+    if (negated) throw fail(NEGATED_OPEN_RANGE);
+    const bound = body.slice(2).trim();
+    const problem = boundProblem(bound);
+    if (problem) throw fail(problem);
+    return body.startsWith('>=') ? `${bound}-` : `-${bound}`;
+  }
+  const dots = body.indexOf('..');
+  if (dots === -1) throw fail(unreadableRange(body));
+  const low = body.slice(0, dots).trim();
+  const high = body.slice(dots + 2).trim();
+  if (low === '' && high === '') throw fail(UNREADABLE_RANGE);
+  const problem = (low && boundProblem(low)) || (high && boundProblem(high));
+  if (problem) throw fail(problem);
+  if (negated && (low === '' || high === '')) throw fail(NEGATED_OPEN_RANGE);
+  if (low && high && isAbove(low, high)) throw fail(REVERSED_RANGE);
+  return `${negated ? '!' : ''}${low}-${high}`;
+}
+
+/**
+ * The value with its key's own conversion applied, before any quoting: each `|` alternative of a
+ * numeric key's value as `numericAlternative()` writes it, or each `|`/`+` segment of a country or
+ * `language` value converted to its code, a leading `!` and the operators kept. Any other key's
+ * value is returned as given.
+ */
+function convertedValue(key: string, field: string, value: string): string {
+  if (NUMERIC_FILTER_KEYS.has(field)) {
+    return value
+      .split('|')
+      .map((alternative) => numericAlternative(key, value, alternative))
+      .join('|');
+  }
+  const convert = COUNTRY_KEY_SUFFIXES.some((suffix) => field.endsWith(suffix))
+    ? (segment: string) => countrySegment(segment, key)
+    : field === 'language'
+      ? languageSegment
+      : undefined;
+  if (convert === undefined) return value;
+  return value
+    .split(/([|+])/)
+    .map((part, index) => {
+      if (index % 2 === 1) return part;
+      const trimmed = part.trim();
+      return trimmed.startsWith('!') ? `!${convert(trimmed.slice(1).trim())}` : convert(trimmed);
+    })
+    .join('');
+}
+
+/**
  * A filter value as its clause sends it. A value putting `|` beside an AND operator fails as
  * `mixed_and_or_in_filter_value`: a `+` read from the caller's value (`mixesOrWithPlus()`), or a
  * space on a key where words mean AND, read from the value as converted (`mixesOrWithSpace()`).
+ * On a numeric key (`NUMERIC_FILTER_KEYS`), each `|` alternative goes out as
+ * `numericAlternative()` writes it, or fails as `invalid_range_in_filter_value`.
  * On a country key or `language`, each `|`/`+` segment is trimmed and converted on its own, a
  * leading `!` and the operators kept, so a multi-word name is one value (`South Korea|Japan` →
  * `KR|JP`); upstream accepts a hyphenated key spelling, so `country-code` reads as
@@ -340,24 +535,7 @@ function mixedAndOrError(key: string) {
 export function upstreamFilterValue(key: string, value: string): string {
   const field = key.replaceAll('-', '_');
   if (mixesOrWithPlus(field, value)) throw mixedAndOrError(key);
-  const convert = COUNTRY_KEY_SUFFIXES.some((suffix) => field.endsWith(suffix))
-    ? (segment: string) => countrySegment(segment, key)
-    : field === 'language'
-      ? languageSegment
-      : undefined;
-  const converted =
-    convert === undefined
-      ? value
-      : value
-          .split(/([|+])/)
-          .map((part, index) => {
-            if (index % 2 === 1) return part;
-            const trimmed = part.trim();
-            return trimmed.startsWith('!')
-              ? `!${convert(trimmed.slice(1).trim())}`
-              : convert(trimmed);
-          })
-          .join('');
+  const converted = convertedValue(key, field, value);
   if (mixesOrWithSpace(field, converted)) throw mixedAndOrError(key);
   const phrase = quotedPhrase(field, converted);
   if (phrase !== undefined) {

@@ -7,13 +7,14 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
-import { codeSpan } from '@/mcp-server/tools/record-page.js';
+import { discloseFilterRepairs, filtersInput } from '@/mcp-server/tools/filters-input.js';
+import { codeSpan, joinNotices } from '@/mcp-server/tools/record-page.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
+import { arxivResolutionNotice } from '@/services/openalex/arxiv-id.js';
 import {
   getOpenAlexService,
   type IdentifierResolution,
   inferIdentifier,
-  PMCID_NOT_INDEXED_HINT,
 } from '@/services/openalex/openalex-service.js';
 import {
   AUTOCOMPLETE_ENTITY_TYPES,
@@ -86,6 +87,35 @@ function nameMissAdvice(input: NameSearchInput): string {
     : 'Try a shorter name or alternate spelling, or pass entity_type to search one type — a one-type search can find names the cross-type search misses.';
 }
 
+/** An identifier scheme as a notice names it: `openalex` → `OpenAlex ID`, `doi` → `DOI`. */
+function schemeLabel(scheme: string): string {
+  switch (scheme) {
+    case 'openalex':
+      return 'OpenAlex ID';
+    case 'arxiv':
+      return 'arXiv ID';
+    default:
+      return scheme.toUpperCase();
+  }
+}
+
+/**
+ * The notice for an arXiv ID that resolved to no work (`missed` names that): the works its landing
+ * page matched, the upstream failure that stopped that lookup, or the plain miss of both lookups.
+ * The candidates are OpenAlex work IDs the service read as `W` and digits, so they need no escape.
+ */
+function arxivMissNotice(missed: string, miss: IdentifierResolution['arxivMiss']): string {
+  if (miss === undefined) {
+    return `${missed} — neither its 10.48550/arXiv DOI nor its arXiv landing page found one. Check it for a typo, or search for the work by title instead.`;
+  }
+  if ('candidates' in miss) {
+    return `${missed} by its DOI, and ${miss.candidates.length} works hold an arXiv location at its landing page: ${miss.candidates.join(', ')} — pass one as \`query\` to resolve it.`;
+  }
+  return miss.fallbackFailedReason === 'upstream_budget_exhausted'
+    ? `${missed} by its DOI, and the landing-page lookup that finds a work without that DOI was refused (reason upstream_budget_exhausted) — call again after the daily budget refills at midnight UTC.`
+    : `${missed} by its DOI, and the landing-page lookup that finds a work without that DOI failed upstream (reason ${miss.fallbackFailedReason}) — call again to complete it.`;
+}
+
 /**
  * The notice for a bare OpenAlex ID that resolved nothing (`missed` names that), followed by
  * what its name search did: the matches it found, nothing, a failure upstream — or, with
@@ -110,7 +140,7 @@ function idMissNotice(
 
 export const resolveNameTool = tool('openalex_resolve_name', {
   description:
-    "Resolve a name or an identifier to an OpenAlex ID. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. A name returns up to 10 autocomplete matches with disambiguation hints. An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN, bare or in URL form — resolves directly to the record it addresses instead of running a name search. Short names share the bare OpenAlex ID shape (keyword p53 reads as publisher ID P53), so a bare OpenAlex ID that resolves nothing is searched as a name next. Two identifiers can address more than one entity type: a ROR names an organization's institution, funder, and publisher records alike, so it returns each one that exists (institution first) unless entity_type picks one of those three; and a Crossref Funder Registry DOI (10.13039/…) resolves to the funder unless entity_type is works. A PMCID is recognized as well, bare or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work's PMID or DOI instead. An award ID (G…, bare or as an OpenAlex URL) is not looked up, since OpenAlex has no award autocomplete: it returns no matches and a notice naming the openalex_search_entities call that opens the award. Under entity_type, a bare G… is searched as a name of that type instead.",
+    "Resolve a name or an identifier to an OpenAlex ID. ALWAYS use this before filtering by entity — names are ambiguous, IDs are not. A name returns up to 10 autocomplete matches with disambiguation hints. An identifier — OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN, or arXiv ID, bare or in URL form — resolves directly to the record it addresses instead of running a name search. An arXiv ID resolves to its work under any entity_type, found by its arXiv landing page when OpenAlex holds no work under its arXiv DOI, one billed list request. Short names share the bare OpenAlex ID shape (keyword p53 reads as publisher ID P53), so a bare OpenAlex ID that resolves nothing is searched as a name next. Two identifiers can address more than one entity type: a ROR names an organization's institution, funder, and publisher records alike, so it returns each one that exists (institution first) unless entity_type picks one of those three; and a Crossref Funder Registry DOI (10.13039/…) resolves to the funder unless entity_type is works. An award ID (G…, bare or as an OpenAlex URL) is not looked up, since OpenAlex has no award autocomplete: it returns no matches and a notice naming the openalex_search_entities call that opens the award. Under entity_type, a bare G… is searched as a name of that type instead.",
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/resolve-name.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -194,7 +224,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'An identifier `query` holds a `.` or `..` path segment, written plainly or percent-encoded.',
       recovery:
-        'Pass the identifier itself — an OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN — with no relative path segments, or pass a name to search for instead.',
+        'Pass the identifier itself — an OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN, or arXiv ID — with no relative path segments, or pass a name to search for instead.',
       thrownBy: 'service',
     },
     {
@@ -203,6 +233,14 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       when: 'A `filters` value contains a comma, which collides with the OpenAlex filter separator, on a field that takes no phrase. Free-text search filters (any `.search` key, such as display_name.search) and fields matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, parsed_longest_name, biblio fields) are exempt: a comma there is sent quoted, as part of the phrase.',
       recovery:
         'Use `|` for OR within a filter value (e.g. "2020|2021"), or move a free-text phrase containing commas into the `query` parameter.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_range_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A numeric `filters` value (works_count, cited_by_count, publication_year, and the other count, year, and score fields) holds a range OpenAlex cannot read: a negative bound, a reversed range (high bound first), a "!" before a comparison or an open range, a bound that is not a plain decimal, or two comparisons ANDed in one value.',
+      recovery:
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.',
       thrownBy: 'service',
     },
     {
@@ -263,6 +301,22 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       thrownBy: 'service',
     },
     {
+      reason: 'upstream_wildcard_requires_exact',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * or ? wildcard in a stemmed works .search filter that has a .search.exact form (HTTP 400).',
+      recovery:
+        'Use the `.search.exact` key the message names in place of the `.search` filter (title.search → title.search.exact), or remove a `*` that is part of the text rather than a wildcard.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_wildcard_prefix_too_short',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * wildcard with fewer than three characters before it in a .search filter value (HTTP 400).',
+      recovery:
+        'Put at least three characters before the `*` in the filter value (micro*), or remove a `*` that is part of a name or title such as "A* search".',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_validation_failed',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the autocomplete request as semantically invalid (HTTP 422).',
@@ -271,7 +325,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       thrownBy: 'service',
     },
   ],
-  inputAliases: { name: 'query', filter: 'filters' },
+  inputAliases: { name: 'query', filter: 'filters', entity: 'entity_type' },
   input: z.object({
     entity_type: z
       .enum(AUTOCOMPLETE_ENTITY_TYPES)
@@ -283,13 +337,12 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .min(1)
       .describe(
-        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161", or an OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807"), DOI ("10.1038/nature12373", or a funder\'s Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678") — which resolves straight to the record it addresses, or for a ROR up to three (see entity_type), instead of running a name search. A bare OpenAlex ID that resolves nothing is then searched as a name — under entity_type when given, and not at all when filters come without entity_type — since short names share its shape ("P53" is a keyword); under entity_type keywords it is searched as a name from the start. A keyword URL ("https://openalex.org/keywords/groundwater") resolves the same way; a bare keyword slug reads as a name and runs a name search, which finds it too. A PMCID ("PMC1234567" or a PubMed Central URL) is recognized but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. An award ID ("G417894356", or "https://openalex.org/awards/G417894356") sends no request and names the openalex_search_entities call for it; with entity_type, a bare one is searched as a name of that type.',
+        'Name or partial name to resolve. Also accepts an identifier, bare or in URL form — OpenAlex ID ("W2741809807", "F4320332161", or an OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807"), DOI ("10.1038/nature12373", or a funder\'s Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361"), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567" or a PubMed Central URL such as "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/"), ISSN ("1234-5678"), arXiv ID ("1706.03762", "hep-th/9901001", "arXiv:1706.03762", an arxiv.org /abs/ or /pdf/ URL, or its DOI "10.48550/arXiv.1706.03762"; a version suffix is dropped and named in `notice`, and the ID resolves to the work under any entity_type) — which resolves straight to the record it addresses, or for a ROR up to three (see entity_type), instead of running a name search. A bare OpenAlex ID that resolves nothing is then searched as a name — under entity_type when given, and not at all when filters come without entity_type — since short names share its shape ("P53" is a keyword); under entity_type keywords it is searched as a name from the start. A keyword URL ("https://openalex.org/keywords/groundwater") resolves the same way; a bare keyword slug reads as a name and runs a name search, which finds it too. An award ID ("G417894356", or "https://openalex.org/awards/G417894356") sends no request and names the openalex_search_entities call for it; with entity_type, a bare one is searched as a name of that type.',
       ),
-    filters: z
-      .record(z.string(), z.string())
+    filters: filtersInput({ nativeString: false })
       .optional()
       .describe(
-        'Narrow autocomplete results with a filter record object, using the openalex_search_entities value syntax; native string input is unavailable here. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
+        'Narrow autocomplete results with a filter record object, using the openalex_search_entities value syntax; native string input is unavailable here. On numeric fields, `>=N`, `<=N`, `a..b`, `a..`, and `..b` are inclusive ranges, sent as OpenAlex\'s hyphen ranges (`N-`, `-N`, `a-b`); a negative bound, a reversed range, or a `!` before a comparison or an open range is rejected. Boolean values, non-negative numbers, nested objects (`{"authorships":{"author":{"id":"A1"}}}` reads as `authorships.author.id`), and a key wrapped in quotes are read as string values under dotted keys and disclosed in `notice`, except that a whole number at the top level is sent as its decimal text without a notice. null, arrays, empty objects, negative or exponent numbers, and two keys naming one field are rejected. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
       ),
   }),
   output: z.object({
@@ -345,14 +398,14 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when nothing matched (echoes the query, and the filters when a name search applied them, and suggests corrections), when a bare OpenAlex ID resolved nothing and the query was searched as a name instead (names both outcomes, or why the name search did not run or finish), when an identifier query was passed name-search parameters that do not apply to it, when one of the lookups for a ROR failed upstream (names the entity type whose record may be missing), or when the query is an award ID (names the openalex_search_entities call that opens it). Caller text in it is JSON-encoded and Markdown-escaped, the same string on both surfaces. Absent otherwise.',
+        'Guidance notice. Set when nothing matched (echoes the query, and the filters when a name search applied them, and suggests corrections), when a bare OpenAlex ID resolved nothing and the query was searched as a name instead (names both outcomes, or why the name search did not run or finish), when an identifier query was passed name-search parameters that do not apply to it, when one of the lookups for a ROR failed upstream (names the entity type whose record may be missing), when the query is an award ID (names the openalex_search_entities call that opens it), when the filters record was normalized (booleans, numbers, nested objects, or quoted keys; it names the keys), or for an arXiv ID whose version was dropped, that was found by its billed landing-page lookup, that matched several works by its landing page, or whose landing-page lookup failed. Caller text in it is JSON-encoded and Markdown-escaped, the same string on both surfaces. Absent otherwise.',
       ),
     budget: z
       .object({
         costUsd: z
           .number()
           .describe(
-            'USD this call spent. Autocomplete is priced at the floor — resolving a name before filtering costs far less than the failed searches an ambiguous name causes.',
+            'USD this call spent. Autocomplete is priced at the floor — resolving a name before filtering costs far less than the failed searches an ambiguous name causes. An arXiv ID found by its landing page bills one list request.',
           ),
         remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
         resetsInSeconds: z
@@ -375,7 +428,15 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     budget: { render: renderBudgetTrailer },
   },
 
-  async handler(input, ctx) {
+  async handler(parsedInput, ctx) {
+    const { filters: normalized, ...rest } = parsedInput;
+    const input = { ...rest, filters: normalized?.value };
+    const filterRepairs = discloseFilterRepairs(normalized, 'openalex_resolve_name', ctx);
+    /** `notice` is last-wins, so each path sets it once, the filters normalization first. */
+    const setNotice = (notice?: string) => {
+      const joined = joinNotices([filterRepairs, notice]);
+      if (joined) ctx.enrich.notice(joined);
+    };
     const service = getOpenAlexService();
     // An identifier addresses its own record, so it goes to the deterministic by-ID lookup.
     // Autocomplete only ever matched identifiers by accident — it indexes the external-ID URL,
@@ -399,7 +460,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
         resolvedVia: 'none',
         matchCount: 0,
       });
-      ctx.enrich.notice(
+      setNotice(
         `${query} is an OpenAlex award ID; this tool resolves no awards — OpenAlex has no award autocomplete — so nothing was looked up. Open the award with ${openAwardCall(awardId)}; to find an award by title or grant number instead, call it with entity_type "awards" and a \`query\` or the \`funder_award_id\` filter, narrowed by \`funder.id\`.`,
       );
       return { results: [] };
@@ -425,9 +486,11 @@ export const resolveNameTool = tool('openalex_resolve_name', {
           awardId === undefined
             ? ''
             : ` ${query} is also shaped like an OpenAlex award ID — open the award with ${openAwardCall(awardId)}.`;
-        ctx.enrich.notice(
+        setNotice(
           `No matches for ${query}${nameSearchScope(input)}. ${nameMissAdvice(input)}${award}`,
         );
+      } else {
+        setNotice();
       }
       return result;
     }
@@ -436,12 +499,13 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     // as a name next — unless filters came without entity_type, which no name search takes.
     const canSearchByName =
       identifier.mayBeName === true && (input.entity_type !== undefined || !hasFilters(input));
-    const { results, failedEntityTypes, nameFallback } = await service.resolveIdentifier(
-      identifier,
-      ctx,
-      canSearchByName ? nameSearch : undefined,
-      input.query,
-    );
+    const { arxiv, arxivMiss, results, failedEntityTypes, nameFallback } =
+      await service.resolveIdentifier(
+        identifier,
+        ctx,
+        canSearchByName ? nameSearch : undefined,
+        input.query,
+      );
     ctx.log.info('Name resolved', {
       query: input.query,
       entityType: identifier.entityTypes.join(','),
@@ -449,14 +513,13 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       matchCount: results.length,
     });
 
-    const scheme =
-      identifier.scheme === 'openalex' ? 'OpenAlex ID' : identifier.scheme.toUpperCase();
+    const scheme = schemeLabel(identifier.scheme);
     const nouns = identifier.entityTypes.map(entityNoun);
     const missed = `No ${orList(nouns)} in OpenAlex for ${scheme} ${query}`;
 
     // A bare ID that missed was read as a name next, so its notice covers both readings.
     if (identifier.mayBeName && (nameFallback || results.length === 0)) {
-      ctx.enrich.notice(idMissNotice(missed, nameFallback, results.length, input));
+      setNotice(idMissNotice(missed, nameFallback, results.length, input));
       return { results };
     }
 
@@ -474,12 +537,12 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       );
     }
 
+    const arxivNotice = arxiv && arxivResolutionNotice(arxiv);
+    if (arxivNotice) notices.push(arxivNotice);
+
     if (results.length === 0) {
-      if (identifier.scheme === 'pmcid') {
-        // A PMCID is the one identifier whose miss says nothing about the identifier: it is
-        // well formed and OpenAlex still holds no record for it, so "check it for a typo"
-        // sends the caller to re-check something that was never wrong.
-        notices.push(`${missed}. ${PMCID_NOT_INDEXED_HINT}`);
+      if (identifier.scheme === 'arxiv') {
+        notices.push(arxivMissNotice(missed, arxivMiss));
       } else if (identifier.scheme === 'ror' && input.entity_type && nouns.length === 1) {
         notices.push(
           `${missed} under entity_type="${input.entity_type}". One ROR can name an institution, a funder, and a publisher — omit entity_type to look up all three.`,
@@ -504,7 +567,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
       );
     }
 
-    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
+    setNotice(joinNotices(notices));
     return { results };
   },
 

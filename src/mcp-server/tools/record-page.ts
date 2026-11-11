@@ -427,6 +427,20 @@ export interface RecordPageRequest extends PageContext {
    */
   path: 'list' | 'lookup';
   records: readonly EntityRecord[];
+  /**
+   * Top-level fields `select` returned whole for nested names (`open_access` for `is_oa`), which
+   * the refusal names: the caller asked for less than the response carries.
+   */
+  widenedFields?: readonly string[];
+}
+
+/** The refusal sentence naming the top-level fields `select` widened nested names to, or ''. */
+function widenedSelectHint(fields: readonly string[] | undefined): string {
+  if (!fields?.length) return '';
+  const authorTip = fields.includes('authorships')
+    ? ', or `author_list` in place of `authorships`'
+    : '';
+  return ` Nested names in \`select\` returned their whole top-level fields (${fields.map(codeSpan).join(', ')}); select only the ones you need${authorTip}.`;
 }
 
 /**
@@ -484,6 +498,7 @@ export function buildRecordPage(request: RecordPageRequest): PageOutcome {
   const bytes = bytesFor(records.length);
   if (withinCeiling(bytes)) return { kind: 'page', ...pageFor(records.length) };
 
+  const widened = widenedSelectHint(request.widenedFields);
   const [record] = records;
   if (path === 'lookup' && record) {
     const largest = Object.entries(record)
@@ -493,9 +508,11 @@ export function buildRecordPage(request: RecordPageRequest): PageOutcome {
     return tooLarge(
       `The record at \`${bareId(record.id)}\``,
       bytes,
-      largest
-        ? `Narrow \`select\` to the fields you need, or page \`${largest.field}\` (${count(largest.items.length)} elements, its largest array) with \`slice\`.`
-        : 'Narrow `select` to the fields you need.',
+      `${
+        largest
+          ? `Narrow \`select\` to the fields you need, or page \`${largest.field}\` (${count(largest.items.length)} elements, its largest array) with \`slice\`.`
+          : 'Narrow `select` to the fields you need.'
+      }${widened}`,
     );
   }
 
@@ -505,7 +522,7 @@ export function buildRecordPage(request: RecordPageRequest): PageOutcome {
     return tooLarge(
       subject,
       bytes,
-      'The first record alone exceeds the ceiling. Narrow `select` to the fields you need, or fetch the record by `id` and page its largest array with `slice`.',
+      `The first record alone exceeds the ceiling. Narrow \`select\` to the fields you need, or fetch the record by \`id\` and page its largest array with \`slice\`.${widened}`,
     );
   }
   // Past page 1, the same `page` at a smaller per_page holds other records, so the named size
@@ -514,9 +531,11 @@ export function buildRecordPage(request: RecordPageRequest): PageOutcome {
   return tooLarge(
     subject,
     bytes,
-    continuation === 'page' && page > 1
-      ? `per_page ${fits} is the most of these records that fit, but page boundaries move with per_page, so \`page: ${page}\` at that size holds other records; walk the listing from page 1 at per_page ${fits}, or narrow \`select\` to the fields you need.`
-      : `Rerun with per_page ${fits}, the most of these records that fit, and continue ${continuation === 'cursor' ? 'from the cursor that page returns' : 'with the next `page`'}; or narrow \`select\` to the fields you need.`,
+    `${
+      continuation === 'page' && page > 1
+        ? `per_page ${fits} is the most of these records that fit, but page boundaries move with per_page, so \`page: ${page}\` at that size holds other records; walk the listing from page 1 at per_page ${fits}, or narrow \`select\` to the fields you need.`
+        : `Rerun with per_page ${fits}, the most of these records that fit, and continue ${continuation === 'cursor' ? 'from the cursor that page returns' : 'with the next `page`'}; or narrow \`select\` to the fields you need.`
+    }${widened}`,
     { input: 'per_page', value: fits },
   );
 }

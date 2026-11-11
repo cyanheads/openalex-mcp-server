@@ -248,7 +248,6 @@ describe('describeFieldsTool', () => {
         'referenced_works',
         'related_to',
         'sustainable_development_goals.score',
-        'topics_count',
         // HTTP 500 on every probe
         'best_oa_location.raw_type',
         'cites',
@@ -264,7 +263,6 @@ describe('describeFieldsTool', () => {
         'ids.mag',
         'is_high_oa_rate_since_year',
         'is_in_doaj_since_year',
-        'is_in_jstage_since_year',
         'last_publication_year',
         'oa_flip_year',
         // "Cannot group by is_in_jstage: OpenAlex doesn't record which sources are in J-STAGE." (gh #125)
@@ -341,19 +339,70 @@ describe('describeFieldsTool', () => {
     /**
      * group_by view size per entity type after the sweep and the 2026-10-18 regeneration (gh #104)
      * — every other listed field grouped. Sources lost `is_in_jstage` and awards joined at the
-     * 2026-10-28 regeneration (gh #125): 60 awards filters less 4 text searches and 9 refusals.
+     * 2026-10-28 regeneration (gh #125). The 2026-11-10 regeneration added five fields that each
+     * grouped live once (`CATALOG_2026_11_10_GROUPED`).
      */
     const GROUP_BY_TOTALS: Record<string, number> = {
-      works: 165,
-      authors: 36,
+      works: 166,
+      authors: 37,
       sources: 35,
-      institutions: 33,
+      institutions: 34,
       topics: 9,
       keywords: 6,
       publishers: 19,
       funders: 20,
-      awards: 47,
+      awards: 49,
     };
+
+    /** Fields the 2026-11-10 regeneration added; each answered `group_by` with HTTP 200. */
+    const CATALOG_2026_11_10_GROUPED: Record<string, string[]> = {
+      works: ['is_traditional'],
+      authors: ['awards_count'],
+      institutions: ['awards_count'],
+      awards: ['investigators.author.id', 'lead_investigator.author.id'],
+    };
+
+    it.each(Object.entries(CATALOG_2026_11_10_GROUPED))(
+      'offers the fields the 2026-11-10 regeneration added to %s as filters and group_by targets',
+      async (entityType, fields) => {
+        const ctx = createMockContext();
+        const [filter, groupBy] = await Promise.all(
+          (['filter', 'group_by'] as const).map((context) =>
+            describeFieldsTool.handler(
+              describeFieldsTool.input.parse({ entity_type: entityType, context }),
+              ctx,
+            ),
+          ),
+        );
+        for (const field of fields) {
+          expect(filter?.fields).toContain(field);
+          expect(groupBy?.fields).toContain(field);
+        }
+      },
+    );
+
+    /**
+     * Names OpenAlex lists among its valid filter fields but answers with an HTTP 400 as a filter
+     * ("is not a filter", "can't be used as a filter"); `scripts/generate-field-catalog.ts` leaves
+     * them out, so neither view offers them.
+     */
+    it.each([
+      ['works', 'semantic.search'],
+      ['works', 'topics_count'],
+      ['sources', 'is_in_jstage_since_year'],
+    ])(
+      'lists no %s filter or group_by field %s, which OpenAlex refuses as a filter',
+      async (entityType, field) => {
+        const ctx = createMockContext();
+        for (const context of ['filter', 'group_by'] as const) {
+          const view = await describeFieldsTool.handler(
+            describeFieldsTool.input.parse({ entity_type: entityType, context }),
+            ctx,
+          );
+          expect(view.fields).not.toContain(field);
+        }
+      },
+    );
 
     it.each(Object.entries(SWEEP_REJECTS))(
       'drops the fields OpenAlex refuses to group %s by, keeping them as filters (gh #86)',
@@ -461,14 +510,12 @@ describe('describeFieldsTool', () => {
           ctx,
         );
       expect((await select('works')).fields).toEqual(
-        expect.arrayContaining([
-          'rerank_score',
-          'study_designs',
-          'sustainable_development_goals_aurora',
-          'volume',
-        ]),
+        expect.arrayContaining(['is_traditional', 'rerank_score', 'study_designs', 'volume']),
       );
-      expect((await select('authors')).fields).toContain('observed_orcids');
+      expect((await select('works')).fields).not.toContain('sustainable_development_goals_aurora');
+      expect((await select('authors')).fields).toEqual(
+        expect.arrayContaining(['awards_api_url', 'awards_count', 'observed_orcids']),
+      );
       expect((await select('sources')).fields).toEqual(
         expect.arrayContaining(['apc_usd_by_year', 'listed_in']),
       );
@@ -513,7 +560,7 @@ describe('describeFieldsTool', () => {
         .map((b) => ('text' in b ? b.text : ''))
         .join('\n');
 
-      expect(text).toContain('**works** / **group_by** — 165 valid fields');
+      expect(text).toContain('**works** / **group_by** — 166 valid fields');
       expect(text).not.toMatch(/^- fwci$/m);
       expect(text).toMatch(/^- publication_year$/m);
     });
@@ -703,6 +750,37 @@ describe('describeFieldsTool', () => {
         }) ?? [];
       const text = content[0]?.type === 'text' ? content[0].text : '';
       expect(text).toContain('No matches.');
+    });
+  });
+
+  /** The tool's first root-key alias; it takes no per_page, so `limit` stays unknown. (gh #138) */
+  describe('input aliases (gh #138)', () => {
+    /** Arguments as a client sends them: untyped, so the alias keys reach the framework's parse. */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(describeFieldsTool, args as never);
+
+    it('reads entity as entity_type', async () => {
+      const result = await call({ entity: 'works', context: 'select' });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        entity_type: 'works',
+        context: 'select',
+        total: fieldCatalog.works.select.length + 1,
+      });
+    });
+
+    it('rejects entity beside entity_type with the alias hint', async () => {
+      const result = await call({ entity: 'works', entity_type: 'works', context: 'select' });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(
+        'entity is an alias of entity_type; send one of them, not both.',
+      );
+    });
+
+    it('still rejects limit as an unknown key', async () => {
+      const result = await call({ entity_type: 'works', context: 'select', limit: 5 });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain('Unknown key limit');
     });
   });
 });

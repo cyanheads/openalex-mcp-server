@@ -22,19 +22,30 @@ import {
   defaultIsTransient,
   fetchWithTimeout,
   httpStatusToErrorCode,
+  logger,
+  withExtra,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 
 import { getServerConfig } from '@/config/server-config.js';
 
+import {
+  ARXIV_SOURCE_ID,
+  type ArxivId,
+  arxivDoi,
+  arxivLandingPageUrls,
+  parseArxivId,
+} from './arxiv-id.js';
 import { mergeUpstreamBudget, parseUpstreamBudget, type UpstreamBudget } from './budget.js';
 import fieldCatalog from './field-catalog.json' with { type: 'json' };
 import { rankFields } from './field-ranker.js';
 import { quoteCallerText, quotedCommaValue, upstreamFilterValue } from './filter-values.js';
+import { isGroupableField } from './groupable-fields.js';
 import { normalizeProviderText, normalizeProviderValue } from './provider-text.js';
 import {
   type AnalyzeParams,
   type AnalyzeResult,
+  type ArxivResolution,
   AUTOCOMPLETE_ENTITY_TYPES,
   type AutocompleteEntityType,
   type AutocompleteParams,
@@ -107,7 +118,10 @@ type FilterClause = [key: string, value: string];
  * that puts that operator beside a `|` throws `mixed_and_or_in_filter_value`, since OpenAlex drops
  * every `|` alternative that ANDs more than one value; a value sent double-quoted that carries a
  * `"` of its own throws `quote_in_filter_value`. A value left unquoted with an unmatched `"`
- * throws `unmatched_quote_in_filter_value`. Every throw runs before any request.
+ * throws `unmatched_quote_in_filter_value`. On a numeric key, `>=N`, `<=N`, and `a..b` go out as
+ * OpenAlex's hyphen ranges, and a range it cannot read (a negative bound, a reversed range, a
+ * negated comparison or open range) throws `invalid_range_in_filter_value`. Every throw runs
+ * before any request.
  * `autocomplete()` sends its filters without `translateFilters()`, so the conversion lives here
  * rather than there.
  *
@@ -149,22 +163,12 @@ const PUBMED_URL_PATTERN = /^https?:\/\/(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov\/(
 /**
  * A PubMed Central article URL — the current `pmc.ncbi.nlm.nih.gov/articles/…` host and the
  * legacy `ncbi.nlm.nih.gov/pmc/articles/…` path alike. The article segment is a PMCID, so the
- * URL carries exactly the same meaning as the bare form; normalizing it is what makes the two
- * fail identically instead of the URL being forwarded verbatim as a work ID. As with PubMed,
+ * URL carries exactly the same meaning as the bare form; normalizing it is what makes the URL
+ * resolve as the bare form does instead of being forwarded verbatim as a work ID. As with PubMed,
  * the host is anchored on both ends so a look-alike domain can never be read as PubMed Central.
  */
 const PMC_URL_PATTERN =
   /^https?:\/\/(?:www\.)?(?:pmc\.ncbi\.nlm\.nih\.gov|ncbi\.nlm\.nih\.gov\/pmc)\/articles\/(PMC\d+)\/?$/i;
-
-/**
- * Recovery for a PMCID that reached OpenAlex and came back with nothing. OpenAlex indexes no
- * PMCIDs — `has_pmcid:true` matches zero works and a work's `ids` object never carries the key —
- * so a PMCID cannot resolve however well formed it is, and the generic "verify the ID format"
- * advice sends the caller back to retry an identifier that can never work. Shared by the 404
- * mapping here and the `openalex_resolve_name` miss notice so both say the same thing.
- */
-export const PMCID_NOT_INDEXED_HINT =
-  'OpenAlex indexes no PMCIDs, so a PMCID resolves nothing however it is written. Convert it to a PMID or DOI — the NCBI ID Converter (https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/) does this — and retry with that identifier.';
 
 /**
  * The start of an OpenAlex URL — `openalex.org`, `www.openalex.org`, or `api.openalex.org`, with
@@ -469,6 +473,13 @@ export interface ResolvedIdentifier {
 
 /** What `resolveIdentifier()` found. */
 export interface IdentifierResolution extends AutocompleteResult {
+  /** Set when an arXiv ID resolved to its work: how the lookup reached it. */
+  arxiv?: ArxivResolution;
+  /**
+   * Set when an arXiv ID matched no work for more than the plain miss of both lookups: the works
+   * its landing page matched (`candidates`), or the upstream failure that stopped that lookup.
+   */
+  arxivMiss?: { candidates: string[] } | { fallbackFailedReason: string };
   /** Entity types whose lookup failed upstream while another type returned a record. */
   failedEntityTypes?: EntityType[];
   /**
@@ -496,6 +507,10 @@ export interface IdentifierResolution extends AutocompleteResult {
  * address: a ROR to one of institutions, funders, and publishers, and a Funder Registry DOI to
  * works. Any other type leaves the identifier's own types in place — except `keywords`, under
  * which a bare native-ID shape is a name: keyword IDs are slugs, and `P53` is a keyword.
+ *
+ * An arXiv ID in any form `parseArxivId()` reads — its 10.48550 DOI included — is scheme `arxiv`,
+ * a work under every `requested` type. It is read before `normalizeId()`, which would take the DOI
+ * form for a plain DOI; the works lookup reads the arXiv forms itself (see `search()`).
  */
 export function inferIdentifier(
   query: string,
@@ -507,6 +522,9 @@ export function inferIdentifier(
     return { entityTypes: ['keywords'], id: fromUrl.id, scheme: 'openalex' };
   }
   if (fromUrl) return nativeIdentifier(fromUrl.id);
+
+  const arxiv = parseArxivId(trimmed);
+  if (arxiv) return { entityTypes: ['works'], id: `doi:${arxivDoi(arxiv.id)}`, scheme: 'arxiv' };
 
   const normalized = normalizeId(trimmed);
 
@@ -596,8 +614,9 @@ function authorListEntry(authorship: unknown): Record<string, string | null> {
 
 /**
  * What a works request's `select` asks the server to derive from `authorships`: `author_list`,
- * and whether `authorships` itself was asked for too (by name, by its `authors` alias, or by
- * `*`) and so stays on the record.
+ * and whether `authorships` itself was asked for too (by name, by its `authors` alias, by a
+ * dotted `authorships.*` name, or by `*`) and so stays on the record. Read from the split names,
+ * so `author_list` inside a comma-joined entry counts.
  */
 interface AuthorListShape {
   keepAuthorships: boolean;
@@ -605,14 +624,16 @@ interface AuthorListShape {
 
 function authorListShape(
   entityType: SearchParams['entityType'],
-  select: string[] | undefined,
+  select: readonly string[] | undefined,
 ): AuthorListShape | undefined {
-  if (entityType !== 'works' || !select?.includes(AUTHOR_LIST_FIELD)) return;
+  if (entityType !== 'works' || !select) return;
+  const names = selectNames(select);
+  if (!names.includes(AUTHOR_LIST_FIELD)) return;
   return {
-    keepAuthorships: select.some(
-      (field) =>
-        field === '*' ||
-        (field !== AUTHOR_LIST_FIELD && translateSelectField('works', field) === 'authorships'),
+    keepAuthorships: names.some(
+      (name) =>
+        name === '*' ||
+        (name !== AUTHOR_LIST_FIELD && translateSelectField('works', name) === 'authorships'),
     ),
   };
 }
@@ -766,10 +787,10 @@ const SELECT_ALIASES_WORKS: Record<string, string> = {
 
 /**
  * Bibliometric leaves that live under `summary_stats` upstream. `select` projects top-level
- * fields only — OpenAlex rejects both the bare leaf name and the dotted path — so a caller
- * asking for `h_index` gets a 400 listing 21 field names, none of which resemble what they
- * asked for. Widening the leaf to its parent makes the first call succeed and returns the
- * requested metric inside the object it actually lives in.
+ * fields only — OpenAlex rejects the bare leaf name — so a caller asking for `h_index` gets a
+ * 400 listing 21 field names, none of which resemble what they asked for. Widening the leaf to
+ * its parent makes the first call succeed and returns the requested metric inside the object it
+ * actually lives in.
  */
 const SELECT_ALIASES_SUMMARY_STATS: Record<string, string> = {
   '2yr_mean_citedness': 'summary_stats',
@@ -778,28 +799,29 @@ const SELECT_ALIASES_SUMMARY_STATS: Record<string, string> = {
 };
 
 /**
- * Sources-only `select` aliases: the `summary_stats` leaves, plus `publisher`. OpenAlex names a
- * journal's publisher `host_organization_name` — for a repository it names the hosting
- * institution — and token-overlap suggestions cannot reach it from `publisher`. Select only: the
- * filter, sort, and group_by sides have no single target (`host_organization` and
- * `host_organization_lineage` both read as "publisher"), so `publisher` there keeps its 400.
+ * Sources-only `select` rename: OpenAlex names a journal's publisher `host_organization_name` —
+ * for a repository it names the hosting institution — and token-overlap suggestions cannot reach
+ * it from `publisher`. Select only: the filter, sort, and group_by sides have no single target
+ * (`host_organization` and `host_organization_lineage` both read as "publisher"), so `publisher`
+ * there keeps its 400.
  */
 const SELECT_ALIASES_SOURCES: Record<string, string> = {
-  ...SELECT_ALIASES_SUMMARY_STATS,
   publisher: 'host_organization_name',
 };
 
 /**
- * Entity types besides sources that expose `summary_stats`, verified against
- * `api.openalex.org`. `works`, `topics`, and `keywords` carry no such field and reject it in
- * `select`, so they get no alias map — the upstream 400 is the correct answer there.
+ * Works `select` leaves that live under `open_access` upstream. OpenAlex rejects each bare name
+ * (`is_oa is not a valid select field. Did you mean: is_xpac, …`) with no suggestion pointing at
+ * the parent, though its filter side takes `is_oa` and `oa_status` as aliases of their
+ * `open_access.` forms. Works only: sources project `is_oa` as a top-level field of their own,
+ * and the other OA leaves elsewhere have several possible parents or none.
  */
-const SUMMARY_STATS_ENTITY_TYPES: ReadonlySet<string> = new Set([
-  'authors',
-  'funders',
-  'institutions',
-  'publishers',
-]);
+const SELECT_ALIASES_OPEN_ACCESS: Record<string, string> = {
+  any_repository_has_fulltext: 'open_access',
+  is_oa: 'open_access',
+  oa_status: 'open_access',
+  oa_url: 'open_access',
+};
 
 /**
  * Works-only `filter` key aliases. Same shape as `SELECT_ALIASES_WORKS` — LLM callers reach
@@ -812,39 +834,154 @@ const FILTER_ALIASES_WORKS: Record<string, string> = {
   year: 'publication_year',
 };
 
+/** Per entity type, the `select` names that are another field's own name: renames. */
+const SELECT_RENAMES: Partial<Record<EntityType, Record<string, string>>> = {
+  works: SELECT_ALIASES_WORKS,
+  sources: SELECT_ALIASES_SOURCES,
+};
+
 /**
- * Translate caller-friendly aliases in `select` to the upstream OpenAlex field name and
- * guarantee the schema-required fields (`id`, `display_name`) are always projected.
- * `abstract` is reconstructed from `abstract_inverted_index` in the response — the API
- * itself only accepts the latter — so we accept either on input and forward the upstream
- * name. Keeps tool ergonomics symmetric with the response shape.
- *
- * Renames are fail-open: an unmapped name passes through and surfaces upstream's 400 with
- * its valid-field list. Several names can share one upstream field (summary_stats leaves;
- * `author_list` beside `authorships`), so the list is deduped after aliasing rather than before.
+ * Per entity type, the leaf names `select` answers with the top-level object holding them.
+ * `summary_stats` exists on authors, sources, institutions, publishers, and funders, verified
+ * against `api.openalex.org`; works, topics, keywords, and awards carry no such field and reject
+ * it in `select`, so a bibliometric leaf there keeps its upstream 400.
  */
-function translateSelect(entityType: SearchParams['entityType'], fields: string[]): string[] {
-  const upstream = [...REQUIRED_SEARCH_FIELDS, ...fields].map((field) =>
-    translateSelectField(entityType, field),
+const SELECT_LEAF_PARENTS: Partial<Record<EntityType, Record<string, string>>> = {
+  works: SELECT_ALIASES_OPEN_ACCESS,
+  authors: SELECT_ALIASES_SUMMARY_STATS,
+  sources: SELECT_ALIASES_SUMMARY_STATS,
+  institutions: SELECT_ALIASES_SUMMARY_STATS,
+  publishers: SELECT_ALIASES_SUMMARY_STATS,
+  funders: SELECT_ALIASES_SUMMARY_STATS,
+};
+
+/**
+ * Each entity type's top-level `select` fields as OpenAlex lists them (`field-catalog.json`). A
+ * dotted name opening with one of them is answered with that field: `select` projects top-level
+ * fields only, and OpenAlex rejects every dotted path.
+ */
+const TOP_LEVEL_SELECT_FIELDS: ReadonlyMap<EntityType, ReadonlySet<string>> = new Map(
+  ENTITY_TYPES.map((entityType) => [
+    entityType,
+    new Set((fieldCatalog as FieldCatalog)[entityType].select),
+  ]),
+);
+
+/** The upstream field one `select` name projects, and whether it holds the name (a widening). */
+interface SelectProjection {
+  field: string;
+  widened: boolean;
+}
+
+/**
+ * Project one caller `select` name. A rename is the same field under another name (`year` →
+ * `publication_year`, `publisher` → `host_organization_name`, `authors` and `author_list` →
+ * `authorships`). A widening answers a nested name with the top-level object holding it:
+ * `h_index` → `summary_stats`, works `is_oa` → `open_access`, and a dotted name whose first
+ * segment is a top-level select field of the entity type (`primary_location.source.display_name`
+ * → `primary_location`). Any other name passes through, so upstream's 400 names it — a dotted
+ * name opening with no select field (`foo.bar`, works `summary_stats.h_index`) included.
+ */
+function projectSelectName(entityType: SearchParams['entityType'], name: string): SelectProjection {
+  const renamed = ownEntry(SELECT_RENAMES[entityType], name);
+  if (renamed !== undefined) return { field: renamed, widened: false };
+  const dot = name.indexOf('.');
+  const head = dot > 0 ? name.slice(0, dot) : undefined;
+  const parent =
+    ownEntry(SELECT_LEAF_PARENTS[entityType], name) ??
+    (head !== undefined && TOP_LEVEL_SELECT_FIELDS.get(entityType)?.has(head) ? head : undefined);
+  return parent === undefined ? { field: name, widened: false } : { field: parent, widened: true };
+}
+
+/**
+ * The names one caller `select` entry holds. An entry holding a comma is OpenAlex's own
+ * comma-joined `select=` syntax: split on the commas, each piece trimmed, the empty ones dropped
+ * (OpenAlex itself accepts `id,doi,,title` and `id, doi`). Any other entry is one name, as sent,
+ * so every entry that worked unsplit sends the same request.
+ */
+export function splitSelectEntry(entry: string): string[] {
+  if (!entry.includes(',')) return [entry];
+  return entry
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
+/** Every name a caller's `select` holds, comma-joined entries split. */
+function selectNames(select: readonly string[]): string[] {
+  return select.flatMap(splitSelectEntry);
+}
+
+/**
+ * Translate caller-friendly names in `select` to the upstream OpenAlex fields and guarantee the
+ * schema-required fields (`id`, `display_name`) are always projected. `abstract` is
+ * reconstructed from `abstract_inverted_index` in the response — the API itself only accepts
+ * the latter — so we accept either on input and forward the upstream name. Keeps tool
+ * ergonomics symmetric with the response shape.
+ *
+ * Translation is fail-open: an unmapped name passes through and surfaces upstream's 400 with
+ * its valid-field list. Several names can share one upstream field (summary_stats leaves;
+ * `author_list` beside `authorships`; `is_oa` beside `open_access`), so the list is deduped after
+ * translation rather than before.
+ */
+function translateSelect(entityType: SearchParams['entityType'], names: string[]): string[] {
+  const upstream = [...REQUIRED_SEARCH_FIELDS, ...names].map((name) =>
+    translateSelectField(entityType, name),
   );
   return Array.from(new Set(upstream));
 }
 
-/**
- * The upstream field one caller-supplied `select` name projects to — `authors` and
- * `author_list` → `authorships` on works, `publisher` → `host_organization_name` on sources,
- * `h_index` → `summary_stats` where that object exists; any other name unchanged.
- */
+/** The upstream field one caller `select` name projects to (see `projectSelectName`). */
 function translateSelectField(entityType: SearchParams['entityType'], field: string): string {
-  const aliases =
-    entityType === 'works'
-      ? SELECT_ALIASES_WORKS
-      : entityType === 'sources'
-        ? SELECT_ALIASES_SOURCES
-        : SUMMARY_STATS_ENTITY_TYPES.has(entityType)
-          ? SELECT_ALIASES_SUMMARY_STATS
-          : undefined;
-  return ownEntry(aliases, field) ?? field;
+  return projectSelectName(entityType, field).field;
+}
+
+/** A comma-joined `select` entry and the names it split into. */
+export interface SelectSplit {
+  entry: string;
+  names: string[];
+}
+
+/** A nested `select` name and the top-level field returned for it. */
+export interface SelectWidening {
+  field: string;
+  name: string;
+}
+
+/** What the projection made of a caller's `select` beyond renames. */
+export interface SelectReport {
+  splits: SelectSplit[];
+  widenings: SelectWidening[];
+}
+
+/**
+ * Report what the projection made of a caller's `select` beyond renames, for the notices that
+ * disclose it: each comma-joined entry and the names it split into, and each nested name
+ * answered with the top-level field holding it. Mirrors `resolveSelect`: an omitted or empty
+ * `select` takes the curated default, which names no nested field, and `*` projects nothing, so
+ * it widens nothing. Renames stay unreported — the caller gets the field it named.
+ */
+export function reportSelect(
+  entityType: SearchParams['entityType'],
+  select: readonly string[] | undefined,
+): SelectReport {
+  if (!select?.length) return { splits: [], widenings: [] };
+  const splits = new Map<string, string[]>();
+  for (const entry of select) {
+    if (entry.includes(',')) splits.set(entry, splitSelectEntry(entry));
+  }
+  const names = selectNames(select);
+  const widenings = new Map<string, string>();
+  if (!names.includes('*')) {
+    for (const name of names) {
+      const { field, widened } = projectSelectName(entityType, name);
+      if (widened) widenings.set(name, field);
+    }
+  }
+  return {
+    splits: Array.from(splits, ([entry, split]) => ({ entry, names: split })),
+    widenings: Array.from(widenings, ([name, field]) => ({ name, field })),
+  };
 }
 
 /**
@@ -873,17 +1010,21 @@ function ownEntry<V>(table: Record<string, V> | undefined, key: string): V | und
  *
  * - omitted or empty → the curated `DEFAULT_SELECT` for the entity type, keeping responses lean
  *   (full records run 20-70 KB);
- * - contains `'*'` → the full record: returns `undefined` so the caller omits `select` entirely
+ * - names `'*'` → the full record: returns `undefined` so the caller omits `select` entirely
  *   (OpenAlex has no `select=*` wildcard — the sentinel is consumed here, not forwarded);
- * - explicit field list → those fields, with `id`/`display_name` guaranteed and works aliases
+ * - explicit field list → those fields, with `id`/`display_name` guaranteed and aliases
  *   translated.
+ *
+ * Comma-joined entries split after the default is decided, so `[","]` asks for `id` and
+ * `display_name` alone, as `[""]` does, rather than for the default.
  */
 function resolveSelect(
   entityType: SearchParams['entityType'],
-  select: string[] | undefined,
+  select: readonly string[] | undefined,
 ): string[] | undefined {
-  if (select?.includes('*')) return;
-  return translateSelect(entityType, select?.length ? select : DEFAULT_SELECT[entityType]);
+  const names = select?.length ? selectNames(select) : DEFAULT_SELECT[entityType];
+  if (names.includes('*')) return;
+  return translateSelect(entityType, names);
 }
 
 /**
@@ -975,8 +1116,8 @@ function translateFilters(
 /**
  * The `filter` parameter a search or group_by over `filters` sends: keys translated, then each
  * clause built by `buildFilterString()`, whose pre-flight throws (`comma_in_filter_value`,
- * `invalid_country_code`, `mixed_and_or_in_filter_value`, `quote_in_filter_value`,
- * `unmatched_quote_in_filter_value`) it shares.
+ * `invalid_country_code`, `invalid_range_in_filter_value`, `mixed_and_or_in_filter_value`,
+ * `quote_in_filter_value`, `unmatched_quote_in_filter_value`) it shares.
  * Exported so a tool that spends a request before its search — the citation graph's seed lookup —
  * can run those checks first and fail without one.
  */
@@ -992,14 +1133,24 @@ const BASE_BACKOFF_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
 
 /**
- * How long an identifier lookup and the name search it falls back to may take together, counted
- * from the start of the lookup. One request's own worst case — three 10 s attempts and up to
- * ~3.75 s of jittered backoff — is ~34 s, so a lookup that misses inside its retry budget still
- * leaves the name search one full attempt, and the call settles by 45 s, inside the 60 s an MCP
- * client waits. A lookup that ran past it (a long upstream `Retry-After`) leaves no time, and
- * the name search reports a timeout without being sent.
+ * How long an identifier lookup and the fallback it runs after a miss may take together, counted
+ * from the start of the lookup — the name search `resolveIdentifier()` runs after a bare native-ID
+ * miss, and the landing-page lookup and refetch an arXiv DOI miss leads to (`workByArxivId`). One
+ * request's own worst case — three 10 s attempts and up to ~3.75 s of jittered backoff — is ~34 s,
+ * so a lookup that misses inside its retry budget still leaves the fallback one full attempt, and
+ * the call settles by 45 s, inside the 60 s an MCP client waits. A lookup that ran past it (a long
+ * upstream `Retry-After`) leaves no time, and the fallback reports a timeout without being sent.
  */
-const NAME_FALLBACK_DEADLINE_MS = 45_000;
+const FALLBACK_DEADLINE_MS = 45_000;
+
+/** The most landing-page rows an arXiv lookup reads; more than one counted row is already a tie. */
+const ARXIV_LANDING_PAGE_ROWS = 25;
+
+/** A work's OpenAlex ID as a list row carries it, with the bare `W…` ID captured. */
+const OPENALEX_WORK_URL = /^https:\/\/openalex\.org\/(W\d+)$/;
+
+/** The `retry_deadline_exceeded` reason `withRetry` gives a request its `deadlineMs` ran out on. */
+const RETRY_DEADLINE_EXCEEDED = 'retry_deadline_exceeded';
 const KNOWN_AUTOCOMPLETE_TYPES = new Set(
   AUTOCOMPLETE_ENTITY_TYPES.map((type) => type.replace(/s$/, '')),
 );
@@ -1065,15 +1216,22 @@ function recordBudget(budget: UpstreamBudget, ctx: Context): void {
 }
 
 /**
- * Surface OpenAlex's per-request budget accounting and DB latency at debug level, so
- * operators get per-request observability alongside what the caller sees. `db_response_time_ms`
- * has no header equivalent and lives in `meta` — absent on singleton lookups, which carry no
- * `meta` wrapper — while the budget figures come from the headers, which every shape carries.
+ * Write one `OpenAlex response metrics` record at `info` for a billed (2xx) response, so an
+ * operator can see which tool calls spent the daily budget. The budget figures come from the
+ * headers every response shape carries; `db_response_time_ms` has no header and lives in `meta`,
+ * absent on singleton lookups (no `meta` wrapper) and on a body that failed to parse.
+ *
+ * It goes through the module `logger`, the process log only: `ctx.log` would also send it to the
+ * client on every upstream request, repeating the result's `budget`. `withExtra(ctx, …)` keeps
+ * the call's `requestId` and `toolName` on the record. The request is named by `route` and its
+ * parameter names, never their values: the path and the values carry the caller's identifiers,
+ * query text, and filter values.
  */
 function logResponseMetrics(
   parsed: unknown,
   budget: UpstreamBudget | undefined,
   path: string,
+  params: Record<string, string>,
   ctx: Context,
 ): void {
   const meta = isRecord(parsed) ? parsed.meta : undefined;
@@ -1083,15 +1241,19 @@ function logResponseMetrics(
       : undefined;
   if (budget === undefined && db === undefined) return;
 
-  ctx.log.debug('OpenAlex response metrics', {
-    path,
-    ...(budget !== undefined && {
-      costUsd: budget.costUsd,
-      budgetRemainingUsd: budget.remainingUsd,
-      budgetResetsInSeconds: budget.resetsInSeconds,
+  logger.info(
+    'OpenAlex response metrics',
+    withExtra(ctx, {
+      route: parseRequestPath(path).route,
+      params: Object.keys(params),
+      ...(budget !== undefined && {
+        costUsd: budget.costUsd,
+        budgetRemainingUsd: budget.remainingUsd,
+        budgetResetsInSeconds: budget.resetsInSeconds,
+      }),
+      ...(db !== undefined && { dbResponseTimeMs: db }),
     }),
-    ...(db !== undefined && { dbResponseTimeMs: db }),
-  });
+  );
 }
 
 /**
@@ -1209,21 +1371,41 @@ function isGroupByIdRejection(
 const QUERY_TOO_LONG_RE = /\bsearch\b(?: query)?(?: is)? too long\b/i;
 
 /**
+ * OpenAlex 400 emitted when works search meets a `*` or `?` in stemmed text — `search=` (the
+ * keyword `query`) or a `.search` filter that has a `.search.exact` form — in two wordings:
+ * "Wildcards (* or ?) require exact (no-stem) search. …" and "Wildcards (* or ?) require the
+ * exact (no-stem) field. "title.search" is stemmed, …". The message names the `.search.exact`
+ * key to use instead.
+ */
+const WILDCARD_REQUIRES_EXACT_RE = /^Wildcards \(\* or \?\) require\b/;
+
+/**
+ * OpenAlex 400 emitted for a `*` with too few characters before it, in `query` (keyword or
+ * exact) or any `.search` filter, on every entity type: "A * wildcard needs at least 3 leading
+ * characters: "A*". …". No search mode lifts it.
+ */
+const WILDCARD_PREFIX_TOO_SHORT_RE = /^A \* wildcard needs at least \d+ leading characters\b/;
+
+/**
  * A single upstream HTTP 400 spans several distinct failure shapes, each needing a different
  * caller recovery. Pick the declared tool reason from the message shape so the per-tool
  * `recovery` hint (filled by the framework from the reason) matches the actual failure instead of
- * always claiming a rejected field name. Ordering: the over-long-query and ID-value checks run
- * first because they are the shapes naming a concrete upstream concept; the field-name check is
- * anchored at string start; the rest are keyword probes; anything unmatched falls through to a
- * neutral `_other` reason so no shape inherits the field-name recovery by default. The
- * invalid-ID shape alone also reads the request's own `filter`/`group_by` params, because
- * upstream sends it for two different mistakes.
+ * always claiming a rejected field name. Ordering: the two wildcard checks run first — they are
+ * anchored at the message start, and the requires-exact message ends by quoting the caller's
+ * query, so a quote holding another shape's wording ("cannot group by micro*") must never reach
+ * the unanchored probes below. The over-long-query and ID-value checks come next, the shapes
+ * naming a concrete upstream concept; the field-name check is anchored at string start; the rest
+ * are keyword probes; anything unmatched falls through to a neutral `_other` reason so no shape
+ * inherits the field-name recovery by default. The invalid-ID shape alone also reads the
+ * request's own `filter`/`group_by` params, because upstream sends it for two different mistakes.
  */
 function classifyInvalidParamsReason(
   rawMessage: string | undefined,
   requestParams: Record<string, string>,
 ): string {
   if (rawMessage !== undefined) {
+    if (WILDCARD_REQUIRES_EXACT_RE.test(rawMessage)) return 'upstream_wildcard_requires_exact';
+    if (WILDCARD_PREFIX_TOO_SHORT_RE.test(rawMessage)) return 'upstream_wildcard_prefix_too_short';
     if (QUERY_TOO_LONG_RE.test(rawMessage)) return 'query_too_long';
     const invalidId = INVALID_ID_VALUE_RE.exec(rawMessage);
     if (invalidId) {
@@ -1368,8 +1550,9 @@ function classifyRateLimitReason(rawMessage: string | undefined): string {
 
 /**
  * Pick the reason for a normalized throw. Two upstream statuses carry several distinct
- * failure shapes under one error code — 400 (rejected field / relevance sort without a
- * search / ungroupable group_by / non-ID filter value) and 429 (burst throttle vs. spent
+ * failure shapes under one error code — 400 (a wildcard in stemmed works search / a wildcard
+ * with too short a prefix / over-long search text / non-ID filter value / rejected field /
+ * relevance sort without a search / ungroupable group_by) and 429 (burst throttle vs. spent
  * daily budget) — and each shape needs its own caller recovery, so both discriminate on the
  * upstream message, and the 400 invalid-ID shape on the request params too. Every other code
  * maps to a single reason.
@@ -1385,15 +1568,6 @@ function resolveThrowReason(
   }
   if (code === JsonRpcErrorCode.RateLimited) return classifyRateLimitReason(rawMessage);
   return mappedReason;
-}
-
-/**
- * Is this request path a by-ID lookup for a `pmcid:`-scheme identifier? `normalizeId()` folds a
- * recognized scheme to lower case, so `pmcid:` is the exact prefix every PMCID lookup arrives
- * with, bare form and PubMed Central URL alike.
- */
-function isPmcidLookup(path: string): boolean {
-  return path.split('/')[2]?.startsWith('pmcid:') ?? false;
 }
 
 /**
@@ -1414,20 +1588,48 @@ function domainMessageForFetchFailure(error: McpError, path: string): string | u
 }
 
 /**
- * Context keywords in the upstream 400 message mapped to the catalog lookup key.
- * OpenAlex uses "filter" and "group_by" / "select" in its messages.
+ * Which field list a rejected field belongs to. A select rejection says so ("… is not a valid
+ * select field"). A rejected group_by key reads exactly like a rejected filter key ("… is not a
+ * valid field."), so the request's own `group_by`, its `:include_unknown` suffix dropped, tells
+ * the two apart: a group_by key is ranked against the groupable filter fields only, so no
+ * suggestion names a field a group_by retry would fail on (`publication_dat` → `publication_date`,
+ * a raw date).
  */
-function inferContext(message: string): 'filter' | 'select' {
-  return /\bselect\b/i.test(message) ? 'select' : 'filter';
+function inferContext(
+  message: string,
+  rejectedField: string,
+  requestParams: Record<string, string>,
+): 'filter' | 'group_by' | 'select' {
+  if (/\bselect\b/i.test(message)) return 'select';
+  return requestParams.group_by?.replace(/:include_unknown$/, '') === rejectedField
+    ? 'group_by'
+    : 'filter';
 }
 
 /**
- * Derive the entity type from the API path (e.g., "/works" → "works").
- * Falls back to undefined when the path doesn't match a known entity type.
+ * What a request path addresses: the entity type it reads, and its `route` — the path with a
+ * by-ID segment written as `{id}`, so a log record names the endpoint without the caller's DOI,
+ * ID, or slug. The service builds four shapes: `/<entity_type>` (a list, filter, group_by,
+ * sample, or funder-DOI request) and `/<entity_type>/<id>` (an ID that may hold `/`, as a DOI
+ * does) read the first segment, `/autocomplete/<entity_type>` reads the one after it, and
+ * cross-entity `/autocomplete` names no entity type. Exported for the timing suite, which runs it
+ * on a caller-sized by-ID path.
  */
-function entityTypeFromPath(path: string): EntityType | undefined {
-  const segment = path.replace(/^\//, '').split('/')[0];
-  return ENTITY_TYPES.includes(segment as EntityType) ? (segment as EntityType) : undefined;
+export function parseRequestPath(path: string): {
+  entityType: EntityType | undefined;
+  route: string;
+} {
+  const [first = '', second] = path.slice(1).split('/', 2);
+  if (first === 'autocomplete') {
+    return {
+      entityType: second !== undefined && isEntityType(second) ? second : undefined,
+      route: path,
+    };
+  }
+  return {
+    entityType: isEntityType(first) ? first : undefined,
+    route: second === undefined ? path : `/${first}/{id}`,
+  };
 }
 
 /**
@@ -1435,15 +1637,24 @@ function entityTypeFromPath(path: string): EntityType | undefined {
  * `upstream_invalid_params` error message when a rejected field name is
  * extractable from the upstream body.
  */
-function appendFieldSuggestions(message: string, path: string): string {
+function appendFieldSuggestions(
+  message: string,
+  path: string,
+  requestParams: Record<string, string>,
+): string {
   const match = REJECTED_FIELD_RE.exec(message);
   if (!match?.[1]) return message;
 
   const rejectedField = match[1];
-  const entityType = entityTypeFromPath(path);
+  const { entityType } = parseRequestPath(path);
   if (!entityType) return message;
 
-  const pool = getFieldCatalog()[entityType][inferContext(message)];
+  const context = inferContext(message, rejectedField, requestParams);
+  const catalog = getFieldCatalog()[entityType];
+  const pool =
+    context === 'group_by'
+      ? catalog.filter.filter((field) => isGroupableField(entityType, field))
+      : catalog[context];
   const suggestions = rankFields(rejectedField, pool, 3);
   if (suggestions.length === 0) return message;
 
@@ -1489,6 +1700,55 @@ function normalizeSort(sort?: string): string | undefined {
     .join(',');
 }
 
+/** Recovery for an arXiv miss whose landing page several works hold an arXiv location at. */
+const ARXIV_CANDIDATES_HINT =
+  'Retry with one of the OpenAlex work IDs in data.candidates in place of the arXiv ID; each holds an arXiv location at its landing page, so pick the one whose record matches the paper.';
+
+/** Recovery for an arXiv miss whose landing-page lookup failed upstream. */
+const ARXIV_FALLBACK_FAILED_HINT =
+  'Retry the call: no work carries this arXiv DOI, and the landing-page lookup that finds an arXiv work without one failed upstream, so a retry may find the work.';
+
+/** Recovery for an arXiv miss whose landing-page lookup was refused for a spent daily budget. */
+const ARXIV_BUDGET_EXHAUSTED_HINT =
+  "No work carries this arXiv DOI, and the landing-page lookup that finds an arXiv work without one was refused: this server's daily OpenAlex budget is spent. Retry after it refills at midnight UTC.";
+
+/**
+ * The reason to report a failed arXiv landing-page lookup under, or undefined for a failure to
+ * throw as classified. A transient failure and a spent budget leave the DOI's miss standing, since
+ * a later call can still find the work; a caller cancellation, and a request OpenAlex refused, are
+ * not the lookup's to absorb.
+ */
+function landingPageFailureReason(error: unknown, signal: AbortSignal): string | undefined {
+  if (signal.aborted || !(error instanceof McpError)) return;
+  if (error.data?.reason === BUDGET_EXHAUSTED_REASON) return BUDGET_EXHAUSTED_REASON;
+  return defaultIsTransient(error) ? NORMALIZED_THROW_BY_CODE[error.code]?.reason : undefined;
+}
+
+/**
+ * The bare `W…` ID of a landing-page row that counts: one with a location at one of `urls` that
+ * arXiv itself serves. Undefined for any other row, a malformed one included.
+ */
+function arxivLandingWorkId(row: unknown, urls: readonly string[]): string | undefined {
+  if (!isRecord(row) || typeof row.id !== 'string' || !Array.isArray(row.locations)) return;
+  const served = row.locations.some(
+    (location) =>
+      isRecord(location) &&
+      typeof location.landing_page_url === 'string' &&
+      urls.includes(location.landing_page_url) &&
+      isRecord(location.source) &&
+      location.source.id === ARXIV_SOURCE_ID,
+  );
+  return served ? OPENALEX_WORK_URL.exec(row.id)?.[1] : undefined;
+}
+
+/** The `arxivMiss` an arXiv lookup's `entity_not_found` carries, or undefined for a plain miss. */
+function arxivMissDetail(error: McpError): IdentifierResolution['arxivMiss'] {
+  const { candidates, fallbackFailedReason } = error.data ?? {};
+  if (Array.isArray(candidates)) return { candidates: candidates.map(String) };
+  if (typeof fallbackFailedReason === 'string') return { fallbackFailedReason };
+  return;
+}
+
 class OpenAlexService {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -1504,7 +1764,8 @@ class OpenAlexService {
   /**
    * Execute an HTTP request against the OpenAlex API with retry on transient failures. With
    * `deadlineMs`, every attempt and backoff settles within that many milliseconds, after which
-   * the request fails as a `Timeout`.
+   * the request fails as `upstream_timeout`, the reason every tool's contract declares, in place
+   * of the retry ladder's own `retry_deadline_exceeded`.
    */
   private request(
     path: string,
@@ -1536,15 +1797,19 @@ class OpenAlexService {
           // Only 2xx responses reach here — `fetchWithTimeout` throws on anything else, so a
           // throttled or budget-exhausted call surfaces through the error contract instead.
           const budget = parseUpstreamBudget(response.headers);
-          // Recorded before the body is parsed: OpenAlex bills a 200 whether or not its
-          // payload survives (it truncates under load), and `parseResponse` throws on a
-          // truncated body. Recording after would drop the cost of every attempt that
-          // gets retried, under-reporting the call's real spend.
+          // Recorded and logged whether or not the body parses: OpenAlex bills a 200 whether
+          // or not its payload survives (it truncates under load), and `parseResponse` throws
+          // on a truncated body. Counting only parsed bodies would drop the cost of every
+          // attempt that gets retried, so the call's total and its log records would
+          // under-report its real spend.
           if (budget) recordBudget(budget, ctx);
-          const text = await response.text();
-          const parsed = this.parseResponse(text, path);
-          logResponseMetrics(parsed, budget, path, ctx);
-          return parsed;
+          let parsed: unknown;
+          try {
+            parsed = this.parseResponse(await response.text(), path);
+            return parsed;
+          } finally {
+            logResponseMetrics(parsed, budget, path, params, ctx);
+          }
         } catch (error) {
           this.throwNormalizedRequestError(error, path, params);
         }
@@ -1557,7 +1822,16 @@ class OpenAlexService {
         signal: ctx.signal,
         ...(deadlineMs !== undefined && { deadlineMs }),
       },
-    );
+    ).catch((error: unknown) => {
+      if (!(error instanceof McpError && error.data?.reason === RETRY_DEADLINE_EXCEEDED)) {
+        throw error;
+      }
+      throw timeout(
+        `OpenAlex did not answer ${path} before this call's deadline.`,
+        { ...error.data, path, reason: 'upstream_timeout' },
+        { cause: error },
+      );
+    });
   }
 
   private throwNormalizedRequestError(
@@ -1571,6 +1845,10 @@ class OpenAlexService {
 
     const statusCode =
       typeof error.data?.statusCode === 'number' ? error.data.statusCode : undefined;
+    // `fetchWithTimeout` marks the captured body (`body`, `responseBody`) server-only: it reads
+    // here and lands in the failure log, and the marker rides every `{ ...error.data }` below, so
+    // no client envelope carries it. `upstreamError` and `upstreamMessage` are what the caller
+    // sees of the body.
     const upstream = parseOpenAlexErrorBody(error.data?.responseBody);
     const rawMessage = upstream?.message ?? upstream?.error;
     const upstreamFields = {
@@ -1591,8 +1869,8 @@ class OpenAlexService {
     }
     // A semantic search whose query embedding failed upstream comes back as a 400, but the request
     // was valid and the fault is transient. Thrown as the outage it is, it is retried like one, and
-    // its message is the server's own: the upstream one names the embedding service's host. The
-    // body stays verbatim on `data`, as on every upstream error.
+    // its message is the server's own: the upstream one names the embedding service's host, and
+    // reaches the caller only as `data.upstreamMessage`.
     if (isSemanticEmbedFailure(statusCode, rawMessage, params)) {
       throw serviceUnavailable(
         'OpenAlex could not embed the query for semantic search. The failure is upstream; the request itself is valid.',
@@ -1610,7 +1888,7 @@ class OpenAlexService {
     // it would be retried and reported with wait-and-retry advice, yet no wait clears a plan gate.
     // `Forbidden` sits outside `withRetry`'s transient set, so the first request is the only one,
     // and `retryable: false` tells the caller the same over the 429 status left on `data`. The
-    // message is the server's own; the body stays verbatim on `data`, as on every upstream error.
+    // message is the server's own; the upstream text rides `upstreamError` and `upstreamMessage`.
     if (statusCode === 429 && upstream?.error === PLAN_UPGRADE_REQUIRED_ERROR) {
       throw forbidden(
         planGatedFilterMessage(upstream.message),
@@ -1653,7 +1931,7 @@ class OpenAlexService {
     if (rawMessage !== undefined && upstream?.truncated) {
       const withSuggestions =
         code === JsonRpcErrorCode.InvalidParams
-          ? appendFieldSuggestions(rawMessage, path)
+          ? appendFieldSuggestions(rawMessage, path, params)
           : rawMessage;
       sanitizedMessage =
         withSuggestions === rawMessage
@@ -1671,13 +1949,6 @@ class OpenAlexService {
       ...error.data,
       path,
       reason,
-      // A PMCID lookup that 404s is not a miss to verify and retry — OpenAlex indexes no
-      // PMCIDs, so every tool's generic "verify the ID" recovery hands back the one instruction
-      // that cannot help. Substituted here, where all three ID-accepting tools inherit it; an
-      // explicit hint wins over the one the framework would fill from the contract.
-      ...(code === JsonRpcErrorCode.NotFound && isPmcidLookup(path)
-        ? { recovery: { hint: PMCID_NOT_INDEXED_HINT } }
-        : {}),
       // `RateLimited` sits in the framework's transient set, so `withRetry` would spend the
       // full attempt budget against a budget wall that stays up until the daily reset. This
       // flag is the framework's per-error opt-out from that loop; the contract's own
@@ -1736,10 +2007,16 @@ class OpenAlexService {
     }
   }
 
-  /** Search/filter/sort entities, or retrieve a single entity by ID. */
+  /**
+   * Search/filter/sort entities, or retrieve a single entity by ID. A works `id` that reads as an
+   * arXiv ID is looked up through `workByArxivId`. `params.deadlineMs` bounds every request sent.
+   */
   async search(params: SearchParams, ctx: Context): Promise<SearchResult> {
     // Singleton lookup by ID
     if (params.id) {
+      const arxivId = params.entityType === 'works' ? parseArxivId(params.id) : undefined;
+      if (arxivId) return this.workByArxivId(arxivId, params, ctx);
+
       const normalizedId = normalizeId(params.id);
       assertIdMatchesEntityType(normalizedId, params.entityType);
       const select = resolveSelect(params.entityType, params.select);
@@ -1748,10 +2025,11 @@ class OpenAlexService {
         return this.funderByDoi(normalizedId.slice('doi:'.length), select, ctx);
       }
 
-      const data = (await this.request(
+      const data = (await this.requestWithin(
         byIdPath(params.entityType, normalizedId, params.id),
         select ? { select: select.join(',') } : {},
         ctx,
+        params.deadlineMs,
       )) as EntityRecord;
 
       return {
@@ -1802,7 +2080,12 @@ class OpenAlexService {
       queryParams.cursor = params.cursor ?? '*';
     }
 
-    const searchRequest = this.request(`/${params.entityType}`, queryParams, ctx) as Promise<{
+    const searchRequest = this.requestWithin(
+      `/${params.entityType}`,
+      queryParams,
+      ctx,
+      params.deadlineMs,
+    ) as Promise<{
       meta: SearchResult['meta'];
       results: EntityRecord[];
     }>;
@@ -1814,10 +2097,11 @@ class OpenAlexService {
     let populationRequest: Promise<{ meta: { count: number } }> | undefined;
     if (params.sample !== undefined) {
       const { sample: _sample, seed: _seed, page: _page, ...filterParams } = queryParams;
-      populationRequest = this.request(
+      populationRequest = this.requestWithin(
         `/${params.entityType}`,
         { ...filterParams, per_page: '1', cursor: '*' },
         ctx,
+        params.deadlineMs,
       ) as Promise<{ meta: { count: number } }>;
     }
 
@@ -1867,6 +2151,149 @@ class OpenAlexService {
       meta: { count: 1, per_page: 1, next_cursor: null },
       results: normalizeEntityRecords([record]),
     };
+  }
+
+  /**
+   * Look a work up by arXiv ID (gh #137). OpenAlex has no arXiv-ID path, so it takes up to three
+   * requests:
+   *
+   * 1. `/works/doi:10.48550/arXiv.<id>`, the DOI arXiv registers for every article — unbilled.
+   *    A failure other than a 404 is thrown as any by-ID lookup's is.
+   * 2. On that 404, one list request for works with a location at the arXiv landing page, billed
+   *    as a list request. A row counts only when the location at that page is arXiv's own
+   *    (`ARXIV_SOURCE_ID`): a repository record can carry the same URL on an unrelated work.
+   * 3. On one counted row, that work by ID with the caller's `select` — unbilled, and a
+   *    singleton, so its author arrays run to 5,000 rather than a list record's 100.
+   *
+   * Steps 2 and 3 get what is left of `FALLBACK_DEADLINE_MS` from the start of step 1, and of
+   * `params.deadlineMs` when the caller set one. The landing-page lookup reads again an ID whose
+   * DOI already missed, so none of its failures turns that miss into an outage: no counted row,
+   * two or more (`data.candidates`), a transient failure, a spent budget, or no time left
+   * (`data.fallbackFailedReason`) all fail as `entity_not_found`. A request OpenAlex refused
+   * (400, 401, 403, …) is thrown as classified — the server built it — as are a caller
+   * cancellation and any failure of step 3, whose work the list already found.
+   */
+  private async workByArxivId(
+    arxiv: ArxivId,
+    params: SearchParams,
+    ctx: Context,
+  ): Promise<SearchResult> {
+    const startedAt = Date.now();
+    const select = resolveSelect('works', params.select);
+    const selectParams = select ? { select: select.join(',') } : {};
+    const doi = arxivDoi(arxiv.id);
+    const found = (record: EntityRecord, via: ArxivResolution['via']): SearchResult => ({
+      meta: { count: 1, per_page: 1, next_cursor: null },
+      results: normalizeEntityRecords([record], authorListShape('works', params.select)),
+      arxiv: {
+        arxivId: arxiv.id,
+        ...(arxiv.version !== undefined && { droppedVersion: arxiv.version }),
+        via,
+      },
+    });
+
+    try {
+      const record = await this.requestWithin(
+        byIdPath('works', `doi:${doi}`),
+        selectParams,
+        ctx,
+        params.deadlineMs,
+      );
+      return found(record as EntityRecord, 'doi');
+    } catch (error) {
+      if (!(error instanceof McpError && error.code === JsonRpcErrorCode.NotFound)) throw error;
+    }
+
+    const timeLeft = () =>
+      Math.min(FALLBACK_DEADLINE_MS, params.deadlineMs ?? Number.POSITIVE_INFINITY) -
+      (Date.now() - startedAt);
+    const urls = arxivLandingPageUrls(arxiv.id);
+    const [, page] = urls;
+    const miss = (detail: string, data: Record<string, unknown> = {}, cause?: unknown) =>
+      notFound(
+        `No work in OpenAlex carries the DOI ${doi}, and ${detail}`,
+        { reason: 'entity_not_found', path: '/works', arxivId: arxiv.id, ...data },
+        cause === undefined ? undefined : { cause },
+      );
+    const failedLookup = (fallbackFailedReason: string, cause?: unknown) => {
+      ctx.log.notice('arXiv landing-page lookup failed upstream', {
+        arxivId: arxiv.id,
+        reason: fallbackFailedReason,
+      });
+      return miss(
+        `the landing-page lookup that finds a work without it failed upstream (${fallbackFailedReason}).`,
+        {
+          fallbackFailedReason,
+          recovery: {
+            hint:
+              fallbackFailedReason === BUDGET_EXHAUSTED_REASON
+                ? ARXIV_BUDGET_EXHAUSTED_HINT
+                : ARXIV_FALLBACK_FAILED_HINT,
+          },
+        },
+        cause,
+      );
+    };
+
+    let body: unknown;
+    try {
+      body = await this.requestWithin(
+        '/works',
+        {
+          filter: `locations.landing_page_url:${urls.join('|')}`,
+          select: 'id,locations',
+          per_page: String(ARXIV_LANDING_PAGE_ROWS),
+        },
+        ctx,
+        timeLeft(),
+      );
+    } catch (error) {
+      const reason = landingPageFailureReason(error, ctx.signal);
+      if (reason === undefined) throw error;
+      throw failedLookup(reason, error);
+    }
+
+    const rows = isRecord(body) && Array.isArray(body.results) ? body.results : undefined;
+    if (rows === undefined) throw failedLookup('upstream_unavailable');
+    const candidates = rows.flatMap((row) => arxivLandingWorkId(row, urls) ?? []);
+    const [candidate] = candidates;
+    if (candidate === undefined) {
+      throw miss(`none has an arXiv location at its landing page ${page}.`);
+    }
+    if (candidates.length > 1) {
+      throw miss(
+        `${candidates.length} works have an arXiv location at its landing page ${page}: ${candidates.join(', ')}.`,
+        { candidates, recovery: { hint: ARXIV_CANDIDATES_HINT } },
+      );
+    }
+
+    const record = await this.requestWithin(
+      byIdPath('works', candidate),
+      selectParams,
+      ctx,
+      timeLeft(),
+    );
+    return found(record as EntityRecord, 'landing_page');
+  }
+
+  /**
+   * `request()` bounded by `deadlineMs`, what is left of a deadline spanning several requests. With
+   * none left it fails as `upstream_timeout` before sending. Without `deadlineMs` it is
+   * `request()` unchanged.
+   */
+  private async requestWithin(
+    path: string,
+    params: Record<string, string>,
+    ctx: Context,
+    deadlineMs: number | undefined,
+  ): Promise<unknown> {
+    if (deadlineMs !== undefined && deadlineMs <= 0) {
+      throw timeout(`No time was left to ask OpenAlex for ${path} before this call's deadline.`, {
+        path,
+        reason: 'upstream_timeout',
+      });
+    }
+    return await this.request(path, params, ctx, deadlineMs);
   }
 
   /** Group-by aggregation. */
@@ -1952,7 +2379,10 @@ class OpenAlexService {
    * `nameSearch` is the autocomplete to run when every lookup finds nothing — for a query that
    * may be a name rather than an ID (`ResolvedIdentifier.mayBeName`). It runs only on that miss,
    * so an ID that resolves still costs its one request, and only within what is left of
-   * `NAME_FALLBACK_DEADLINE_MS` from the start of this call (see `nameSearchAfterMiss`).
+   * `FALLBACK_DEADLINE_MS` from the start of this call (see `nameSearchAfterMiss`).
+   *
+   * An arXiv ID's lookup reports how it reached its work as `arxiv`, and a miss past the plain one
+   * — several candidate works, or a failed landing-page lookup — as `arxivMiss`.
    *
    * `query` is the text `identifier` was read from, as the caller wrote it. The lookups are sent
    * that spelling, which `search()` normalizes back to `identifier.id`, so a lookup that refuses
@@ -1971,11 +2401,14 @@ class OpenAlexService {
 
     const results: AutocompleteRecord[] = [];
     const failed: { entityType: EntityType; error: unknown }[] = [];
+    let arxiv: ArxivResolution | undefined;
+    let arxivMiss: IdentifierResolution['arxivMiss'];
     settled.forEach((outcome, index) => {
       const entityType = identifier.entityTypes[index] as EntityType;
       if (outcome.status === 'fulfilled') {
         const [record] = outcome.value.results;
         if (record) results.push(toAutocompleteRecord(entityType, record));
+        arxiv ??= outcome.value.arxiv;
       } else if (
         outcome.reason instanceof McpError &&
         outcome.reason.code === JsonRpcErrorCode.NotFound
@@ -1984,6 +2417,7 @@ class OpenAlexService {
           identifier: identifier.id,
           entityType,
         });
+        arxivMiss ??= arxivMissDetail(outcome.reason);
       } else {
         failed.push({ entityType, error: outcome.reason });
       }
@@ -1994,12 +2428,14 @@ class OpenAlexService {
     if (results.length === 0 && nameSearch) {
       return this.nameSearchAfterMiss(
         nameSearch,
-        NAME_FALLBACK_DEADLINE_MS - (Date.now() - startedAt),
+        FALLBACK_DEADLINE_MS - (Date.now() - startedAt),
         ctx,
       );
     }
     return {
       results,
+      ...(arxiv && { arxiv }),
+      ...(arxivMiss && { arxivMiss }),
       ...(failed.length > 0 ? { failedEntityTypes: failed.map((f) => f.entityType) } : {}),
     };
   }

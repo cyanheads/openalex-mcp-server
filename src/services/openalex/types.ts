@@ -116,6 +116,12 @@ export const DEFAULT_SELECT: Record<EntityType, string[]> = {
 
 export interface SearchParams {
   cursor?: string | undefined;
+  /**
+   * Milliseconds the whole call may take from when `search()` starts — every request it sends,
+   * every retry and backoff included — after which it fails as `upstream_timeout`. A tool that
+   * chains several calls under one deadline passes each what the earlier ones left.
+   */
+  deadlineMs?: number | undefined;
   entityType: EntityType;
   filters?: Record<string, string> | undefined;
   id?: string | undefined;
@@ -134,12 +140,31 @@ export interface SearchParams {
 }
 
 export interface SearchResult {
+  /** Set on an `id` lookup that read the `id` as an arXiv ID: how it reached the work. */
+  arxiv?: ArxivResolution;
   meta: {
     count: number;
     per_page: number;
     next_cursor: string | null;
   };
   results: EntityRecord[];
+}
+
+/**
+ * How a works lookup by arXiv ID reached its work (gh #137). OpenAlex has no arXiv-ID path, so the
+ * ID is looked up by the DOI arXiv registers for it, and by its arXiv landing page when no work
+ * carries that DOI.
+ */
+export interface ArxivResolution {
+  /** The versionless arXiv ID the caller's identifier was read as. */
+  arxivId: string;
+  /** The version the caller's identifier named (`v5`), dropped: OpenAlex keeps one work per paper. */
+  droppedVersion?: string;
+  /**
+   * `doi`: found by `10.48550/arXiv.<id>`, an unbilled by-ID fetch. `landing_page`: that DOI
+   * found nothing, and a list request on the arXiv landing page — billed — found the work.
+   */
+  via: 'doi' | 'landing_page';
 }
 
 export interface AnalyzeParams {

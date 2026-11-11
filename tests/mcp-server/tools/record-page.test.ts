@@ -320,6 +320,54 @@ describe('record pages (gh #131)', () => {
     });
   });
 
+  /** A refusal names the top-level fields `select` widened nested names to. (gh #135) */
+  describe('widened select fields in the response_too_large hint (gh #135)', () => {
+    const hintOf = (outcome: PageOutcome) =>
+      outcome.kind === 'too_large' ? outcome.data.recovery.hint : '';
+    const sentence =
+      ' Nested names in `select` returned their whole top-level fields (`open_access`, `authorships`); select only the ones you need, or `author_list` in place of `authorships`.';
+
+    it.each([
+      ['an id lookup', [padded(1, 8_000_000)], 'lookup'],
+      ['a list whose first record overflows', [padded(1, 8_000_000), padded(2, 10)], 'list'],
+      [
+        'a list page that fits at a smaller per_page',
+        [padded(1, 5_000_000), padded(2, 5_000_000)],
+        'list',
+      ],
+    ] as const)(
+      'appends the widened fields on %s, and nothing without them',
+      (_label, records, path) => {
+        const request = {
+          ...context,
+          records: [...records],
+          path,
+          continuation: 'cursor',
+        } as const;
+        const plain = hintOf(buildRecordPage(request));
+        expect(plain).not.toContain('Nested names');
+        expect(hintOf(buildRecordPage({ ...request, widenedFields: [] }))).toBe(plain);
+        expect(
+          hintOf(buildRecordPage({ ...request, widenedFields: ['open_access', 'authorships'] })),
+        ).toBe(`${plain}${sentence}`);
+      },
+    );
+
+    it('omits the author_list pointer when authorships was not widened', () => {
+      const hint = hintOf(
+        buildRecordPage({
+          ...context,
+          records: [padded(1, 8_000_000)],
+          path: 'lookup',
+          continuation: 'cursor',
+          widenedFields: ['summary_stats'],
+        }),
+      );
+      expect(hint).toContain('top-level fields (`summary_stats`); select only the ones you need.');
+      expect(hint).not.toContain('author_list');
+    });
+  });
+
   describe('whole pages and arrays', () => {
     it('returns every record of a page far past 64,000 bytes, with no window', () => {
       const records = Array.from({ length: 25 }, (_, n) => workWithAuthorships(n, 98));

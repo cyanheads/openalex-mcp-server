@@ -4,6 +4,8 @@
  * @module index
  */
 
+// First: definition modules read the server config as they load.
+import '@/config/env-file.js';
 import { createApp } from '@cyanheads/mcp-ts-core';
 import { literatureReviewPrompt } from '@/mcp-server/prompts/definitions/literature-review.prompt.js';
 import { researchLandscapePrompt } from '@/mcp-server/prompts/definitions/research-landscape.prompt.js';

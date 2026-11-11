@@ -1046,14 +1046,21 @@ const WORK_CHARS = 400_000;
 const SAMPLES = 5;
 /** Absolute per-call bound: CPU milliseconds per 1,000 input characters. */
 const MS_PER_K_CHARS = 0.5;
+/** Back-to-back (smallest size, 64×) readings the full-span growth is taken from. */
+const SPAN_PAIRS = 3;
 
-/** This thread's CPU milliseconds per call of `fn` on `input`, the fastest of `SAMPLES` runs. */
-function cpuMsPerCall(fn: (s: string) => unknown, input: string): number {
-  const reps = Math.ceil(WORK_CHARS / input.length);
+/**
+ * This thread's CPU milliseconds per call of `fn`, the fastest of `SAMPLES` runs. `input` is what
+ * `fn` is called with; a number is a size in characters for a call that takes no text (a record
+ * whose size is its JSON length, which cannot be stringified when it nests deeply).
+ */
+function cpuMsPerCall(fn: (s: string) => unknown, input: string | number): number {
+  const size = typeof input === 'string' ? input.length : input;
+  const reps = Math.ceil(WORK_CHARS / size);
   let best = Number.POSITIVE_INFINITY;
   for (let sample = 0; sample < SAMPLES; sample++) {
     const start = process.threadCpuUsage();
-    for (let i = 0; i < reps; i++) fn(input);
+    for (let i = 0; i < reps; i++) fn(String(input));
     const used = process.threadCpuUsage(start);
     best = Math.min(best, (used.user + used.system) / 1000 / reps);
   }
@@ -1067,20 +1074,26 @@ function build(unit: string, size: number): string {
 
 /**
  * Time a shape in this thread's own CPU time at every doubling of its size, from `from` to 64×
- * it. Each size is checked against an absolute bound before the next size runs, so super-linear
- * growth fails at the size where it starts instead of hanging the suite; across the full 64×
- * span the time must grow by less than 256× (linear grows ~64×, quadratic ~4096×).
+ * it. Every reading is checked against an absolute bound as it is taken, before the next size
+ * runs, so super-linear growth fails at the size where it starts instead of hanging the suite.
+ * Across the full 64× span the time must grow by less than 256× (linear grows ~64×, quadratic
+ * ~4096×): the smallest size is re-timed beside the 64× size in `SPAN_PAIRS` back-to-back pairs
+ * and the least growth across the pairs is asserted, so neither a baseline caught unusually fast
+ * nor a change in machine state between the start of the run and its end fails a linear shape.
  */
 function expectLinearCpuTime(from: number, msAt: (size: number) => number): void {
-  let first = 0;
-  let last = 0;
-  for (let size = from; size <= from * 64; size *= 2) {
+  const top = from * 64;
+  const timed = (size: number): number => {
     const ms = msAt(size);
     expect(ms, `${size} characters`).toBeLessThan((size / 1000) * MS_PER_K_CHARS);
-    if (size === from) first = ms;
-    last = ms;
-  }
-  expect(last / first).toBeLessThan(256);
+    return ms;
+  };
+  for (let size = from; size < top; size *= 2) timed(size);
+  const growth = Array.from({ length: SPAN_PAIRS }, () => {
+    const baseline = timed(from);
+    return timed(top) / baseline;
+  });
+  expect(Math.min(...growth), `growth from ${from} to ${top} characters`).toBeLessThan(256);
 }
 
 /**
@@ -1545,6 +1558,28 @@ describe('Security — a plan-gated filter is named in linear time (gh #114)', (
 });
 
 /**
+ * Every billed response's metrics record and every invalid-field suggestion parse the request
+ * path, and a by-ID path carries the caller's `id` whole, so the parse runs on caller-sized text.
+ * Each shape is timed with `expectLinearCpuTime` from 5k to 320k characters. (gh #139, #140)
+ */
+describe('Security — request paths parse in linear time (gh #139, #140)', () => {
+  const PATH_SHAPES: [string, (size: number) => string][] = [
+    ['a long DOI id', (n) => `/works/doi:10.1000/${'1'.repeat(n)}`],
+    ['slash runs in the id', (n) => `/works/${'/'.repeat(n)}`],
+    ['a long first segment', (n) => `/${'w'.repeat(n)}`],
+    ['a long autocomplete tail', (n) => `/autocomplete/${'a'.repeat(n)}`],
+    ['repeated autocomplete segments', (n) => build('/autocomplete', n)],
+    ['one long line ending in a line break', (n) => `/works/${'x'.repeat(n)}\ny`],
+    ['blank and CRLF runs throughout', (n) => `/works/${build('  \r\n', n)}`],
+  ];
+
+  it.each(PATH_SHAPES)('parseRequestPath: %s', { timeout: 60_000 }, async (_label, make) => {
+    const { parseRequestPath } = await import('@/services/openalex/openalex-service.js');
+    expectLinearCpuTime(5_000, (size) => cpuMsPerCall(parseRequestPath, make(size)));
+  });
+});
+
+/**
  * OpenAlex passes provider text through unsanitized. These cases drive each tool end to end —
  * the real service with only `fetch` stubbed, the real `format()`, and the enrichment trailer
  * the framework appends — and read `content[]` through a CommonMark + GFM parser.
@@ -1872,38 +1907,54 @@ describe('Security — provider text reaching both surfaces (gh #76)', () => {
   });
 });
 
+/**
+ * The arXiv parse runs on every works `id`, `seed_id`, and `resolve_name` query — caller-sized
+ * text — so each shape is timed with `expectLinearCpuTime`. Each shape stays at or below 80k
+ * characters but the digit run, which carries the span to 320k. (gh #137)
+ */
+describe('Security — arXiv identifiers are read in linear time (gh #137)', () => {
+  const SHAPES: [string, (size: number) => string, number][] = [
+    ['a new-style digit run that never ends', (n) => `1706.${'1'.repeat(n)}`, 5_000],
+    ['a long archive letter run', (n) => `${'a'.repeat(n)}/0309136`, 1_250],
+    ['hyphen runs in an archive', (n) => `${build('a-', n)}/0309136`, 1_250],
+    ['a long version run', (n) => `1706.03762v${'1'.repeat(n)}`, 1_250],
+    ['repeated arXiv: prefixes', (n) => build('arXiv:', n), 1_250],
+    ['repeated arXiv host openers', (n) => build('arxiv.org/abs/', n), 1_250],
+    ['repeated arXiv DOI prefixes', (n) => build('10.48550/arXiv.', n), 1_250],
+    [
+      'query runs after an arXiv URL',
+      (n) => `https://arxiv.org/abs/1706.03762?${build('a=b&', n)}`,
+      1_250,
+    ],
+    [
+      '.pdf runs after an arXiv URL',
+      (n) => `https://arxiv.org/pdf/1706.03762${build('.pdf', n)}`,
+      1_250,
+    ],
+    ['slash runs after an arXiv URL', (n) => `https://arxiv.org/abs/${'/'.repeat(n)}`, 1_250],
+    ['one long line ending in a break', (n) => `${build('§1 x', n)}\ny`, 1_250],
+    ['blank and CRLF runs', (n) => build('  \r\n', n), 1_250],
+  ];
+
+  const CASES = (['parseArxivId', 'inferIdentifier'] as const).flatMap((fn) =>
+    SHAPES.map(([label, make, from]) => [fn, label, make, from] as const),
+  );
+
+  it.each(CASES)('%s: %s', { timeout: 60_000 }, async (fnName, _label, make, from) => {
+    const { parseArxivId } = await import('@/services/openalex/arxiv-id.js');
+    const { inferIdentifier } = await import('@/services/openalex/openalex-service.js');
+    const fn = fnName === 'parseArxivId' ? parseArxivId : (s: string) => inferIdentifier(s);
+    expectLinearCpuTime(from, (size) => cpuMsPerCall(fn, make(size)));
+  });
+});
+
+/**
+ * Every shape is timed in this thread's own CPU time (`cpuMsPerCall`), so the scheduler delays a
+ * loaded machine adds to wall-clock time stay out of the measurement, at every doubling from 1,250
+ * to 80k characters (64×, under Bun's regex mode switch), each size held to the absolute bound
+ * before the next runs and the full span to less than 256× growth (`expectLinearCpuTime`).
+ */
 describe('Security — text scanners run in linear time (gh #76)', () => {
-  /**
-   * Milliseconds per call on a 5k and an 80k input. Each sample repeats the call until
-   * `WORK_CHARS` characters have been processed, so the small size is not lost in timer noise.
-   * The two sizes alternate sample by sample, so load from other processes lands on both, and
-   * each keeps its fastest of `SAMPLES`, which a burst of load cannot inflate. Linear growth
-   * keeps t(80k)/t(5k) near 16; quadratic reaches 256.
-   */
-  const WORK_CHARS = 400_000;
-  const SAMPLES = 7;
-  function msPerCall(fn: (s: string) => unknown, input: string): number {
-    const reps = Math.ceil(WORK_CHARS / input.length);
-    const start = performance.now();
-    for (let i = 0; i < reps; i++) fn(input);
-    return (performance.now() - start) / reps;
-  }
-  function perCallMs(fn: (s: string) => unknown, make: (size: number) => string) {
-    const small = make(5_000);
-    const large = make(80_000);
-    let t5k = Number.POSITIVE_INFINITY;
-    let t80k = Number.POSITIVE_INFINITY;
-    for (let sample = 0; sample < SAMPLES; sample++) {
-      t5k = Math.min(t5k, msPerCall(fn, small));
-      t80k = Math.min(t80k, msPerCall(fn, large));
-    }
-    return { t5k, t80k };
-  }
-
-  function build(unit: string, size: number): string {
-    return unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
-  }
-
   const NORMALIZER_CASES: [string, (size: number) => string][] = [
     ['unclosed <!-- repeated', (n) => build('<!--', n)],
     ['unterminated <tag attr', (n) => build('<span class="a ', n)],
@@ -1961,21 +2012,19 @@ describe('Security — text scanners run in linear time (gh #76)', () => {
 
   it.each(NORMALIZER_CASES)(
     'normalizeProviderText: %s',
-    { timeout: 30_000 },
+    { timeout: 60_000 },
     async (_label, make) => {
       const { normalizeProviderText } = await import('@/services/openalex/provider-text.js');
-      const { t5k, t80k } = perCallMs(normalizeProviderText, make);
-      expect(t80k / t5k).toBeLessThan(64);
-      expect(t80k).toBeLessThan(100);
+      expectLinearCpuTime(1_250, (size) => cpuMsPerCall(normalizeProviderText, make(size)));
     },
   );
 
-  it.each(ESCAPE_CASES)('escapeMarkdown: %s', { timeout: 30_000 }, async (_label, make) => {
+  it.each(ESCAPE_CASES)('escapeMarkdown: %s', { timeout: 60_000 }, async (_label, make) => {
     const { escapeMarkdown } = await import('@/mcp-server/tools/escape-markdown.js');
     for (const position of ['inline', 'line-start', 'heading'] as const) {
-      const { t5k, t80k } = perCallMs((s) => escapeMarkdown(s, position), make);
-      expect(t80k / t5k).toBeLessThan(64);
-      expect(t80k).toBeLessThan(100);
+      expectLinearCpuTime(1_250, (size) =>
+        cpuMsPerCall((s) => escapeMarkdown(s, position), make(size)),
+      );
     }
   });
 
@@ -2140,4 +2189,275 @@ describe('Security — provider-text removals run in linear time (gh #92, #110, 
     const { normalizeProviderText } = await import('@/services/openalex/provider-text.js');
     expectLinearCpuTime(1_250, (size) => cpuMsPerCall(normalizeProviderText, make(size)));
   });
+});
+
+/**
+ * A `select` entry is caller-sized text: the service splits it on commas, widens each name by
+ * its first dotted segment, the seam tests a lone string for a separator, and the notice renders
+ * every name as a code span. Each runs on every call that names fields, so each shape is timed
+ * with `expectLinearCpuTime`. (gh #135)
+ */
+describe('Security — select names are split, widened, and disclosed in linear time (gh #135)', () => {
+  /** [label, entry of a given size, smallest size] — six doublings (64×). */
+  const ENTRY_SHAPES: [string, (size: number) => string, number][] = [
+    ['a comma run, every piece empty', (n) => ','.repeat(n), 5_000],
+    ['blank pieces', (n) => build(' ,', n), 1_250],
+    ['many short names', (n) => build('doi,', n), 1_250],
+    ['many dotted names widening to one field', (n) => build('primary_location.x,', n), 1_250],
+    ['one long dotted name', (n) => `authorships.${'a.'.repeat(n / 2)}`, 1_250],
+    ['one long name ending in a comma', (n) => `${'x'.repeat(n - 1)},`, 1_250],
+    ['commas and CRLF breaks throughout', (n) => build(' ,\r\n', n), 1_250],
+    ['one long line ending in a break', (n) => `${'x'.repeat(n - 2)}\ny`, 1_250],
+    ['blank and CRLF runs', (n) => build('  \r\n', n), 1_250],
+  ];
+
+  it.each(ENTRY_SHAPES)('reportSelect: %s', { timeout: 60_000 }, async (_label, make, from) => {
+    const { reportSelect, splitSelectEntry } = await import(
+      '@/services/openalex/openalex-service.js'
+    );
+    expect(splitSelectEntry(','.repeat(5_000))).toEqual([]);
+    expectLinearCpuTime(from, (size) =>
+      cpuMsPerCall((s) => reportSelect('works', [s]), make(size)),
+    );
+  });
+
+  it.each(ENTRY_SHAPES)('describeSelect: %s', { timeout: 60_000 }, async (_label, make, from) => {
+    const { describeSelect } = await import('@/mcp-server/tools/select-input.js');
+    expectLinearCpuTime(from, (size) =>
+      cpuMsPerCall((s) => describeSelect('works', [s]), make(size)),
+    );
+  });
+
+  /** Regex-touching shapes stay at or below 80k characters, where Bun can switch regex modes. */
+  const SEAM_SHAPES: [string, (size: number) => string][] = [
+    ['one long name', (n) => 'x'.repeat(n)],
+    ['one long line ending in a break', (n) => `${'x'.repeat(n - 2)}\ny`],
+    ['blank and CRLF runs', (n) => build('  \r\n', n)],
+    ['a repeated opener with no closer', (n) => '['.repeat(n)],
+    ['a backtick run inside a widened name', (n) => `primary_location.${'`'.repeat(n - 17)}`],
+  ];
+
+  it.each(SEAM_SHAPES)(
+    'the select seam and notice: %s',
+    { timeout: 60_000 },
+    async (_label, make) => {
+      const { describeSelect, selectInput } = await import('@/mcp-server/tools/select-input.js');
+      expectLinearCpuTime(1_250, (size) =>
+        cpuMsPerCall((s) => {
+          selectInput.safeParse(s);
+          describeSelect('works', [s]);
+        }, make(size)),
+      );
+    },
+  );
+});
+
+/**
+ * A numeric key's value runs through the range rewrite one `|` alternative at a time (gh #133),
+ * and a `filters` record is walked through every nested object and key (gh #136), both on
+ * caller-sized input, so each shape is timed with `expectLinearCpuTime`. A shape whose caller
+ * text reaches a regex spans 1,250 to 80k characters, below Bun's regex mode switch; the rest
+ * carry 5k to 320k. A record's size is its JSON length.
+ */
+describe('Security — numeric ranges and filters records run in linear time (gh #133, #136)', () => {
+  /** [label, the numeric clause at a size, smallest size, `buildFilterString()` outcome] */
+  const RANGE_SHAPES: [string, (n: number) => [string, string], number, string][] = [
+    [
+      'long digit bounds with leading zeros',
+      (n) => ['cited_by_count', `${'0'.repeat(n / 2 - 1)}1..${'9'.repeat(n / 2 - 2)}`],
+      1_250,
+      'sent',
+    ],
+    [
+      'long fractional bounds',
+      (n) => ['fwci', `1.${'0'.repeat((n - 6) / 2)}..1.${'0'.repeat((n - 6) / 2 - 1)}1`],
+      1_250,
+      'sent',
+    ],
+    [
+      'a long reversed native range',
+      (n) => ['publication_year', `${'2'.repeat(n / 2)}-${'1'.repeat(n / 2 - 1)}`],
+      1_250,
+      'invalid_range_in_filter_value',
+    ],
+    [
+      '">=" repeated',
+      (n) => ['cited_by_count', `${'>='.repeat(n / 2 - 1)}50`],
+      1_250,
+      'invalid_range_in_filter_value',
+    ],
+    ['a dot run', (n) => ['cited_by_count', '.'.repeat(n)], 1_250, 'invalid_range_in_filter_value'],
+    [
+      'a "+" run after ">="',
+      (n) => ['cited_by_count', `>=${'1+'.repeat(n / 2 - 2)}1`],
+      1_250,
+      'invalid_range_in_filter_value',
+    ],
+    [
+      'a whitespace run after ">="',
+      (n) => ['cited_by_count', `>=${' '.repeat(n - 4)}50`],
+      5_000,
+      'sent',
+    ],
+    [
+      'OR-joined ">=1" alternatives',
+      (n) => ['cited_by_count', Array.from({ length: n / 4 }, () => '>=1').join('|')],
+      5_000,
+      'sent',
+    ],
+    [
+      'a "!" run',
+      (n) => ['cited_by_count', `${'!'.repeat(n - 4)}>=50`],
+      5_000,
+      'invalid_range_in_filter_value',
+    ],
+    [
+      'one long line ending in a break',
+      (n) => ['cited_by_count', `${'x'.repeat(n - 2)}\ny`],
+      5_000,
+      'sent',
+    ],
+    ['blank and CRLF runs', (n) => ['cited_by_count', build('  \r\n', n)], 5_000, 'sent'],
+  ];
+
+  it.each(RANGE_SHAPES)(
+    'buildFilterString on a numeric key: %s',
+    { timeout: 60_000 },
+    async (_label, make, from, expected) => {
+      const { buildFilterString } = await import('@/services/openalex/openalex-service.js');
+      const outcome = (clause: [string, string]): string => {
+        try {
+          buildFilterString([clause]);
+          return 'sent';
+        } catch (error) {
+          return (error as { data?: { reason?: string } }).data?.reason ?? String(error);
+        }
+      };
+      expectLinearCpuTime(from, (size) => {
+        const clause = make(size);
+        expect(outcome(clause), `${size} characters`).toBe(expected);
+        return cpuMsPerCall(() => outcome(clause), clause.join(''));
+      });
+    },
+  );
+
+  /** A chain of `{ [key]: … }` objects `depth` deep around `leaf`, built without recursion. */
+  function chain(key: string, depth: number, leaf: unknown, sibling?: [string, unknown]) {
+    let value: unknown = sibling ? { [sibling[0]]: sibling[1] } : leaf;
+    for (let level = 0; level < depth; level++) {
+      value = sibling ? { [sibling[0]]: sibling[1], [key]: value } : { [key]: value };
+    }
+    return value as Record<string, unknown>;
+  }
+
+  /** Entries named `${prefix}0`, `${prefix}1`, … each holding `leaf`. */
+  const wide = (prefix: string, count: number, leaf: unknown, suffix = '') =>
+    Object.fromEntries(Array.from({ length: count }, (_, i) => [`${prefix}${i}${suffix}`, leaf]));
+
+  /** How many units of `chars` JSON characters fit in `n`. */
+  const per = (n: number, chars: number) => Math.floor(n / chars);
+
+  /** What a walk produced: canonical keys, disclosed normalizations, rejected entries. */
+  type WalkOutcome = { keys: number; repairs: number; issues: number };
+
+  /**
+   * [label, the record at a JSON size, smallest size, expected outcome at that size]. A nested key
+   * past 256 characters is refused without being walked, so a chain's walk stops at level 129 of
+   * one-character keys — 128 leaves survive a chain with a leaf per level, and two entries at
+   * level 129 are refused — whatever its depth.
+   */
+  const RECORD_SHAPES: [
+    string,
+    (n: number) => Record<string, unknown>,
+    number,
+    (n: number) => WalkOutcome,
+  ][] = [
+    [
+      'a deep chain built iteratively',
+      (n) => chain('a', per(n, 6), 'x'),
+      5_000,
+      () => ({ keys: 0, repairs: 0, issues: 1 }),
+    ],
+    [
+      'a wide boolean record',
+      (n) => wide('k', per(n, 14), true),
+      5_000,
+      (n) => ({ keys: per(n, 14), repairs: per(n, 14), issues: 0 }),
+    ],
+    [
+      'a deep chain with a leaf per level',
+      (n) => chain('a', per(n, 14), undefined, ['b', 'x']),
+      5_000,
+      () => ({ keys: 128, repairs: 127, issues: 2 }),
+    ],
+    [
+      'a chain ending in null',
+      (n) => chain('a', per(n, 6), null),
+      5_000,
+      () => ({ keys: 0, repairs: 0, issues: 1 }),
+    ],
+    [
+      'a long key holding many children, each past the 256-character cap',
+      (n) => ({ ['k'.repeat(254)]: wide('c', per(n, 13), 'x') }),
+      5_000,
+      (n) => ({ keys: 0, repairs: 0, issues: per(n, 13) }),
+    ],
+    [
+      'a chain of quoted keys',
+      (n) => chain("'a'", per(n, 8), 'x'),
+      5_000,
+      () => ({ keys: 0, repairs: 0, issues: 1 }),
+    ],
+    [
+      'a wide record of quoted keys',
+      (n) => wide("'k", per(n, 15), 'x', "'"),
+      5_000,
+      (n) => ({ keys: per(n, 15), repairs: per(n, 15), issues: 0 }),
+    ],
+    [
+      'a long quoted key containing a line break',
+      (n) => ({ [`'${'x'.repeat(n - 11)}\ny'`]: true }),
+      5_000,
+      () => ({ keys: 1, repairs: 2, issues: 0 }),
+    ],
+    [
+      'a long nested key containing a line break',
+      (n) => ({ a: { [`${'x'.repeat(n - 14)}\ny`]: 'v' } }),
+      1_250,
+      () => ({ keys: 0, repairs: 0, issues: 1 }),
+    ],
+    [
+      'flat keys each colliding with nested objects',
+      (n) =>
+        Object.fromEntries(
+          Array.from({ length: per(n, 34) }, (_, i) => [
+            [`k${i}.a.b`, 'x'],
+            [`k${i}`, { a: { b: 'y' } }],
+          ]).flat(),
+        ),
+      5_000,
+      (n) => ({ keys: per(n, 34), repairs: 0, issues: per(n, 34) }),
+    ],
+  ];
+
+  it.each(RECORD_SHAPES)(
+    'normalizeFilterRecord: %s',
+    { timeout: 60_000 },
+    async (_label, make, from, expected) => {
+      const { normalizeFilterRecord } = await import('@/mcp-server/tools/filters-input.js');
+      const outcome = (record: Record<string, unknown>): WalkOutcome => {
+        const { record: canonical, repairs, issues } = normalizeFilterRecord(record);
+        return {
+          keys: Object.keys(canonical).length,
+          repairs: repairs.length,
+          issues: issues.length,
+        };
+      };
+      expectLinearCpuTime(from, (size) => {
+        const record = make(size);
+        expect(outcome(record), `${size} characters`).toEqual(expected(size));
+        return cpuMsPerCall(() => normalizeFilterRecord(record), size);
+      });
+    },
+  );
 });

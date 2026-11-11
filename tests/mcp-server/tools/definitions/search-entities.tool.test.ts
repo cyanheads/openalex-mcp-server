@@ -41,6 +41,7 @@ const mockConfig = vi.hoisted(() => ({
   mailto: '',
   filterStringInput: true,
   clampPerPage: true,
+  filterRecordRepair: true,
 }));
 const conversionMetrics = vi.hoisted(() => ({ add: vi.fn() }));
 const clampMetrics = vi.hoisted(() => ({ add: vi.fn() }));
@@ -67,12 +68,9 @@ vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({ ...mockConfig }),
 }));
 
-const {
-  BUDGET_EXHAUSTED_KEYLESS_HINT,
-  normalizeId,
-  PMCID_NOT_INDEXED_HINT,
-  SEMANTIC_UNAVAILABLE_HINT,
-} = await import('@/services/openalex/openalex-service.js');
+const { BUDGET_EXHAUSTED_KEYLESS_HINT, normalizeId, SEMANTIC_UNAVAILABLE_HINT } = await import(
+  '@/services/openalex/openalex-service.js'
+);
 
 const { searchEntitiesTool } = await import(
   '@/mcp-server/tools/definitions/search-entities.tool.js'
@@ -269,6 +267,7 @@ describe('searchEntitiesTool', () => {
     vi.clearAllMocks();
     mockConfig.filterStringInput = true;
     mockConfig.clampPerPage = true;
+    mockConfig.filterRecordRepair = true;
   });
 
   const sampleResult: SearchResult = {
@@ -1609,6 +1608,64 @@ describe('searchEntitiesTool', () => {
     });
   });
 
+  /**
+   * A wildcard OpenAlex refuses reaches the caller under its own reason with this tool's
+   * recovery, through the real service against a verbatim upstream body (2026-11-10). The
+   * classification table lives in the service suite; these cases prove the wiring. (gh #134)
+   */
+  describe('wildcard 400s through the real service (gh #134)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    const REQUIRES_EXACT =
+      'Wildcards (* or ?) require exact (no-stem) search. The default search is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use the search.exact= parameter instead (or the default.search.exact filter), e.g. search.exact=karst AND microplastic*.';
+    const PREFIX_TOO_SHORT =
+      'A * wildcard needs at least 3 leading characters: "A*". Add characters before the *, e.g. abc*.';
+
+    it.each([
+      ['upstream_wildcard_requires_exact', 'karst AND microplastic*', REQUIRES_EXACT],
+      ['upstream_wildcard_prefix_too_short', 'A* search algorithm', PREFIX_TOO_SHORT],
+    ])('%s carries its declared recovery on both surfaces', async (reason, query, message) => {
+      const declared = searchEntitiesTool.errors?.find((e) => e.reason === reason);
+      expect(declared, `${reason} missing from the contract`).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        thrownBy: 'service',
+      });
+      const fetchMock = vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ error: 'Invalid query parameters error.', message }), {
+            status: 400,
+          }),
+        ),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', query });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message,
+          data: { reason, upstreamMessage: message, recovery: { hint: declared?.recovery } },
+        },
+      });
+      const text = readMarkdown(
+        (result.content ?? []).map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+      );
+      expect(text).toContain(message);
+      expect(text).toContain(`Recovery: ${declared?.recovery}`);
+      expect(text).toContain(reason);
+    });
+  });
+
   describe('429 budget exhaustion (gh #54)', () => {
     afterEach(() => {
       vi.unstubAllGlobals();
@@ -1778,9 +1835,11 @@ describe('searchEntitiesTool', () => {
           reason: 'upstream_unavailable',
           recovery: { hint: SEMANTIC_UNAVAILABLE_HINT },
           upstreamMessage: message,
-          responseBody: JSON.stringify({ error: 'Invalid query parameters error.', message }),
         },
       });
+      // The raw body stays on the server; `upstreamMessage` is what the client receives of it.
+      expect(envelope.data).not.toHaveProperty('body');
+      expect(envelope.data).not.toHaveProperty('responseBody');
       expect(envelope.message).not.toContain('embed.example.com');
       expect(text).not.toContain('embed.example.com');
       expect(text).toContain(`Recovery: ${SEMANTIC_UNAVAILABLE_HINT}`);
@@ -1828,7 +1887,10 @@ describe('searchEntitiesTool', () => {
       const costUsd =
         searchEntitiesTool.enrichment?.budget?.unwrap().shape.costUsd.description ?? '';
       expect(costUsd).not.toMatch(/^USD this call spent\. 0 for an `id` lookup —/);
-      expect(costUsd).toMatch(/keyword looked up by its slug/);
+      expect(costUsd).toMatch(/ISSN, keyword slug, or arXiv ID whose 10\.48550 DOI OpenAlex holds/);
+      expect(costUsd).toMatch(
+        /arXiv ID no work carries the 10\.48550 DOI of, found by its landing page/,
+      );
       expect(costUsd).toContain('W2741809807#x');
     });
 
@@ -1906,12 +1968,14 @@ describe('searchEntitiesTool', () => {
   });
 
   /**
-   * OpenAlex indexes no PMCIDs, so a PMCID lookup can only 404. The tool still forwards it —
-   * a wasted call plus an actionable error beats a local block that would have to be removed
-   * by hand the day upstream starts populating the field — and the service's substituted
-   * recovery has to reach the caller on both client surfaces.
+   * OpenAlex indexes PMCIDs, so the tool forwards one like any other identifier, and a PMCID
+   * OpenAlex does not hold is an ordinary miss: the contract's generic not-found recovery reaches
+   * both client surfaces. The miss runs the real service against a stubbed 404, so the case fails
+   * if the service writes a recovery of its own for the scheme.
    */
   describe('PMCID lookups (gh #67)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
     const pmcIds: [label: string, id: string][] = [
       ['a bare PMCID', 'PMC3084216'],
       ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
@@ -1933,64 +1997,58 @@ describe('searchEntitiesTool', () => {
     });
 
     it.each(pmcIds)(
-      'carries the conversion hint on both client surfaces for %s',
+      'carries the generic not-found recovery on both client surfaces for %s',
       async (_label, id) => {
-        mockSearch.mockRejectedValue(
-          notFound('Entity not found at /works/pmcid:PMC3084216', {
-            reason: 'entity_not_found',
-            path: '/works/pmcid:PMC3084216',
-            recovery: { hint: PMCID_NOT_INDEXED_HINT },
-          }),
+        const fetchMock = vi.fn((input: unknown) =>
+          new URL(String(input)).pathname === '/works/pmcid:PMC3084216'
+            ? Promise.resolve(
+                new Response('<!doctype html><title>404 Not Found</title>', { status: 404 }),
+              )
+            : Promise.reject(new Error(`unmocked fetch: ${String(input)}`)),
         );
+        vi.stubGlobal('fetch', fetchMock);
+        const actual = await vi.importActual<
+          typeof import('@/services/openalex/openalex-service.js')
+        >('@/services/openalex/openalex-service.js');
+        actual.initOpenAlexService();
+        const service = actual.getOpenAlexService();
+        mockSearch.mockImplementation((...args: unknown[]) =>
+          service.search(...(args as [SearchParams, Context])),
+        );
+        const recovery = searchEntitiesTool.errors?.find(
+          (entry) => entry.reason === 'entity_not_found',
+        )?.recovery;
 
         const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', id });
 
+        expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(result.isError).toBe(true);
         expect(result.structuredContent).toMatchObject({
           error: {
             code: JsonRpcErrorCode.NotFound,
             data: {
               reason: 'entity_not_found',
-              recovery: { hint: expect.stringContaining('OpenAlex indexes no PMCIDs') },
+              path: '/works/pmcid:PMC3084216',
+              recovery: { hint: recovery },
             },
           },
         });
-        const rendered = (result.content ?? [])
-          .map((block) => (block.type === 'text' ? block.text : ''))
-          .join('\n');
-        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
-        expect(rendered).toContain('PMID');
-        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+        const rendered = readMarkdown(
+          (result.content ?? [])
+            .map((block) => (block.type === 'text' ? block.text : ''))
+            .join('\n'),
+        );
+        expect(rendered).toContain(`Recovery: ${recovery}`);
+        expect(rendered).not.toMatch(/indexes no PMCIDs/i);
       },
     );
 
-    it('leaves a non-PMCID 404 on the generic contract recovery', async () => {
-      mockSearch.mockRejectedValue(
-        notFound('Entity not found at /works/W99999999999', {
-          reason: 'entity_not_found',
-          path: '/works/W99999999999',
-          recovery: {
-            hint: 'Verify the ID format or call openalex_resolve_name to find the correct ID.',
-          },
-        }),
-      );
-
-      const result = await runToolContract(searchEntitiesTool, {
-        entity_type: 'works',
-        id: 'W99999999999',
-      });
-
-      const rendered = (result.content ?? [])
-        .map((block) => (block.type === 'text' ? block.text : ''))
-        .join('\n');
-      expect(rendered).toContain('Verify the ID format');
-      expect(rendered).not.toContain('PMCID');
-    });
-
-    it('no longer advertises PMCID as an id that resolves', () => {
+    it('lists PMCID among the id forms that resolve', () => {
       const description = searchEntitiesTool.input.shape.id.description ?? '';
-      expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
-      expect(description).toMatch(/PMID or DOI/i);
+      expect(description).toContain(
+        'PMCID ("PMC1234567" or a PubMed Central URL such as "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/")',
+      );
+      expect(description).not.toMatch(/indexes no PMCIDs|resolves nothing/i);
     });
   });
 
@@ -2404,14 +2462,26 @@ describe('searchEntitiesTool', () => {
           );
           expect(contentText(result)).not.toContain('Converted native');
         }
-        // The published framework repairs one representation layer, not JSON plus its values.
+        /**
+         * The framework repairs one representation layer, the JSON string, not its values too: the
+         * filters normalization reads the integer inside it, and with OPENALEX_FILTER_RECORD_REPAIR
+         * off the call is refused before any request, as it was before that normalization.
+         */
         const nestedRepair = await run('  {"publication_year":2020}');
-        expect(nestedRepair.result.isError).toBe(true);
-        expect(nestedRepair.fetchMock).not.toHaveBeenCalled();
+        expect(nestedRepair.result.isError).toBeFalsy();
+        expect(
+          new URL(String(nestedRepair.fetchMock.mock.calls[0]?.[0])).searchParams.get('filter'),
+        ).toBe('publication_year:2020');
+        mockConfig.filterRecordRepair = false;
+        const unrepaired = await run('  {"publication_year":2020}');
+        expect(unrepaired.result.isError).toBe(true);
+        expect(unrepaired.fetchMock).not.toHaveBeenCalled();
       },
     );
 
     it('does not admit a caller-supplied normalization wrapper or leak wrapper paths', async () => {
+      // String-only validation; the record repair's reading of the same shapes is tested in gh #136.
+      mockConfig.filterRecordRepair = false;
       const forged = await run({ value: { type: 'article' }, converted: true });
       expect(forged.result.isError).toBe(true);
       expect(forged.fetchMock).not.toHaveBeenCalled();
@@ -2668,6 +2738,156 @@ describe('searchEntitiesTool', () => {
     it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
       const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
       expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /** The rewrite table lives in the service suite; these prove this tool reaches it. */
+    describe('numeric ranges (gh #133)', () => {
+      const RANGE_RECOVERY =
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.';
+
+      it('sends ">=50" on cited_by_count as the hyphen range "50-"', async () => {
+        const { fetchMock, result } = await run({ cited_by_count: '>=50' });
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+          'cited_by_count:50-',
+        );
+      });
+
+      it('rewrites a native filter string the same way', async () => {
+        const { fetchMock, result } = await run('cited_by_count:>=50');
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+          'cited_by_count:50-',
+        );
+      });
+
+      it('refuses a negative bound as invalid_range_in_filter_value before any request', async () => {
+        const { fetchMock, result } = await run({ cited_by_count: '>=-1' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining('Filter "cited_by_count" value ">=-1"'),
+            data: { reason: 'invalid_range_in_filter_value', recovery: { hint: RANGE_RECOVERY } },
+          },
+        });
+        const text = readMarkdown(contentText(result));
+        expect(text).toContain('Filter "cited_by_count" value ">=-1"');
+        expect(text).toContain(RANGE_RECOVERY);
+        expect(text).toContain('invalid_range_in_filter_value');
+      });
+
+      it('declares invalid_range_in_filter_value as a service-thrown ValidationError', () => {
+        const entry = searchEntitiesTool.errors?.find(
+          (e) => e.reason === 'invalid_range_in_filter_value',
+        );
+        expect(entry).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          thrownBy: 'service',
+        });
+      });
+    });
+
+    describe('filters record normalization (gh #136)', () => {
+      const QUOTED_KEY_NOTICE =
+        'Read `filters` as string values under dotted keys: quoted keys unwrapped to `"is_oa"`.';
+      const NATIVE_NOTICE = 'Converted native filter string to a filters record object.';
+
+      it('sets the native-string and quoted-key notices together on one call', async () => {
+        const { fetchMock, result } = await run("'is_oa':true");
+        expect(result.isError).toBeFalsy();
+        expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+          'is_oa:true',
+        );
+        const { notice } = result.structuredContent as { notice: string };
+        expect(notice).toContain(NATIVE_NOTICE);
+        expect(notice).toContain(QUOTED_KEY_NOTICE);
+        expect(notice.indexOf(NATIVE_NOTICE)).toBeLessThan(notice.indexOf(QUOTED_KEY_NOTICE));
+        expect(contentText(result)).toContain(NATIVE_NOTICE);
+        expect(contentText(result)).toContain(QUOTED_KEY_NOTICE);
+      });
+
+      /** With the switch on, a forged wrapper is a record like any other: its keys are filters. */
+      it.each([
+        [
+          { value: { type: 'article' }, converted: true },
+          'value.type:article,converted:true',
+          'converted',
+        ],
+        [
+          { value: { type: 'article' }, fromNativeString: true },
+          'value.type:article,fromNativeString:true',
+          'fromNativeString',
+        ],
+      ])(
+        'reads the wrapper shape %j as filters, never as provenance',
+        async (filters, sent, flag) => {
+          const { fetchMock, result } = await run(filters);
+          expect(result.isError).toBeFalsy();
+          expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('filter')).toBe(
+            sent,
+          );
+          const repairs = `Read \`filters\` as string values under dotted keys: booleans sent as "true"/"false" at \`"${flag}"\`; nested objects flattened to \`"value.type"\`.`;
+          const { notice } = result.structuredContent as { notice: string };
+          expect(notice).toContain(repairs);
+          expect(contentText(result)).toContain(repairs);
+          expect(notice).not.toContain(NATIVE_NOTICE);
+          expect(contentText(result)).not.toContain(NATIVE_NOTICE);
+        },
+      );
+
+      it('names caller paths, never wrapper paths, when a forged shape is refused', async () => {
+        const repairs = await run({ value: { type: 'article' }, repairs: [] });
+        expect(repairs.result.isError).toBe(true);
+        expect(repairs.fetchMock).not.toHaveBeenCalled();
+        expect(contentText(repairs.result)).toContain('filters.repairs: Filter value is an array');
+
+        const nested = await run({ publication_year: { nested: null } });
+        expect(nested.result.isError).toBe(true);
+        expect(nested.fetchMock).not.toHaveBeenCalled();
+        expect(contentText(nested.result)).toContain(
+          'filters.publication_year.nested: Filter value is null',
+        );
+        expect(contentText(nested.result)).not.toContain('filters.value.');
+      });
+
+      /**
+       * `tools/list` is unchanged on every filter-taking tool: with `description` keys set
+       * aside, `filters` is the canonical string record in both JSON Schema modes.
+       */
+      it('advertises the canonical record schema on all four filter-taking tools', async () => {
+        const [{ analyzeTrendsTool }, { resolveNameTool }, { getCitationGraphTool }] =
+          await Promise.all([
+            import('@/mcp-server/tools/definitions/analyze-trends.tool.js'),
+            import('@/mcp-server/tools/definitions/resolve-name.tool.js'),
+            import('@/mcp-server/tools/definitions/citation-graph.tool.js'),
+          ]);
+        const withoutDescriptions = (node: unknown): unknown =>
+          typeof node === 'object' && node !== null
+            ? Object.fromEntries(
+                Object.entries(node)
+                  .filter(([key]) => key !== 'description')
+                  .map(([key, value]) => [key, withoutDescriptions(value)]),
+              )
+            : node;
+        for (const definition of [
+          searchEntitiesTool,
+          analyzeTrendsTool,
+          resolveNameTool,
+          getCitationGraphTool,
+        ]) {
+          for (const io of ['input', 'output'] as const) {
+            const schema = z.toJSONSchema(definition.input, { io });
+            expect(withoutDescriptions(schema.properties?.filters), definition.name).toStrictEqual({
+              type: 'object',
+              propertyNames: { type: 'string' },
+              additionalProperties: { type: 'string' },
+            });
+            expect(schema.required, definition.name).not.toContain('filters');
+          }
+        }
+      });
     });
   });
 
@@ -4510,6 +4730,663 @@ describe('searchEntitiesTool', () => {
           expect(entry).not.toHaveProperty('thrownBy');
         }
       });
+    });
+  });
+
+  /**
+   * `select` widening, comma splitting, and string input, run against the real service and an
+   * upstream fake that projects each record to the `select` it receives, as OpenAlex does. The
+   * mechanism is tabled at its own seams (the service and `select-input`); these prove the
+   * wiring: what reaches the wire, both response surfaces, the notice, the log, and the counter.
+   */
+  describe('select widening and comma-joined names through the real service (gh #135)', () => {
+    type Structured = {
+      results: EntityRecord[];
+      notice?: string;
+      windows?: { field: string; possibly_capped: boolean; next: unknown }[];
+    };
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    const work: EntityRecord = {
+      id: 'https://openalex.org/W2626778328',
+      display_name: 'Attention Is All You Need',
+      doi: 'https://doi.org/10.65215/2q58a426',
+      title: 'Attention Is All You Need',
+      publication_year: 2017,
+      open_access: {
+        is_oa: true,
+        oa_status: 'green',
+        oa_url: 'https://arxiv.org/pdf/1706.03762',
+        any_repository_has_fulltext: true,
+      },
+      primary_location: { source: { display_name: 'arXiv (Cornell University)' } },
+      abstract_inverted_index: { Dominant: [0], models: [1] },
+      authorships: authorships(8, slimAuthorship),
+    };
+    const hundredAuthors = workWithAuthorships(7, 100, slimAuthorship);
+
+    /** Serve `work` by ID and the list as `[work, hundredAuthors]`, each projected to `select`. */
+    async function useRealService() {
+      const project = (record: EntityRecord, select: string | null) =>
+        select === null
+          ? record
+          : (Object.fromEntries(
+              Object.entries(record).filter(([key]) => select.split(',').includes(key)),
+            ) as EntityRecord);
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const select = url.searchParams.get('select');
+        const body =
+          url.pathname === '/works/W2626778328'
+            ? project(work, select)
+            : url.pathname === '/works'
+              ? {
+                  meta: { count: 2, per_page: 25, next_cursor: null },
+                  results: [work, hundredAuthors].map((record) => project(record, select)),
+                }
+              : undefined;
+        return body === undefined
+          ? Promise.reject(new Error(`unmocked fetch: ${url.href}`))
+          : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+    const sentSelect = (fetchMock: ReturnType<typeof vi.fn>) =>
+      new URL(String(fetchMock.mock.calls.at(-1)?.[0])).searchParams.get('select');
+
+    beforeEach(() => {
+      Object.assign(mockConfig, { selectStringInput: true });
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      Object.assign(mockConfig, { selectStringInput: undefined });
+    });
+
+    it.each(['is_oa', 'oa_status', 'oa_url', 'any_repository_has_fulltext'])(
+      'returns open_access for an id lookup selecting %s, with the widening on both surfaces',
+      async (leaf) => {
+        const fetchMock = await useRealService();
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W2626778328',
+          select: [leaf],
+        });
+        expect(result.isError).toBeFalsy();
+        expect(sentSelect(fetchMock)).toBe('id,display_name,open_access');
+        const structured = result.structuredContent as Structured;
+        expect(structured.results).toEqual([
+          { id: work.id, display_name: work.display_name, open_access: work.open_access },
+        ]);
+        expect(structured.notice).toBe(
+          `\`select\` projects top-level fields only, so each nested name returned the field holding it: \`${leaf}\` → \`open_access\`.`,
+        );
+        const text = readMarkdown(textOf(result));
+        expect(text).toContain(`${leaf} → open_access`);
+        expect(text).toContain('https://arxiv.org/pdf/1706.03762');
+      },
+    );
+
+    it('returns primary_location for a dotted name inside it', async () => {
+      const fetchMock = await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W2626778328',
+        select: ['primary_location.source.display_name'],
+      });
+      expect(sentSelect(fetchMock)).toBe('id,display_name,primary_location');
+      const structured = result.structuredContent as Structured;
+      expect(structured.results[0]?.primary_location).toEqual(work.primary_location);
+      expect(structured.notice).toContain(
+        '`primary_location.source.display_name` → `primary_location`',
+      );
+      expect(textOf(result)).toContain('arXiv (Cornell University)');
+    });
+
+    it('sends authorships once for ["authorships", "authorships.author"] and points at author_list', async () => {
+      const fetchMock = await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W2626778328',
+        select: ['authorships', 'authorships.author'],
+      });
+      expect(sentSelect(fetchMock)).toBe('id,display_name,authorships');
+      const structured = result.structuredContent as Structured;
+      expect(structured.results[0]?.authorships).toEqual(work.authorships);
+      expect(structured.notice).toContain('`authorships.author` → `authorships`');
+      expect(structured.notice).toContain('select `author_list`');
+    });
+
+    it('keeps authorships beside author_list for ["author_list", "authorships.author"]', async () => {
+      await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W2626778328',
+        select: ['author_list', 'authorships.author'],
+      });
+      const [record] = (result.structuredContent as Structured).results;
+      expect(record?.authorships).toEqual(work.authorships);
+      expect(record?.author_list).toHaveLength(8);
+    });
+
+    /** A widened authorships is the field ["authorships"] returns, so the list cap applies alike. */
+    it('windows a 100-authorship list record under ["authorships.author"] as under ["authorships"]', async () => {
+      await useRealService();
+      const run = (select: string[]) =>
+        runToolContract(searchEntitiesTool, { entity_type: 'works', select });
+      const widened = (await run(['authorships.author'])).structuredContent as Structured;
+      const named = (await run(['authorships'])).structuredContent as Structured;
+      expect(named.windows).toEqual([
+        expect.objectContaining({
+          field: 'authorships',
+          possibly_capped: true,
+          next: expect.objectContaining({
+            arguments: expect.objectContaining({
+              slice: { field: 'authorships', offset: 100 },
+            }),
+          }),
+        }),
+      ]);
+      expect(widened.windows).toEqual(named.windows);
+      expect(widened.notice).toContain('exactly 100');
+      expect(widened.notice).toContain('`authorships.author` → `authorships`');
+    });
+
+    it('pages authorships for slice.field "authorships.author", with the widening in the notice', async () => {
+      const fetchMock = await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W2626778328',
+        slice: { field: 'authorships.author', limit: 2 },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(sentSelect(fetchMock)).toBe('id,display_name,authorships');
+      const structured = result.structuredContent as Structured;
+      expect(structured.results[0]?.authorships).toEqual(authorships(2, slimAuthorship));
+      expect(structured.windows?.[0]).toMatchObject({
+        field: 'authorships',
+        next: { arguments: { slice: { field: 'authorships', offset: 2, limit: 2 } } },
+      });
+      expect(structured.notice).toContain('`authorships.author` → `authorships`');
+    });
+
+    it('returns doi and the reconstructed abstract for ["doi,abstract"], naming the split', async () => {
+      const fetchMock = await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W2626778328',
+        select: ['doi,abstract'],
+      });
+      expect(sentSelect(fetchMock)).toBe('id,display_name,doi,abstract_inverted_index');
+      const structured = result.structuredContent as Structured;
+      expect(structured.results).toEqual([
+        {
+          id: work.id,
+          display_name: work.display_name,
+          doi: work.doi,
+          abstract: 'Dominant models',
+        },
+      ]);
+      expect(structured.notice).toBe(
+        'Split comma-joined `select` entries into field names: `doi,abstract` → `doi`, `abstract`.',
+      );
+      expect(conversionMetrics.add).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['id,title,publication_year', 'id,display_name,title,publication_year'],
+      [' doi , title ', 'id,display_name,doi,title'],
+      ['doi,,title', 'id,display_name,doi,title'],
+      ['doi,title,', 'id,display_name,doi,title'],
+      [',doi', 'id,display_name,doi'],
+    ])(
+      'accepts the select string %j with a split notice and one counted conversion',
+      async (select, sent) => {
+        const fetchMock = await useRealService();
+        const result = await runToolContract(searchEntitiesTool, {
+          entity_type: 'works',
+          id: 'W2626778328',
+          select,
+        });
+        expect(result.isError).toBeFalsy();
+        expect(sentSelect(fetchMock)).toBe(sent);
+        expect((result.structuredContent as Structured).notice).toContain(
+          'Split comma-joined `select` entries',
+        );
+        expect(conversionMetrics.add).toHaveBeenCalledExactlyOnceWith(1, {
+          'mcp.tool.name': 'openalex_search_entities',
+        });
+      },
+    );
+
+    it('logs a converted select string once, and a select array not at all', async () => {
+      await useRealService();
+      for (const [select, logged] of [
+        ['doi,title', 1],
+        [['doi,title'], 0],
+        ['doi', 0],
+      ] as const) {
+        const ctx = createMockContext();
+        const log = vi.spyOn(ctx.log, 'info');
+        await searchEntitiesTool.handler(
+          searchEntitiesTool.input.parse({ entity_type: 'works', id: 'W2626778328', select }),
+          ctx,
+        );
+        expect(log.mock.calls.filter(([message]) => message === 'Converted select string')).toEqual(
+          Array.from({ length: logged }, () => [
+            'Converted select string',
+            { tool: 'openalex_search_entities' },
+          ]),
+        );
+      }
+    });
+
+    it.each([',', ' ', ''])(
+      'rejects the select string %j, which names no field',
+      async (select) => {
+        const fetchMock = await useRealService();
+        const result = await runToolContract(searchEntitiesTool, { entity_type: 'works', select });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams },
+        });
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([true, undefined])(
+      'keeps "doi" and \'["doi","title"]\' as before, silent and uncounted, with the switch %s',
+      async (enabled) => {
+        Object.assign(mockConfig, { selectStringInput: enabled });
+        const fetchMock = await useRealService();
+        for (const [select, sent] of [
+          ['doi', 'id,display_name,doi'],
+          ['["doi","title"]', 'id,display_name,doi,title'],
+        ] as const) {
+          const result = await runToolContract(searchEntitiesTool, {
+            entity_type: 'works',
+            id: 'W2626778328',
+            select,
+          });
+          expect(result.isError).toBeFalsy();
+          expect(sentSelect(fetchMock)).toBe(sent);
+          expect((result.structuredContent as Structured).notice).toBeUndefined();
+        }
+        expect(conversionMetrics.add).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a comma-holding select string with the switch off, as before', async () => {
+      Object.assign(mockConfig, { selectStringInput: false });
+      const fetchMock = await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        select: 'id,title',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message: expect.stringContaining(
+            'select: Invalid input: expected array, received string',
+          ),
+        },
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(conversionMetrics.add).not.toHaveBeenCalled();
+    });
+
+    it('joins a per_page clamp and a widening in one notice', async () => {
+      await useRealService();
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        select: ['is_oa'],
+        per_page: 150,
+      });
+      const { notice } = result.structuredContent as Structured;
+      expect(notice).toContain('per_page 150 exceeds the maximum of 100; using per_page 100.');
+      expect(notice).toContain('`is_oa` → `open_access`');
+      expect(textOf(result)).toContain('using per_page 100');
+    });
+
+    it('discloses a summary_stats leaf widening, and keeps renames silent', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 25, next_cursor: null },
+        results: [{ id: 'A1', display_name: 'A', summary_stats: { h_index: 121 } }],
+      });
+      const widened = await runToolContract(searchEntitiesTool, {
+        entity_type: 'authors',
+        select: ['h_index'],
+      });
+      expect((widened.structuredContent as Structured).notice).toContain(
+        '`h_index` → `summary_stats`',
+      );
+      mockSearch.mockResolvedValue(sampleResult);
+      const renamed = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        select: ['year', 'authors', 'abstract'],
+      });
+      expect((renamed.structuredContent as Structured).notice).toBeUndefined();
+    });
+
+    it('names the widened parent in a response_too_large hint', async () => {
+      mockSearch.mockResolvedValue({
+        meta: { count: 1, per_page: 1, next_cursor: null },
+        results: [
+          {
+            id: 'https://openalex.org/W1',
+            display_name: 'Wide',
+            primary_location: { note: 'x'.repeat(8_000_000) },
+          },
+        ],
+      });
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'W1',
+        select: ['primary_location.source'],
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'response_too_large',
+            recovery: { hint: expect.stringContaining('top-level fields (`primary_location`)') },
+          },
+        },
+      });
+    });
+  });
+
+  /** Root-key aliases: each reaches its target, exactly as the canonical key does. (gh #138) */
+  describe('input aliases (gh #138)', () => {
+    /** Arguments as a client sends them: untyped, so the alias keys reach the framework's parse. */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(searchEntitiesTool, args as never);
+
+    it('reads entity as entity_type', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const result = await call({ entity: 'works', id: 'W2626778328' });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'works', id: 'W2626778328' }),
+        expect.anything(),
+      );
+    });
+
+    it('reads limit as per_page, clamping 500 with the per_page notice', async () => {
+      mockSearch.mockResolvedValue(sampleResult);
+      const one = await call({ entity_type: 'works', filters: { type: 'article' }, limit: 1 });
+      expect(one.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenLastCalledWith(
+        expect.objectContaining({ perPage: 1 }),
+        expect.anything(),
+      );
+      const clamped = await call({ entity_type: 'works', limit: 500 });
+      expect(mockSearch).toHaveBeenLastCalledWith(
+        expect.objectContaining({ perPage: 100 }),
+        expect.anything(),
+      );
+      expect((clamped.structuredContent as { notice?: string }).notice).toContain(
+        'per_page 500 exceeds the maximum of 100; using per_page 100.',
+      );
+    });
+
+    it('reports a bad limit under per_page', async () => {
+      const result = await call({ entity_type: 'works', limit: 0 });
+      expect(result.isError).toBe(true);
+      const text = JSON.stringify(result.content);
+      expect(text).toContain('per_page');
+      expect(text).toContain('Validated limit as per_page.');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [{ entity: 'works', entity_type: 'works' }, 'entity is an alias of entity_type'],
+      [{ entity_type: 'works', limit: 5, per_page: 5 }, 'limit is an alias of per_page'],
+    ])('rejects an alias sent beside its target: %j', async (args, hint) => {
+      const result = await call(args);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(`${hint}; send one of them, not both.`);
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * An arXiv `id` under works runs through the real service against a routed `fetch`; these cases
+   * prove the tool's wiring — the notice on both surfaces, the budget, and the error envelopes —
+   * while the lookup itself is tabled in the service suite. (gh #137)
+   */
+  describe('arXiv ids (gh #137)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    const BUDGET = (cost: number) => ({
+      'x-ratelimit-cost-usd': String(cost),
+      'x-ratelimit-remaining-usd': '0.5',
+      'x-ratelimit-reset': '100',
+    });
+    const ARXIV_LOCATION = (id: string) => ({
+      landing_page_url: `https://arxiv.org/abs/${id}`,
+      source: { id: 'https://openalex.org/S4306400194' },
+    });
+
+    /** Route `mockSearch` to the real service; `fetch` answers from `routes` by path. */
+    async function useRealService(routes: Record<string, () => Response>) {
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        const route = url.hostname === 'api.openalex.org' ? routes[url.pathname] : undefined;
+        return route
+          ? Promise.resolve(route())
+          : Promise.reject(new Error(`unmocked fetch: ${url.pathname}`));
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return () => fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname);
+    }
+
+    const work = (id: string) => () =>
+      new Response(JSON.stringify({ id: `https://openalex.org/${id}`, display_name: 'A paper' }), {
+        status: 200,
+        headers: BUDGET(0),
+      });
+    const missing = () => new Response('<!doctype html><title>404</title>', { status: 404 });
+    const list = (rows: unknown[]) => () =>
+      new Response(JSON.stringify({ meta: { count: rows.length }, results: rows }), {
+        status: 200,
+        headers: BUDGET(0.0001),
+      });
+    const contentText = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+
+    it('names the dropped version on both surfaces at no cost', async () => {
+      const requests = await useRealService({
+        '/works/doi:10.48550/arXiv.1706.03762': work('W2626778328'),
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'https://arxiv.org/abs/1706.03762v5',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(requests()).toEqual(['/works/doi:10.48550/arXiv.1706.03762']);
+      const notice =
+        'Version v5 was dropped from arXiv ID 1706.03762v5: OpenAlex keeps one work per arXiv paper, not one per version, so it was looked up as 1706.03762.';
+      expect(result.structuredContent).toMatchObject({
+        results: [{ id: 'https://openalex.org/W2626778328' }],
+        notice,
+        budget: { costUsd: 0 },
+      });
+      expect(contentText(result)).toContain(notice);
+    });
+
+    it('sets no notice on an unversioned arXiv ID its DOI finds', async () => {
+      await useRealService({ '/works/doi:10.48550/arXiv.1706.03762': work('W2626778328') });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: 'arXiv:1706.03762',
+      });
+
+      expect(result.structuredContent).not.toHaveProperty('notice');
+    });
+
+    it('discloses the billed landing-page lookup and counts it in budget, on both surfaces', async () => {
+      const requests = await useRealService({
+        '/works/doi:10.48550/arXiv.2608.25542': missing,
+        '/works': list([
+          { id: 'https://openalex.org/W7204606861', locations: [ARXIV_LOCATION('2608.25542')] },
+        ]),
+        '/works/W7204606861': work('W7204606861'),
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '2608.25542',
+      });
+
+      expect(requests()).toEqual([
+        '/works/doi:10.48550/arXiv.2608.25542',
+        '/works',
+        '/works/W7204606861',
+      ]);
+      const structured = result.structuredContent as {
+        notice: string;
+        budget: { costUsd: number };
+      };
+      expect(structured.notice).toContain('found by its landing page');
+      expect(structured.notice).toContain('($0.0001)');
+      expect(structured.budget.costUsd).toBe(0.0001);
+      const text = contentText(result);
+      expect(text).toContain('found by its landing page');
+      expect(text).toContain('$0.0001 this call');
+    });
+
+    it('joins the arXiv notice with the id-precedence notice', async () => {
+      await useRealService({ '/works/doi:10.48550/arXiv.1706.03762': work('W2626778328') });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '1706.03762v2',
+        query: 'attention',
+      });
+
+      const { notice } = result.structuredContent as { notice: string };
+      expect(notice).toContain('Version v2 was dropped');
+      expect(notice).toContain('`id` takes precedence — query was not applied');
+    });
+
+    it('sends an arXiv-shaped id under another entity_type as written, failing on its 404', async () => {
+      const requests = await useRealService({ '/authors/1706.03762': missing });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'authors',
+        id: '1706.03762',
+      });
+
+      expect(requests()).toEqual(['/authors/1706.03762']);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'entity_not_found' } },
+      });
+    });
+
+    it('fails a miss on both lookups with the contract recovery, on both surfaces', async () => {
+      await useRealService({
+        '/works/doi:10.48550/arXiv.9999.99999': missing,
+        '/works': list([]),
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '9999.99999',
+      });
+
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'entity_not_found');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: expect.stringContaining('none has an arXiv location at its landing page'),
+          data: { reason: 'entity_not_found', recovery: { hint: entry?.recovery } },
+        },
+      });
+      expect(entry?.recovery).toContain('search works by its title');
+      expect(contentText(result)).toContain('search works by its title');
+    });
+
+    it('carries the candidates and their hint onto the envelope', async () => {
+      await useRealService({
+        '/works/doi:10.48550/arXiv.2608.25542': missing,
+        '/works': list([
+          { id: 'https://openalex.org/W1', locations: [ARXIV_LOCATION('2608.25542')] },
+          { id: 'https://openalex.org/W2', locations: [ARXIV_LOCATION('2608.25542')] },
+        ]),
+      });
+
+      const result = await runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '2608.25542',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'entity_not_found',
+            candidates: ['W1', 'W2'],
+            recovery: { hint: expect.stringContaining('data.candidates') },
+          },
+        },
+      });
+      expect(contentText(result)).toContain('W1, W2');
+    });
+
+    it('carries a failed landing-page lookup as entity_not_found with its retry hint', async () => {
+      vi.useFakeTimers();
+      await useRealService({
+        '/works/doi:10.48550/arXiv.2608.25542': missing,
+        '/works': () => new Response(JSON.stringify({ error: 'down' }), { status: 503 }),
+      });
+
+      const pending = runToolContract(searchEntitiesTool, {
+        entity_type: 'works',
+        id: '2608.25542',
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          data: {
+            fallbackFailedReason: 'upstream_unavailable',
+            recovery: { hint: expect.stringMatching(/^Retry the call/) },
+          },
+        },
+      });
+    });
+
+    it('declares the arXiv misses in the entity_not_found entry', () => {
+      const entry = searchEntitiesTool.errors?.find((e) => e.reason === 'entity_not_found');
+      expect(entry?.when).toContain('data.candidates');
+      expect(entry?.when).toContain('data.fallbackFailedReason');
+      expect(entry?.thrownBy).toBe('service');
     });
   });
 });

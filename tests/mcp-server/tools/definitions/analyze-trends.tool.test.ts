@@ -534,6 +534,68 @@ describe('analyzeTrendsTool', () => {
   });
 
   /**
+   * A wildcard OpenAlex refuses in a `.search` filter reaches the caller under its own reason
+   * with this tool's recovery, through the real service against a verbatim upstream body
+   * (2026-11-10). The classification table lives in the service suite. (gh #134)
+   */
+  describe('wildcard 400s through the real service (gh #134)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    const REQUIRES_EXACT =
+      'Wildcards (* or ?) require the exact (no-stem) field. "title.search" is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use "title.search.exact" instead, e.g. title.search.exact:microplastic*.';
+    const PREFIX_TOO_SHORT =
+      'A * wildcard needs at least 3 leading characters: "A*". Add characters before the *, e.g. abc*.';
+
+    it.each([
+      ['upstream_wildcard_requires_exact', 'microplastic*', REQUIRES_EXACT],
+      ['upstream_wildcard_prefix_too_short', 'A* search', PREFIX_TOO_SHORT],
+    ])('%s carries its declared recovery on both surfaces', async (reason, value, message) => {
+      const declared = analyzeTrendsTool.errors?.find((e) => e.reason === reason);
+      expect(declared, `${reason} missing from the contract`).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        thrownBy: 'service',
+      });
+      const fetchMock = vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ error: 'Invalid query parameters error.', message }), {
+            status: 400,
+          }),
+        ),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockAnalyze.mockImplementation((...args: unknown[]) =>
+        service.analyze(...(args as Parameters<typeof service.analyze>)),
+      );
+
+      const result = await runToolContract(analyzeTrendsTool, {
+        entity_type: 'works',
+        group_by: 'publication_year',
+        filters: { 'title.search': value },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message,
+          data: { reason, upstreamMessage: message, recovery: { hint: declared?.recovery } },
+        },
+      });
+      const text = renderedText(
+        (result.content ?? []).map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+      );
+      expect(text).toContain(message);
+      expect(text).toContain(`Recovery: ${declared?.recovery}`);
+      expect(text).toContain(reason);
+    });
+  });
+
+  /**
    * A zero-group page on a cursor continuation is a finished key-ascending traversal, not a
    * filter set that grouped nothing — the remove-filters advice there names filters that are
    * already doing their job. (gh #74)
@@ -1681,6 +1743,89 @@ describe('analyzeTrendsTool', () => {
       expect(textOf(result)).toContain('quote_in_filter_value');
       const entry = analyzeTrendsTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
       expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /** The rewrite table lives in the service suite; these prove this tool reaches it. */
+    describe('numeric ranges (gh #133)', () => {
+      const RANGE_RECOVERY =
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.';
+
+      it('sends "2020..2022" on publication_year as the hyphen range "2020-2022"', async () => {
+        const { fetchMock, result } = await run({ publication_year: '2020..2022' });
+        expect(result.isError).toBeFalsy();
+        expect(fetchMock).toHaveBeenCalled();
+        for (const [input] of fetchMock.mock.calls) {
+          expect(new URL(String(input)).searchParams.get('filter')).toBe(
+            'publication_year:2020-2022',
+          );
+        }
+      });
+
+      it('refuses a reversed range as invalid_range_in_filter_value before any request', async () => {
+        const { fetchMock, result } = await run({ publication_year: '2024..2020' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining('Filter "publication_year" value "2024..2020"'),
+            data: { reason: 'invalid_range_in_filter_value', recovery: { hint: RANGE_RECOVERY } },
+          },
+        });
+        const text = renderedText(textOf(result));
+        expect(text).toContain('Filter "publication_year" value "2024..2020"');
+        expect(text).toContain(RANGE_RECOVERY);
+        expect(text).toContain('invalid_range_in_filter_value');
+      });
+
+      it('declares invalid_range_in_filter_value as a service-thrown ValidationError', () => {
+        const entry = analyzeTrendsTool.errors?.find(
+          (e) => e.reason === 'invalid_range_in_filter_value',
+        );
+        expect(entry).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          thrownBy: 'service',
+        });
+      });
+    });
+  });
+
+  /** Root-key aliases reach their targets exactly as the canonical keys do. (gh #138) */
+  describe('input aliases (gh #138)', () => {
+    /** Arguments as a client sends them: untyped, so the alias keys reach the framework's parse. */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(analyzeTrendsTool, args as never);
+
+    it('reads entity as entity_type and limit as per_page', async () => {
+      mockAnalyze.mockResolvedValue({
+        meta: { count: 2, groups_count: 2, next_cursor: null },
+        groups: [
+          { key: 'true', key_display_name: 'true', count: 2 },
+          { key: 'false', key_display_name: 'false', count: 1 },
+        ],
+      });
+      const result = await call({ entity: 'works', group_by: 'is_oa', limit: 2 });
+      expect(result.isError).toBeFalsy();
+      expect(mockAnalyze).toHaveBeenCalledWith(
+        expect.objectContaining({ entityType: 'works', groupBy: 'is_oa', perPage: 2 }),
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      [
+        { entity: 'works', entity_type: 'works', group_by: 'type' },
+        'entity is an alias of entity_type',
+      ],
+      [
+        { entity_type: 'works', group_by: 'type', limit: 5, per_page: 5 },
+        'limit is an alias of per_page',
+      ],
+    ])('rejects an alias sent beside its target: %j', async (args, hint) => {
+      const result = await call(args);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(`${hint}; send one of them, not both.`);
+      expect(mockAnalyze).not.toHaveBeenCalled();
     });
   });
 });

@@ -130,6 +130,8 @@ describe('OpenAlex environment configuration', () => {
         baseUrl: 'https://api.openalex.org',
         filterStringInput: true,
         clampPerPage: true,
+        filterRecordRepair: true,
+        selectStringInput: true,
       });
     },
   );
@@ -145,6 +147,8 @@ describe('OpenAlex environment configuration', () => {
       baseUrl: 'https://example.org/api',
       filterStringInput: true,
       clampPerPage: true,
+      filterRecordRepair: true,
+      selectStringInput: true,
     });
   });
 
@@ -172,5 +176,27 @@ describe('OpenAlex environment configuration', () => {
     vi.stubEnv('OPENALEX_FILTER_STRING_INPUT', 'flase');
     const { getServerConfig } = await import('@/config/server-config.js');
     expect(() => getServerConfig()).toThrow('OPENALEX_FILTER_STRING_INPUT');
+  });
+
+  it.each([
+    ['OPENALEX_FILTER_RECORD_REPAIR', 'filterRecordRepair'],
+    ['OPENALEX_SELECT_STRING_INPUT', 'selectStringInput'],
+  ] as const)('parses %s strictly, on by default', async (name, key) => {
+    for (const [value, expected] of [
+      ['', true],
+      ['true', true],
+      ['false', false],
+      ['0', false],
+      [`\${${name}}`, true],
+    ] as const) {
+      vi.resetModules();
+      vi.stubEnv(name, value);
+      const { getServerConfig } = await import('@/config/server-config.js');
+      expect(getServerConfig()[key], `${name}=${value}`).toBe(expected);
+    }
+    vi.resetModules();
+    vi.stubEnv(name, 'flase');
+    const { getServerConfig } = await import('@/config/server-config.js');
+    expect(() => getServerConfig()).toThrow(name);
   });
 });

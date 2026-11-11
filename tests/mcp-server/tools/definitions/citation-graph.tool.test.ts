@@ -4,7 +4,7 @@
  */
 
 import { type Context, z } from '@cyanheads/mcp-ts-core';
-import { invalidParams, JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
+import { invalidParams, JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   createMockContext as createCoreMockContext,
   getEnrichment,
@@ -40,9 +40,7 @@ vi.mock('@/services/openalex/openalex-service.js', async (importOriginal) => {
   };
 });
 
-const { normalizeId, PMCID_NOT_INDEXED_HINT } = await import(
-  '@/services/openalex/openalex-service.js'
-);
+const { normalizeId } = await import('@/services/openalex/openalex-service.js');
 
 const { getCitationGraphTool } = await import(
   '@/mcp-server/tools/definitions/citation-graph.tool.js'
@@ -628,6 +626,76 @@ describe('getCitationGraphTool', () => {
   });
 
   /**
+   * A wildcard OpenAlex refuses in a `.search` filter reaches the caller under its own reason
+   * with this tool's recovery, through the real service against a verbatim upstream body
+   * (2026-11-10): the seed lookup succeeds and the graph page is refused. The classification
+   * table lives in the service suite. (gh #134)
+   */
+  describe('wildcard 400s through the real service (gh #134)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    const REQUIRES_EXACT =
+      'Wildcards (* or ?) require the exact (no-stem) field. "title.search" is stemmed, so the literal text before the wildcard is removed when the work is indexed and the search returns wrong results. Use "title.search.exact" instead, e.g. title.search.exact:microplastic*.';
+    const PREFIX_TOO_SHORT =
+      'A * wildcard needs at least 3 leading characters: "A*". Add characters before the *, e.g. abc*.';
+
+    it.each([
+      ['upstream_wildcard_requires_exact', 'microplastic*', REQUIRES_EXACT],
+      ['upstream_wildcard_prefix_too_short', 'A* search', PREFIX_TOO_SHORT],
+    ])('%s carries its declared recovery on both surfaces', async (reason, value, message) => {
+      const declared = getCitationGraphTool.errors?.find((e) => e.reason === reason);
+      expect(declared, `${reason} missing from the contract`).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        thrownBy: 'service',
+      });
+      const fetchMock = vi.fn((input: unknown) => {
+        const url = new URL(String(input));
+        if (url.hostname !== 'api.openalex.org') {
+          return Promise.reject(new Error(`unmocked fetch: ${url.href}`));
+        }
+        if (url.pathname === '/works/W2741809807') {
+          return Promise.resolve(
+            Response.json({ id: 'https://openalex.org/W2741809807', display_name: 'Seed' }),
+          );
+        }
+        return Promise.resolve(
+          Response.json({ error: 'Invalid query parameters error.', message }, { status: 400 }),
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W2741809807',
+        direction: 'cites',
+        filters: { 'title.search': value },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message,
+          data: { reason, upstreamMessage: message, recovery: { hint: declared?.recovery } },
+        },
+      });
+      const text = readMarkdown(
+        (result.content ?? []).map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+      );
+      expect(text).toContain(message);
+      expect(text).toContain(`Recovery: ${declared?.recovery}`);
+      expect(text).toContain(reason);
+    });
+  });
+
+  /**
    * Identifier and URL fields skip provider-text normalization and come back byte-identical to
    * upstream, so the `results` description cannot call every text value decoded. (gh #94)
    */
@@ -701,11 +769,15 @@ describe('getCitationGraphTool', () => {
   });
 
   /**
-   * The seed lookup is a `/works/{id}` singleton call, so a PMCID seed reaches the same 404 the
-   * other two tools do. The service substitutes the conversion recovery for the contract's
-   * generic one, and it has to survive onto both client surfaces here too.
+   * The seed lookup is a `/works/{id}` singleton call, and OpenAlex indexes PMCIDs, so a PMCID
+   * seed resolves like any other work identifier. A PMCID OpenAlex does not hold is an ordinary
+   * miss: the contract's generic `entity_not_found` recovery reaches both client surfaces. The
+   * miss runs the real service against a stubbed 404, so the case fails if the service writes a
+   * recovery of its own for the scheme.
    */
   describe('PMCID seeds (gh #67)', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
     const pmcSeeds: [label: string, seedId: string][] = [
       ['a bare PMCID', 'PMC3084216'],
       ['a PMC URL', 'https://pmc.ncbi.nlm.nih.gov/articles/PMC3084216/'],
@@ -730,49 +802,67 @@ describe('getCitationGraphTool', () => {
     });
 
     it.each(pmcSeeds)(
-      'carries the conversion hint on both client surfaces for %s',
+      'carries the generic not-found recovery on both client surfaces for %s',
       async (_label, seedId) => {
-        mockSearch.mockRejectedValue(
-          notFound('Entity not found at /works/pmcid:PMC3084216', {
-            reason: 'entity_not_found',
-            path: '/works/pmcid:PMC3084216',
-            recovery: { hint: PMCID_NOT_INDEXED_HINT },
-          }),
+        const fetchMock = vi.fn((input: unknown) =>
+          new URL(String(input)).pathname === '/works/pmcid:PMC3084216'
+            ? Promise.resolve(
+                new Response('<!doctype html><title>404 Not Found</title>', { status: 404 }),
+              )
+            : Promise.reject(new Error(`unmocked fetch: ${String(input)}`)),
         );
+        vi.stubGlobal('fetch', fetchMock);
+        const actual = await vi.importActual<
+          typeof import('@/services/openalex/openalex-service.js')
+        >('@/services/openalex/openalex-service.js');
+        actual.initOpenAlexService();
+        const service = actual.getOpenAlexService();
+        mockSearch.mockImplementation((...args: unknown[]) =>
+          service.search(...(args as [SearchParams, Context])),
+        );
+        const recovery = getCitationGraphTool.errors?.find(
+          (entry) => entry.reason === 'entity_not_found',
+        )?.recovery;
 
         const result = await runToolContract(getCitationGraphTool, {
           seed_id: seedId,
           direction: 'cited_by',
         });
 
+        expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(result.isError).toBe(true);
         expect(result.structuredContent).toMatchObject({
           error: {
             code: JsonRpcErrorCode.NotFound,
             data: {
               reason: 'entity_not_found',
-              recovery: { hint: expect.stringContaining('OpenAlex indexes no PMCIDs') },
+              path: '/works/pmcid:PMC3084216',
+              recovery: { hint: recovery },
             },
           },
         });
-        const rendered = (result.content ?? [])
-          .map((block) => (block.type === 'text' ? block.text : ''))
-          .join('\n');
-        expect(rendered).toContain('OpenAlex indexes no PMCIDs');
-        expect(rendered).toContain('https://www.ncbi.nlm.nih.gov/pmc/tools/idconv/');
+        const rendered = readMarkdown(
+          (result.content ?? [])
+            .map((block) => (block.type === 'text' ? block.text : ''))
+            .join('\n'),
+        );
+        expect(rendered).toContain(`Recovery: ${recovery}`);
+        expect(rendered).not.toMatch(/indexes no PMCIDs/i);
       },
     );
 
-    it('no longer lists PMCID as a working seed_id form', () => {
+    it('lists PMCID as a working seed_id form', () => {
       const contractRecovery =
         getCitationGraphTool.errors?.find((entry) => entry.reason === 'entity_not_found')
           ?.recovery ?? '';
-      expect(contractRecovery).toMatch(/OpenAlex indexes no PMCIDs/i);
-      expect(contractRecovery).not.toMatch(/DOI, PMID, or PMCID/i);
+      expect(contractRecovery).toContain('DOI, PMID, PMCID, or arXiv ID');
+      expect(contractRecovery).not.toMatch(/indexes no PMCIDs|convert a PMCID/i);
 
       const description = getCitationGraphTool.input.shape.seed_id.description ?? '';
-      expect(description).toMatch(/OpenAlex indexes no PMCIDs/i);
-      expect(description).toMatch(/PMID or DOI/i);
+      expect(description).toContain(
+        'PMCID ("PMC1234567" or a PubMed Central URL such as "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/")',
+      );
+      expect(description).not.toMatch(/indexes no PMCIDs|resolves nothing/i);
     });
   });
 
@@ -1204,6 +1294,46 @@ describe('getCitationGraphTool', () => {
     it('declares quote_in_filter_value as a service-thrown ValidationError', () => {
       const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'quote_in_filter_value');
       expect(entry).toMatchObject({ code: JsonRpcErrorCode.ValidationError, thrownBy: 'service' });
+    });
+
+    /** The rewrite table lives in the service suite; these prove this tool reaches it. */
+    describe('numeric ranges (gh #133)', () => {
+      const RANGE_RECOVERY =
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.';
+
+      it('sends "<=2022" on publication_year as the hyphen range "-2022"', async () => {
+        const { result, sentFilter } = await run({ publication_year: '<=2022' });
+        expect(result.isError).toBeFalsy();
+        expect(sentFilter()).toBe('filter=publication_year%3A-2022%2Ccites%3AW3002222772');
+      });
+
+      it('refuses a negated open range before the seed lookup', async () => {
+        const { fetchMock, result } = await run({ publication_year: '!2020..' });
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(mockSearch).not.toHaveBeenCalled();
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            message: expect.stringContaining('Filter "publication_year" value "!2020.."'),
+            data: { reason: 'invalid_range_in_filter_value', recovery: { hint: RANGE_RECOVERY } },
+          },
+        });
+        const text = readMarkdown(textOf(result));
+        expect(text).toContain('Filter "publication_year" value "!2020.."');
+        expect(text).toContain(RANGE_RECOVERY);
+        expect(text).toContain('invalid_range_in_filter_value');
+      });
+
+      it('declares invalid_range_in_filter_value as a service-thrown ValidationError', () => {
+        const entry = getCitationGraphTool.errors?.find(
+          (e) => e.reason === 'invalid_range_in_filter_value',
+        );
+        expect(entry).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          thrownBy: 'service',
+        });
+      });
     });
   });
 
@@ -1683,6 +1813,363 @@ describe('getCitationGraphTool', () => {
       expect(text).toContain(`**Window:** ${bare(capped.id)} \`authorships\``);
       expect(text).toMatch(/possibly capped/);
       expect(text).not.toContain(`**Window:** ${bare(complete.id)}`);
+    });
+  });
+
+  /**
+   * The graph shares the `select` seam and the service's projection with the search tool, where
+   * both are tabled; these prove its wiring — what reaches the graph search, the notice beside
+   * its own, the conversion log, and the refusal hint. (gh #135)
+   */
+  describe('select widening and comma-joined names (gh #135)', () => {
+    const graphPage = (results: EntityRecord[]): SearchResult => ({
+      meta: { count: results.length, per_page: 25, next_cursor: null },
+      results,
+    });
+    const citing = { id: 'https://openalex.org/W9', display_name: 'Citing', open_access: {} };
+
+    it('hands a select string to the graph search whole, with the split and widening disclosed', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2626778328'))
+        .mockResolvedValueOnce(graphPage([citing]));
+      const ctx = createMockContext();
+      const log = vi.spyOn(ctx.log, 'info');
+      await getCitationGraphTool.handler(
+        getCitationGraphTool.input.parse({
+          seed_id: 'W2626778328',
+          direction: 'cites',
+          select: 'doi, is_oa',
+        }),
+        ctx,
+      );
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ select: ['doi, is_oa'] }),
+        ctx,
+      );
+      expect(log).toHaveBeenCalledWith('Converted select string', {
+        tool: 'openalex_get_citation_graph',
+      });
+      const { notice } = getEnrichment(ctx);
+      expect(notice).toContain('`doi, is_oa` → `doi`, `is_oa`');
+      expect(notice).toContain('`is_oa` → `open_access`');
+    });
+
+    it('logs no conversion for a select array, and keeps the seed lookup to id', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2626778328'))
+        .mockResolvedValueOnce(graphPage([citing]));
+      const ctx = createMockContext();
+      const log = vi.spyOn(ctx.log, 'info');
+      await getCitationGraphTool.handler(
+        getCitationGraphTool.input.parse({
+          seed_id: 'W2626778328',
+          direction: 'cites',
+          select: ['doi'],
+        }),
+        ctx,
+      );
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ select: ['id'] }),
+        ctx,
+      );
+      expect(log.mock.calls.map(([message]) => message)).not.toContain('Converted select string');
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('joins the widening to the per_page clamp and the empty-page notice', async () => {
+      mockSearch.mockResolvedValueOnce(lookupResponse('W1')).mockResolvedValueOnce({
+        meta: { count: 0, per_page: 100, next_cursor: null },
+        results: [],
+      });
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W1',
+        direction: 'cites',
+        select: ['primary_location.source.display_name'],
+        per_page: 150,
+      });
+      const { notice } = result.structuredContent as { notice: string };
+      expect(notice).toContain('using per_page 100.');
+      expect(notice).toContain('`primary_location.source.display_name` → `primary_location`');
+      expect(notice).toContain('No edges');
+      expect(notice.indexOf('using per_page')).toBeLessThan(notice.indexOf('primary_location'));
+      expect(notice.indexOf('primary_location')).toBeLessThan(notice.indexOf('No edges'));
+    });
+
+    it('names the widened parent in a response_too_large hint', async () => {
+      const wide = (n: number): EntityRecord => ({
+        id: `https://openalex.org/W${n}`,
+        display_name: `Wide ${n}`,
+        open_access: { note: 'x'.repeat(3_000_000) },
+      });
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W1'))
+        .mockResolvedValueOnce(graphPage([wide(2), wide(3), wide(4)]));
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'W1',
+        direction: 'cites',
+        select: ['is_oa'],
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: {
+            reason: 'response_too_large',
+            largestFitting: { input: 'per_page', value: 2 },
+            recovery: { hint: expect.stringContaining('top-level fields (`open_access`)') },
+          },
+        },
+      });
+    });
+  });
+
+  /** Root-key aliases reach their targets exactly as the canonical keys do. (gh #138) */
+  describe('input aliases (gh #138)', () => {
+    /** Arguments as a client sends them: untyped, so the alias keys reach the framework's parse. */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(getCitationGraphTool, args as never);
+
+    it('reads work_id as seed_id and limit as per_page', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2626778328'))
+        .mockResolvedValueOnce(sampleResult);
+      const result = await call({ work_id: 'W2626778328', direction: 'related_to', limit: 2 });
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ id: 'W2626778328' }),
+        expect.anything(),
+      );
+      expect(mockSearch).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          perPage: 2,
+          filters: expect.objectContaining({ related_to: 'W2626778328' }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it.each([
+      [{ work_id: 'W1', seed_id: 'W1', direction: 'cites' }, 'work_id is an alias of seed_id'],
+      [
+        { seed_id: 'W1', direction: 'cites', limit: 5, per_page: 5 },
+        'limit is an alias of per_page',
+      ],
+    ])('rejects an alias sent beside its target: %j', async (args, hint) => {
+      const result = await call(args);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain(`${hint}; send one of them, not both.`);
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('leaves entity unknown here, where no entity_type exists', async () => {
+      const result = await call({ seed_id: 'W1', direction: 'cites', entity: 'works' });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain('Unknown key entity');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * An arXiv seed resolves through the real service, and the seed lookup and the graph page share
+   * one 50-second call deadline. (gh #137)
+   */
+  describe('arXiv seeds and the call deadline (gh #137)', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    const textOf = (result: { content?: { type: string; text?: string }[] }) =>
+      (result.content ?? []).map((block) => block.text ?? '').join('\n');
+    const work = (id: string) =>
+      Response.json({ id: `https://openalex.org/${id}`, display_name: id });
+    const missing = () => new Response('<!doctype html><title>404</title>', { status: 404 });
+    const graphPage = () =>
+      Response.json({
+        meta: { count: 1, per_page: 25, next_cursor: null },
+        results: [defaultWork(9)],
+      });
+    const landingRow = (id: string) => ({
+      id: `https://openalex.org/${id}`,
+      locations: [
+        {
+          landing_page_url: 'https://arxiv.org/abs/2608.25542',
+          source: { id: 'https://openalex.org/S4306400194' },
+        },
+      ],
+    });
+
+    /** A fetch that never settles on its own — only an abort of its signal ends it. */
+    function hang(init: RequestInit | undefined): Promise<Response> {
+      return new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }
+
+    /** Route `mockSearch` to the real service over `answer`, a stub for every `fetch`. */
+    async function useRealService(
+      answer: (url: URL, init: RequestInit | undefined) => Promise<Response>,
+    ) {
+      const fetchMock = vi.fn((input: unknown, init?: RequestInit) =>
+        answer(new URL(String(input)), init),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      const actual = await vi.importActual<
+        typeof import('@/services/openalex/openalex-service.js')
+      >('@/services/openalex/openalex-service.js');
+      actual.initOpenAlexService();
+      const service = actual.getOpenAlexService();
+      mockSearch.mockImplementation((...args: unknown[]) =>
+        service.search(...(args as [SearchParams, Context])),
+      );
+      return fetchMock;
+    }
+
+    it('walks the graph from an arXiv seed, naming the dropped version on both surfaces', async () => {
+      const fetchMock = await useRealService(async (url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.1706.03762') return work('W2626778328');
+        if (url.pathname === '/works') return graphPage();
+        throw new Error(`unmocked fetch: ${url.pathname}`);
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'https://arxiv.org/pdf/1706.03762v7.pdf',
+        direction: 'cites',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const graphUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+      expect(graphUrl.searchParams.get('filter')).toBe('cites:W2626778328');
+      const notice =
+        'Version v7 was dropped from arXiv ID 1706.03762v7: OpenAlex keeps one work per arXiv paper, not one per version, so it was looked up as 1706.03762.';
+      expect(result.structuredContent).toMatchObject({ notice });
+      expect(textOf(result)).toContain(notice);
+    });
+
+    it('discloses the billed landing-page lookup a seed needed', async () => {
+      await useRealService(async (url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') return missing();
+        if (url.pathname === '/works' && url.searchParams.has('filter')) {
+          return url.searchParams.get('filter')?.startsWith('locations.landing_page_url:')
+            ? Response.json({ meta: { count: 1 }, results: [landingRow('W7204606861')] })
+            : graphPage();
+        }
+        if (url.pathname === '/works/W7204606861') return work('W7204606861');
+        throw new Error(`unmocked fetch: ${url.pathname}`);
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: '2608.25542',
+        direction: 'cited_by',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { notice: string }).notice).toContain(
+        'found by its landing page',
+      );
+      expect(textOf(result)).toContain('($0.0001)');
+    });
+
+    it('passes the seed lookup the whole deadline and the graph page what it left', async () => {
+      mockSearch
+        .mockResolvedValueOnce(lookupResponse('W2741809807'))
+        .mockResolvedValueOnce(sampleResult);
+
+      await runToolContract(getCitationGraphTool, { seed_id: 'W2741809807', direction: 'cites' });
+
+      const [seed, graph] = mockSearch.mock.calls.map(
+        (call) => (call as unknown[])[0] as SearchParams,
+      );
+      expect(seed?.deadlineMs).toBe(50_000);
+      expect(graph?.deadlineMs).toBeGreaterThan(0);
+      expect(graph?.deadlineMs).toBeLessThanOrEqual(50_000);
+    });
+
+    it('settles a slow arXiv seed and a hung graph page within the 50 s call deadline', async () => {
+      vi.useFakeTimers();
+      let doiAttempts = 0;
+      const fetchMock = await useRealService(async (url, init) => {
+        // Two DOI attempts time out before the third answers 404 (~23 s); the landing page and the
+        // refetch answer at once; the graph page never does. Its own retry budget (~33 s) would end
+        // the call near 57 s — past the 50 s deadline and close to a client's 60 s wait.
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') {
+          doiAttempts += 1;
+          return doiAttempts < 3 ? hang(init) : missing();
+        }
+        if (url.searchParams.get('filter')?.startsWith('locations.landing_page_url:')) {
+          return Response.json({ meta: { count: 1 }, results: [landingRow('W7204606861')] });
+        }
+        if (url.pathname === '/works/W7204606861') return work('W7204606861');
+        if (url.pathname === '/works') return hang(init);
+        throw new Error(`unmocked fetch: ${url.pathname}`);
+      });
+      const startedAt = Date.now();
+      let settledAt = 0;
+
+      const pending = runToolContract(getCitationGraphTool, {
+        seed_id: '2608.25542',
+        direction: 'cites',
+      }).finally(() => {
+        settledAt = Date.now();
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(doiAttempts).toBe(3);
+      const graphAttempts = fetchMock.mock.calls.filter(([input]) =>
+        new URL(String(input)).searchParams.get('filter')?.startsWith('cites:'),
+      );
+      expect(graphAttempts.length).toBeGreaterThan(0);
+      expect(settledAt - startedAt).toBeLessThanOrEqual(50_000);
+      // The seed took over 20 s, so the call deadline — not the graph page's own retry budget —
+      // is what ended the call.
+      expect(settledAt - startedAt).toBeGreaterThan(45_000);
+      const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'upstream_timeout');
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.Timeout,
+          data: { reason: 'upstream_timeout', path: '/works', recovery: { hint: entry?.recovery } },
+        },
+      });
+    });
+
+    it('fails an arXiv seed whose landing page several works hold as entity_not_found with the candidates', async () => {
+      await useRealService(async (url) => {
+        if (url.pathname === '/works/doi:10.48550/arXiv.2608.25542') return missing();
+        if (url.pathname === '/works') {
+          return Response.json({
+            meta: { count: 2 },
+            results: [landingRow('W1'), landingRow('W2')],
+          });
+        }
+        throw new Error(`unmocked fetch: ${url.pathname}`);
+      });
+
+      const result = await runToolContract(getCitationGraphTool, {
+        seed_id: 'arXiv:2608.25542',
+        direction: 'cites',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          data: {
+            reason: 'entity_not_found',
+            candidates: ['W1', 'W2'],
+            recovery: { hint: expect.stringContaining('data.candidates') },
+          },
+        },
+      });
+    });
+
+    it('declares the arXiv misses in the entity_not_found entry', () => {
+      const entry = getCitationGraphTool.errors?.find((e) => e.reason === 'entity_not_found');
+      expect(entry?.when).toContain('data.fallbackFailedReason');
+      expect(entry?.recovery).toContain('arXiv ID');
     });
   });
 });

@@ -45,9 +45,10 @@ function readNumericHeader(headers: Headers, name: string): number | undefined {
  * and a singleton `/works/{id}` lookup alike. Singleton lookups are the reason this reads
  * headers rather than the parsed body: they carry no `meta` wrapper at all, so the body's
  * `cost_usd` (present and identical on the other shapes) is unavailable exactly where
- * `costUsd: 0` is the most interesting signal — fetching by an OpenAlex ID, DOI, or other
- * external identifier is free. (A keyword fetched by its slug, or an ID with characters past it
- * such as `W2741809807#x`, bills like a list request.)
+ * `costUsd: 0` is the most interesting signal — fetching by an OpenAlex ID, DOI, other external
+ * identifier, or keyword slug is free. (An ID with characters past it, such as `W2741809807#x`,
+ * bills like a list request, as does a funder looked up by its Funder Registry DOI, which is an
+ * `ids.doi` list request; measured 2026-11-10.)
  *
  * Returns `undefined` unless the full set parses. A partial read would report a cost with no
  * budget to weigh it against, which is worse than reporting nothing. The prepaid balance sits

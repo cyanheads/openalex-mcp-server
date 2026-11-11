@@ -36,6 +36,20 @@
           "default": "true"
         },
         {
+          "name": "OPENALEX_FILTER_RECORD_REPAIR",
+          "description": "Accept boolean and number values, nested objects, and quoted keys in the filters record, with a notice. Set false to require string values under dotted keys.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "OPENALEX_SELECT_STRING_INPUT",
+          "description": "Accept a comma-separated select string on search_entities and get_citation_graph, with a notice. Set false to require an array.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "OPENALEX_API_KEY",
           "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
           "format": "string",
@@ -83,6 +97,20 @@
         {
           "name": "OPENALEX_FILTER_STRING_INPUT",
           "description": "Accept unambiguous native filter strings on search_entities. Set false to require record objects.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "OPENALEX_FILTER_RECORD_REPAIR",
+          "description": "Accept boolean and number values, nested objects, and quoted keys in the filters record, with a notice. Set false to require string values under dotted keys.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
+          "name": "OPENALEX_SELECT_STRING_INPUT",
+          "description": "Accept a comma-separated select string on search_entities and get_citation_graph, with a notice. Set false to require an array.",
           "format": "string",
           "isRequired": false,
           "default": "true"

@@ -30,6 +30,18 @@ const ServerConfigSchema = z.object({
     .describe(
       'Clamp oversized count inputs (per_page, semantic per_page, sample, slice.limit) to their caps with a notice; false rejects them',
     ),
+  filterRecordRepair: z
+    .stringbool()
+    .default(true)
+    .describe(
+      'Accept boolean and number values, nested objects, and quoted keys in the filters record of every filter-taking tool, with a notice; false requires string values under dotted keys',
+    ),
+  selectStringInput: z
+    .stringbool()
+    .default(true)
+    .describe(
+      'Accept a comma-separated select string on openalex_search_entities and openalex_get_citation_graph, with a notice; false requires an array',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -43,6 +55,8 @@ export function getServerConfig(): ServerConfig {
     baseUrl: 'OPENALEX_BASE_URL',
     filterStringInput: 'OPENALEX_FILTER_STRING_INPUT',
     clampPerPage: 'OPENALEX_CLAMP_PER_PAGE',
+    filterRecordRepair: 'OPENALEX_FILTER_RECORD_REPAIR',
+    selectStringInput: 'OPENALEX_SELECT_STRING_INPUT',
   });
   return _config;
 }

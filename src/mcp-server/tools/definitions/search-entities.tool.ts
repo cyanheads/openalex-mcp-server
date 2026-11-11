@@ -8,6 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { ATTR_MCP_TOOL_NAME, createCounter } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { escapeMarkdown } from '@/mcp-server/tools/escape-markdown.js';
+import { discloseFilterRepairs, filtersInput } from '@/mcp-server/tools/filters-input.js';
 import { clampCount, countSchema, pageSizeSchema } from '@/mcp-server/tools/page-size.js';
 import {
   buildRecordPage,
@@ -17,7 +18,13 @@ import {
   windowsOutputSchema,
 } from '@/mcp-server/tools/record-page.js';
 import { renderBudgetTrailer } from '@/mcp-server/tools/render-budget.js';
-import { parseNativeFilters, quoteCallerText } from '@/services/openalex/filter-values.js';
+import {
+  describeSelect,
+  recordSelectStringConversion,
+  selectInput,
+} from '@/mcp-server/tools/select-input.js';
+import { arxivResolutionNotice } from '@/services/openalex/arxiv-id.js';
+import { quoteCallerText } from '@/services/openalex/filter-values.js';
 import { getOpenAlexService, selectRecordKey } from '@/services/openalex/openalex-service.js';
 import { ENTITY_TYPES } from '@/services/openalex/types.js';
 
@@ -36,30 +43,6 @@ const SAMPLE_MAX_LABEL = SAMPLE_MAX.toLocaleString('en-US');
 /** What `meta.count` counts, in the rendered header. */
 const RESULT_NOUN = 'result(s)';
 
-const canonicalFilters = z.record(z.string(), z.string());
-const { $schema: _schema, ...filterProjection } = z.toJSONSchema(canonicalFilters, { io: 'input' });
-/** Provenance belongs to the parsed call; only the canonical record is sent to the service. */
-const normalizedFilters = z
-  .preprocess(
-    (raw, ctx) => {
-      /**
-       * Leave JSON-object representations to the framework's existing record repair. Report
-       * canonical paths so repairs target caller fields rather than the internal wrapper.
-       */
-      const converted =
-        typeof raw === 'string' &&
-        !raw.trimStart().startsWith('{') &&
-        getServerConfig().filterStringInput;
-      const parsed = canonicalFilters.safeParse(converted ? parseNativeFilters(raw) : raw);
-      if (!parsed.success) {
-        for (const issue of parsed.error.issues) ctx.addIssue({ ...issue });
-        return z.NEVER;
-      }
-      return { value: parsed.data, converted };
-    },
-    z.object({ value: canonicalFilters, converted: z.boolean() }),
-  )
-  .meta({ ...filterProjection, properties: undefined, required: undefined });
 const filterStringConversions = createCounter(
   'openalex.filter_string.conversions',
   'Native filter strings converted to records',
@@ -146,7 +129,7 @@ function hasNextPage(page: number, perPage: number, reachable: number): boolean 
 
 export const searchEntitiesTool = tool('openalex_search_entities', {
   description:
-    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders, awards). Pass `id` to retrieve a single entity. Otherwise, use `query` and/or `filters` for discovery. Filters take a record object; an unambiguous native string such as "issn:0920-8542" is also accepted when enabled and disclosed in `notice`. Native clauses split on commas outside paired double quotes and the first colon; duplicate keys and bare fragments are rejected. Any filter value sent unquoted must have paired double quotes; balanced search phrases remain valid. Supports keyword search with boolean operators, exact phrase matching, AI semantic search, and seeded random samples. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` to override with specific fields, or `["*"]` for the full record. A page holds `per_page` records and `next_cursor` continues it — semantic search and a seeded `sample` continue with `page` instead; an `id` lookup returns every selected array whole, and `slice` pages one array by count.',
+    'Search, filter, sort, or retrieve by ID. Covers all OpenAlex entity types (works, authors, sources, institutions, topics, keywords, publishers, funders, awards). Pass `id` to retrieve a single entity; on works it also takes an arXiv ID, found by its arXiv landing page when OpenAlex holds no work under its arXiv DOI, one billed list request. Otherwise, use `query` and/or `filters` for discovery. Filters take a record object; an unambiguous native string such as "primary_location.source.issn:0920-8542" is also accepted when enabled and disclosed in `notice`. Native clauses split on commas outside paired double quotes and the first colon; duplicate keys and bare fragments are rejected. Any filter value sent unquoted must have paired double quotes; balanced search phrases remain valid. Supports keyword search with boolean operators, exact phrase matching, AI semantic search, and seeded random samples. On works, wildcards (`*`, `?`) need search_mode "exact" or a `.search.exact` filter, and a `*` needs three characters before it. Use openalex_resolve_name to resolve names to IDs before filtering. Searches and ID lookups return a curated set of fields by default; pass `select` (an array, or a comma-separated string) to override with specific fields, or `["*"]` for the full record. A page holds `per_page` records and `next_cursor` continues it — semantic search and a seeded `sample` continue with `page` instead; an `id` lookup returns every selected array whole, and `slice` pages one array by count.',
   sourceUrl:
     'https://github.com/cyanheads/openalex-mcp-server/blob/main/src/mcp-server/tools/definitions/search-entities.tool.ts',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
@@ -274,14 +257,15 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       code: JsonRpcErrorCode.ValidationError,
       when: '`id` holds a `.` or `..` path segment, written plainly or percent-encoded.',
       recovery:
-        'Pass the identifier itself — an OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN — with no relative path segments, or drop `id` and search with `query` or `filters`.',
+        'Pass the identifier itself — an OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN, or (on works) arXiv ID — with no relative path segments, or drop `id` and search with `query` or `filters`.',
       thrownBy: 'service',
     },
     {
       reason: 'entity_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Lookup by id matched no OpenAlex entity.',
-      recovery: 'Verify the ID format or call openalex_resolve_name to find the correct ID.',
+      when: 'Lookup by id matched no OpenAlex entity — for an arXiv ID under entity_type "works", no work carries its 10.48550/arXiv DOI and the lookup by its arXiv landing page found none, found several (`data.candidates`), or failed upstream (`data.fallbackFailedReason`).',
+      recovery:
+        'Verify the ID format or call openalex_resolve_name to find the correct ID; for an arXiv paper OpenAlex finds under neither its DOI nor its landing page, search works by its title with `query`.',
       thrownBy: 'service',
     },
     {
@@ -354,6 +338,14 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       thrownBy: 'service',
     },
     {
+      reason: 'invalid_range_in_filter_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A numeric filter (publication_year, cited_by_count, fwci, and the other count, year, and score fields) holds a range OpenAlex cannot read: a negative bound, a reversed range (high bound first), a "!" before a comparison or an open range, a bound that is not a plain decimal, or two comparisons ANDed in one value.',
+      recovery:
+        'Write the bound as a non-negative decimal number: >=N, <=N, >N, <N, a..b, a.., or ..b, low bound first. "!" negates only an exact value or a closed range a..b.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'invalid_country_code',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A country filter (a key ending in country_code, country_codes, or countries) holds a segment that cannot be a country code, such as a misspelled name, an unassigned number, "unknown", or two codes joined by a space ("DE US").',
@@ -418,6 +410,22 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       thrownBy: 'service',
     },
     {
+      reason: 'upstream_wildcard_requires_exact',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * or ? wildcard in stemmed works search (HTTP 400): the query under search_mode "keyword", or a .search filter that has a .search.exact form.',
+      recovery:
+        'For `query`, rerun with search_mode "exact", which turns off stemming for every term. For a `.search` filter, use the `.search.exact` key the message names (title.search → title.search.exact). Remove a `*` that is part of a title rather than a wildcard.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_wildcard_prefix_too_short',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'OpenAlex refused a * wildcard with fewer than three characters before it (HTTP 400), in the query or a .search filter.',
+      recovery:
+        'Put at least three characters before the `*` (micro*), or remove a `*` that is part of a name or title such as "A* search"; search_mode "exact" does not lift this limit.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_validation_failed',
       code: JsonRpcErrorCode.ValidationError,
       when: 'OpenAlex rejected the request as semantically invalid (HTTP 422).',
@@ -426,7 +434,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       thrownBy: 'service',
     },
   ],
-  inputAliases: { search: 'query', filter: 'filters' },
+  inputAliases: { search: 'query', filter: 'filters', entity: 'entity_type', limit: 'per_page' },
   input: z.object({
     entity_type: z.enum(ENTITY_TYPES).describe('Type of scholarly entity to search.'),
     id: z
@@ -434,25 +442,25 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .min(1)
       .optional()
       .describe(
-        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807" or "https://api.openalex.org/works/W2741809807"), whose letter must name `entity_type` — W works, A authors, S sources, I institutions, T topics, P publishers, F funders, G awards; DOI ("10.1038/nature12373"; under entity_type "funders", a funder\'s Crossref Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361" — one ROR can name an institution, a funder, and a publisher, and `entity_type` picks which), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), ISSN ("1234-5678"). Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). A PMCID is recognized too, bare ("PMC1234567") or as a PubMed Central URL, but OpenAlex indexes no PMCIDs, so it resolves nothing — pass the work\'s PMID or DOI instead. When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). Every selected array returns whole; `slice` pages a long one by count. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
+        'Retrieve a single entity by ID. Supports: OpenAlex ID ("W2741809807", or its OpenAlex record-page or API URL such as "https://openalex.org/works/W2741809807" or "https://api.openalex.org/works/W2741809807"), whose letter must name `entity_type` — W works, A authors, S sources, I institutions, T topics, P publishers, F funders, G awards; DOI ("10.1038/nature12373"; under entity_type "funders", a funder\'s Crossref Funder Registry DOI such as "10.13039/100000001"), ORCID ("0000-0002-1825-0097"), ROR ("https://ror.org/00hx57361" — one ROR can name an institution, a funder, and a publisher, and `entity_type` picks which), PMID ("12345678" or "https://pubmed.ncbi.nlm.nih.gov/12345678"), PMCID ("PMC1234567" or a PubMed Central URL such as "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/"), ISSN ("1234-5678"). Under entity_type "works" an arXiv ID is also accepted ("1706.03762", "hep-th/9901001", "arXiv:1706.03762", an arxiv.org /abs/ or /pdf/ URL, or its DOI "10.48550/arXiv.1706.03762"); a version suffix is dropped and named in `notice`. Under any other entity_type the `id` is sent as written. Keywords are identified by slug rather than a native ID — pass either the slug ("groundwater") or the URL a search returns ("https://openalex.org/keywords/groundwater"). When provided, `query`, `search_mode`, `filters`, `sort`, `sample`, and `seed` are not applied — the returned record is the entity at that ID regardless of them, and the response `notice` names any you passed. `select` still applies: the curated per-entity-type default is returned unless you pass `select` (use `["*"]` for the complete record). Every selected array returns whole; `slice` pages a long one by count. To filter, drop `id` and search. Use openalex_resolve_name to find the ID if unknown.',
       ),
     query: z
       .string()
       .min(1)
       .optional()
       .describe(
-        'Text search query. Supports boolean operators (AND, OR, NOT), quoted phrases ("exact match"), wildcards (machin*), fuzzy matching (machin~1), and proximity ("climate change"~5). Omit for filter-only queries — an empty string is rejected, since a blank search is a mistake rather than a request for the whole catalog.',
+        'Text search query. Supports boolean operators (AND, OR, NOT), quoted phrases ("exact match"), wildcards (machin*), fuzzy matching (machin~1), and proximity ("climate change"~5). On works, wildcards need search_mode "exact" — the default stemmed keyword search refuses `*` and `?`. A `*` needs at least three characters before it (micro*, not A*) in every mode and on every entity type. Omit for filter-only queries — an empty string is rejected, since a blank search is a mistake rather than a request for the whole catalog.',
       ),
     search_mode: z
       .enum(['keyword', 'exact', 'semantic'])
       .default('keyword')
       .describe(
-        `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match). "semantic": AI embedding similarity over a query-dependent candidate set whose size \`meta.count\` reports, at ~1 req/sec, up to ${SEMANTIC_PER_PAGE_CAP} per page, and paginated with \`page\` rather than \`cursor\`.`,
+        `Search strategy. "keyword": stemmed full-text (default). "exact": no stemming, matches individual words (use quoted phrases for multi-word exact match), and the mode that takes wildcards on works; on every other entity type OpenAlex runs it as the keyword search. "semantic": AI embedding similarity over a query-dependent candidate set whose size \`meta.count\` reports, at ~1 req/sec, up to ${SEMANTIC_PER_PAGE_CAP} per page, and paginated with \`page\` rather than \`cursor\`.`,
       ),
-    filters: normalizedFilters
+    filters: filtersInput({ nativeString: true })
       .optional()
       .describe(
-        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". AND within same field: "+"-separate ("us+gb"); inside a `.search` value, a DOI, a date (a timestamp\'s "+00:00" offset), a URL field such as landing_page_url, an exactly matched name (display_name, awards.funder_display_name — "C++", "Erasmus+"), a biblio field (issue "1+2"), or awards.funder_award_id, "+" is a literal character. A value cannot mix "|" with an AND operator — a "+", or a space between values on an ID, code, or `language` key (a space inside a language name is part of the name, and a country field never reads a space as AND) — OpenAlex splits it on "|" first and drops every alternative that ANDs more than one value, so such a value is rejected; put the AND in a second key instead ("institutions.country_code": "US" beside "authorships.institutions.country_code": "DE|FR" on works). On a field matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, biblio fields), a space is part of the value: "New York", "!New York", and "New York|Boston" match as written, but quotes around one "|" alternative make that alternative match nothing. A comma is part of such a value too ("University of California, Berkeley" on raw_affiliation_strings): a value holding one is sent as one quoted phrase, its "+" a literal character. A value sent as a quoted phrase cannot contain a double quote of its own. A multi-word value there cannot be ANDed with another ("New York+Boston" matches nothing); to require two funders or institutions, AND their IDs (awards.funder_id, authorships.institutions.id). Country fields (keys ending in country_code, country_codes, or countries) take ISO 3166-1 alpha-2 codes ("DE"): an alpha-3 code ("DEU"), numeric code ("276"), or English name ("Germany", "South Korea") is converted, "UK" becomes "GB", and a value that cannot be a country code is rejected. A space there is part of a name, never a separator: "South Korea|Japan" ORs two countries, and "DE US" is rejected. `language` takes ISO 639-1 codes ("en"): an ISO 639-2 code ("eng") or English name ("English") is converted. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`.',
+        'Filter criteria as field:value pairs. AND across fields (multiple keys). OR within field: pipe-separate ("us|gb"). NOT: prefix "!" ("!us"). Range: "2020-2024". Comparison: ">100", "<50". On numeric fields, `>=N`, `<=N`, `a..b`, `a..`, and `..b` are inclusive ranges, sent as OpenAlex\'s hyphen ranges (`N-`, `-N`, `a-b`); a negative bound, a reversed range, or a `!` before a comparison or an open range is rejected. AND within same field: "+"-separate ("us+gb"); inside a `.search` value, a DOI, a date (a timestamp\'s "+00:00" offset), a URL field such as landing_page_url, an exactly matched name (display_name, awards.funder_display_name — "C++", "Erasmus+"), a biblio field (issue "1+2"), or awards.funder_award_id, "+" is a literal character. A value cannot mix "|" with an AND operator — a "+", or a space between values on an ID, code, or `language` key (a space inside a language name is part of the name, and a country field never reads a space as AND) — OpenAlex splits it on "|" first and drops every alternative that ANDs more than one value, so such a value is rejected; put the AND in a second key instead ("institutions.country_code": "US" beside "authorships.institutions.country_code": "DE|FR" on works). On a field matched as whole text (display_name, awards.funder_display_name, awards.funder_award_id, geo.city, geo.region, raw_affiliation_strings, block_key, biblio fields), a space is part of the value: "New York", "!New York", and "New York|Boston" match as written, but quotes around one "|" alternative make that alternative match nothing. A comma is part of such a value too ("University of California, Berkeley" on raw_affiliation_strings): a value holding one is sent as one quoted phrase, its "+" a literal character. A value sent as a quoted phrase cannot contain a double quote of its own. A multi-word value there cannot be ANDed with another ("New York+Boston" matches nothing); to require two funders or institutions, AND their IDs (awards.funder_id, authorships.institutions.id). Country fields (keys ending in country_code, country_codes, or countries) take ISO 3166-1 alpha-2 codes ("DE"): an alpha-3 code ("DEU"), numeric code ("276"), or English name ("Germany", "South Korea") is converted, "UK" becomes "GB", and a value that cannot be a country code is rejected. A space there is part of a name, never a separator: "South Korea|Japan" ORs two countries, and "DE US" is rejected. `language` takes ISO 639-1 codes ("en"): an ISO 639-2 code ("eng") or English name ("English") is converted. Two keys that resolve to the same upstream field (an alias and its canonical name, e.g. `year` and `publication_year`) are both applied and AND\'d, so they narrow rather than override each other. On works, a `.search` filter that has a `.search.exact` form (abstract, default, display_name, fulltext, title, title_abstract_keywords, title_and_abstract) refuses `*` and `?`: put the wildcard in the `.search.exact` key (title.search.exact). keyword.search, raw_affiliation_strings.search, and raw_author_name.search take wildcards as written. A `*` needs three characters before it in any `.search` value. Use OpenAlex IDs (not names) for entity filters — resolve names first. Common keys: `openalex` (filter by entity ID, e.g. {"openalex": "W123|W456"}), `cites` (works citing a given work), `publication_year` (range "2020-2024"), `authorships.author.id`, `type`, `is_oa`. Boolean values, non-negative numbers, nested objects (`{"authorships":{"author":{"id":"A1"}}}` reads as `authorships.author.id`), and a key wrapped in quotes are read as string values under dotted keys and disclosed in `notice`, except that a whole number at the top level is sent as its decimal text without a notice. null, arrays, empty objects, negative or exponent numbers, and two keys naming one field are rejected.',
       ),
     sort: z
       .string()
@@ -460,11 +468,10 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .describe(
         'Sort field. Prefix with "-" for descending. Comma-separate for a multi-key sort, applied left to right, with the "-" prefix set per key ("-publication_year,cited_by_count" sorts by year descending, then citations ascending). Common: "cited_by_count", "-publication_date", "-relevance_score" (default when query present). Note: when combined with a keyword query, an explicit sort overrides relevance ranking entirely — top results may be highly cited but only tangentially on-topic. Use "-relevance_score" or omit sort to keep the most relevant results first. "-relevance_score" requires an active search via "query" or a "filter:search" filter — passing it without one will fail. Not combinable with `sample` — a search passing both is rejected.',
       ),
-    select: z
-      .array(z.string())
+    select: selectInput
       .optional()
       .describe(
-        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project, so a nested value is requested by its parent object: bibliometrics (`h_index`, `i10_index`, `2yr_mean_citedness`) live under `summary_stats` on authors, sources, institutions, publishers, and funders, and naming a leaf returns that object. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. A wide projection on a large page makes a large response, so name the fields you need. Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
+        'OpenAlex top-level field names to return. Always returned: `id`, `display_name` — additional fields you list are appended. A curated default per entity type applies to both searches and single-entity (`id`) lookups; pass field names to override it, or `["*"]` to retrieve the complete record (every field). Only top-level fields project. A nested name returns the top-level object holding it, with a notice: `h_index`, `i10_index`, `2yr_mean_citedness` → `summary_stats` (authors, sources, institutions, publishers, funders); on works `is_oa`, `oa_status`, `oa_url`, `any_repository_has_fulltext` → `open_access`; and any dotted name whose first segment is a top-level field (`primary_location.source.display_name` → `primary_location`, `authorships.author` → `authorships` — `author_list` is the compact form). A name holding commas is split on them (`["doi,title"]`), and a comma-separated string is accepted too (`"doi,title"`, when OPENALEX_SELECT_STRING_INPUT is on), both disclosed in `notice`. On sources, `publisher` returns `host_organization_name`: the publisher of a journal, the hosting institution of a repository, and null on most sources. On works, `author_list` returns each author in authorship order as `{id, display_name, orcid}` (`orcid` null when absent), a compact alternative to `authorships`, which also carries institutions and affiliations; neither the default nor `["*"]` includes it. Invalid field names produce an error identifying the rejected field. A wide projection on a large page makes a large response, so name the fields you need. Not applied with `slice`. Example: ["doi", "author_list", "primary_topic"].',
       ),
     per_page: pageSizeSchema(PER_PAGE_CAP)
       .optional()
@@ -583,14 +590,14 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
       .string()
       .optional()
       .describe(
-        'Guidance notice. Set when per_page, sample, or slice.limit was clamped (requested and applied sizes), a native filter string was converted, a first call has no matches, a continuation is exhausted, an id lookup ignores search criteria, semantic search reports a candidate total and whether a later `page` holds more, a sample draws more than one page (the next `page`, its last page, or that `seed` makes it pageable), an author array is possibly capped (100 list entries or 5,000 stored singleton entries), a slice offset is past the end, or slice replaces select. Absent otherwise.',
+        "Guidance notice. Set when per_page, sample, or slice.limit was clamped (requested and applied sizes), a native filter string was converted, the filters record was normalized (booleans, numbers, nested objects, or quoted keys; it names the keys), a `select` name was widened to its top-level parent or a comma-joined name was split, an arXiv ID's version was dropped or the ID was found by its billed landing-page lookup, a first call has no matches, a continuation is exhausted, an id lookup ignores search criteria, semantic search reports a candidate total and whether a later `page` holds more, a sample draws more than one page (the next `page`, its last page, or that `seed` makes it pageable), an author array is possibly capped (100 list entries or 5,000 stored singleton entries), a slice offset is past the end, or slice replaces select. Absent otherwise.",
       ),
     budget: z
       .object({
         costUsd: z
           .number()
           .describe(
-            'USD this call spent. 0 for an `id` lookup by an OpenAlex ID, DOI, ORCID, ROR, PMID, or ISSN — OpenAlex does not bill those single-entity fetches, so batching known IDs beats paging a filtered list. OpenAlex bills like one list request a keyword looked up by its slug, an `id` carrying characters past the identifier itself (`W2741809807#x` still returns W2741809807), and a funder looked up by its Funder Registry DOI.',
+            'USD this call spent. 0 for an `id` lookup by an OpenAlex ID, DOI, ORCID, ROR, PMID, ISSN, keyword slug, or arXiv ID whose 10.48550 DOI OpenAlex holds — OpenAlex does not bill those single-entity fetches, so batching known IDs beats paging a filtered list. OpenAlex bills like one list request an `id` carrying characters past the identifier itself (`W2741809807#x` still returns W2741809807), a funder looked up by its Funder Registry DOI, and an arXiv ID no work carries the 10.48550 DOI of, found by its landing page.',
           ),
         remainingUsd: z.number().describe("USD left in today's OpenAlex budget after this call."),
         resetsInSeconds: z
@@ -618,10 +625,11 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
   async handler(parsedInput, ctx) {
     const { filters: normalized, ...rest } = parsedInput;
     const input = { ...rest, filters: normalized?.value };
-    if (normalized?.converted) {
+    if (normalized?.fromNativeString) {
       ctx.log.info('Converted native filter string', { tool: 'openalex_search_entities' });
       filterStringConversions.add(1, { [ATTR_MCP_TOOL_NAME]: 'openalex_search_entities' });
     }
+    const filterRepairs = discloseFilterRepairs(normalized, 'openalex_search_entities', ctx);
     // A form client sends an empty `slice.field` for an unset slice; an empty field is no slice.
     const slice = input.slice?.field ? input.slice : undefined;
     if (slice && !input.id) {
@@ -806,6 +814,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
           ctx,
         )
       : undefined;
+    if (input.select?.converted) recordSelectStringConversion('openalex_search_entities', ctx);
     const service = getOpenAlexService();
     const result = await service.search(
       {
@@ -815,7 +824,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         searchMode: input.search_mode,
         filters: input.filters,
         sort: input.sort,
-        select: slice ? [slice.field] : input.select,
+        select: slice ? [slice.field] : input.select?.value,
         perPage: pageSize.applied,
         cursor: input.cursor,
         page: input.page,
@@ -840,9 +849,18 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
     if (sample?.notice) notices.push(sample.notice);
     if (pageSize.notice) notices.push(pageSize.notice);
     if (sliceLimit?.notice) notices.push(sliceLimit.notice);
-    if (normalized?.converted) {
+    // The projection that ran: a slice replaces `select` with its one field.
+    const selected = describeSelect(input.entity_type, slice ? [slice.field] : input.select?.value);
+    notices.push(...selected.notices);
+    if (normalized?.fromNativeString) {
       notices.push('Converted native filter string to a filters record object.');
     }
+    if (filterRepairs) notices.push(filterRepairs);
+
+    // An `id` read as an arXiv ID says what the lookup dropped (a version) or spent (the billed
+    // landing-page lookup); only an `id` lookup carries `arxiv`.
+    const arxivNotice = result.arxiv && arxivResolutionNotice(result.arxiv);
+    if (arxivNotice) notices.push(arxivNotice);
 
     // An `id` lookup always returns its one record or throws, so it never reaches the
     // empty-results notice — the two branches are exclusive, and the dropped-parameter
@@ -960,6 +978,7 @@ export const searchEntitiesTool = tool('openalex_search_entities', {
         path: input.id ? 'lookup' : 'list',
         continuation: semantic || sample ? 'page' : 'cursor',
         page,
+        widenedFields: selected.widenedFields,
       });
     }
     if (outcome.kind === 'too_large') {
