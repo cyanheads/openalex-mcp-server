@@ -35,6 +35,17 @@ const ENTITY_TYPES = [
 type EntityType = (typeof ENTITY_TYPES)[number];
 type Catalog = Record<EntityType, { filter: string[]; select: string[] }>;
 
+/**
+ * Names OpenAlex lists among an entity type's valid filter fields but answers with an HTTP 400
+ * as a filter, so cataloguing them would advertise keys no call can use: works
+ * `semantic.search` ("is not a filter. For semantic search use the search.semantic parameter")
+ * and `topics_count`, sources `is_in_jstage_since_year` ("can't be used as a filter").
+ */
+const UNUSABLE_FILTER_FIELDS: Partial<Record<EntityType, ReadonlySet<string>>> = {
+  works: new Set(['semantic.search', 'topics_count']),
+  sources: new Set(['is_in_jstage_since_year']),
+};
+
 /** Extract the comma-separated valid-field list from an OpenAlex 400 error body. */
 function parseValidFields(body: string): string[] {
   let parsed: { message?: string } = {};
@@ -81,7 +92,8 @@ async function fetchFields(
   }
 
   const body = await response.text();
-  const fields = parseValidFields(body);
+  const unusable = context === 'filter' ? UNUSABLE_FILTER_FIELDS[entityType] : undefined;
+  const fields = parseValidFields(body).filter((field) => !unusable?.has(field));
   console.log(`  ${entityType}/${context}: ${fields.length} fields`);
   return fields;
 }
