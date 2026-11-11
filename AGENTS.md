@@ -2,8 +2,8 @@
 
 **Server:** openalex-mcp-server
 **Version:** 0.11.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -45,6 +45,8 @@ No hand-written resources — entity lookups need `select` for payload control, 
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
 | `OPENALEX_FILTER_STRING_INPUT` | No | Default: `true`; accept unambiguous native filter strings on `openalex_search_entities`; `false` restores record-only input. Strict boolean parsing rejects invalid values. |
 | `OPENALEX_CLAMP_PER_PAGE` | No | Default: `true`; clamp positive integer `per_page` (100 search/citation, 50 semantic, 200 analysis), `slice.limit` (5,000), and `sample` (10,000) to their caps, with a notice, log, and `openalex.count_input.clamps` counter. `false` rejects each over its cap. Strict boolean parsing. |
+| `OPENALEX_FILTER_RECORD_REPAIR` | No | Default: `true`; accept boolean and number values, nested objects, and quoted keys in the `filters` record of every filter-taking tool, normalized to string values under dotted keys and disclosed in `notice`; `false` requires string values. Strict boolean parsing. |
+| `OPENALEX_SELECT_STRING_INPUT` | No | Default: `true`; accept a comma-separated `select` string on `openalex_search_entities` and `openalex_get_citation_graph`, disclosed in `notice`; `false` requires an array. Strict boolean parsing. |
 
 **Session mode:** `createApp({ sessionMode: 'stateless' })` in `src/index.ts` — no tool gates on `ctx.requestInput`, so every call completes in one round trip. An explicit `MCP_SESSION_MODE` still overrides it; `.env.example` and the `Dockerfile` set the same value. No service holds a watcher, socket, or ref'd timer, so there is no `teardown` hook.
 
@@ -72,7 +74,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 ## Core Rules
 
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
-- **Use `ctx.log`** for request-scoped logging. No `console` calls.
+- **Use `ctx.log`** for request-scoped logging — it also reaches the client as `notifications/message`. Per-response upstream cost goes through the module `logger` with `withExtra(ctx, …)`, the process log only. No `console` calls.
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Secrets in env vars only** — never hardcoded.
@@ -153,7 +155,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 | Property | Description |
 |:---------|:------------|
-| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
+| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. Operator-only records (`OpenAlex response metrics`) use the module `logger` with `withExtra(ctx, …)` instead. |
 | `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). |
 | `ctx.requestInput` | Suspend and ask the caller for more input with `return ctx.requestInput(...)`; the handler is re-entered with answers. |
 | `ctx.inputs` | The request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped` — limited to what the client declared (`elicitation` and its form/url modes, `sampling`, `roots`). Client-supplied: a consent gate trusts only a `ctx.state` record it stored when it asked, bound to the operation, caller, and target (see the `api-context` skill). |
@@ -194,7 +196,9 @@ async handler(input, ctx) {
 
 Native-filter parser failures raised during schema preprocessing carry explicit recovery guidance: the handler boundary has not run yet, so handler-contract hint filling cannot supply it.
 
-The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Three service throws set their own `recovery: { hint }`, which wins over the fill: the PMCID 404, since the generic "verify the ID" recovery would send the caller back to retry an identifier OpenAlex never indexes; `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone); and `upstream_unavailable` on a semantic search — including the HTTP 400 `Failed to embed query:` and `Semantic search is not configured` bodies, relabelled from caller errors to that outage — whose hint adds the keyword-search fallback the generic outage recovery cannot name. One status is read past its code: an HTTP 429 whose body `error` is `Plan upgrade required` — a filter OpenAlex serves only on a paid plan — is thrown as `Forbidden` with `upstream_plan_required` and `retryable: false` under a message of the server's own, so it fails on its first request — no wait clears a plan gate. Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_page_without_seed`, `sample_page_too_deep`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, `slice_field_not_array`, and `response_too_large` on `openalex_search_entities`; `reserved_filter_key`, the seed-lookup `entity_not_found`, and `response_too_large` on `openalex_get_citation_graph`; `filters_without_entity_type` on `openalex_resolve_name`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
+The OpenAlex service throws factory errors (`notFound`, `rateLimited`, etc.) based on upstream status codes, carrying the contract `reason` on `data.reason` and nothing else of the contract; the framework fills the calling tool's `recovery` for that reason at the handler boundary, and the errors bubble through and are auto-classified. Three service throws set their own `recovery: { hint }`, which wins over the fill: `upstream_budget_exhausted` on a server with no `OPENALEX_API_KEY`, whose hint adds the free-key advice to the contract's key-neutral midnight-UTC recovery (a keyed server's budget is already the larger one, so it gets the contract text alone); `upstream_unavailable` on a semantic search — including the HTTP 400 `Failed to embed query:` and `Semantic search is not configured` bodies, relabelled from caller errors to that outage — whose hint adds the keyword-search fallback the generic outage recovery cannot name; and `entity_not_found` for an arXiv ID whose landing-page lookup found several works (`data.candidates`) or was refused or failed upstream (`data.fallbackFailedReason`), whose hint names the retry that fits. One status is read past its code: an HTTP 429 whose body `error` is `Plan upgrade required` — a filter OpenAlex serves only on a paid plan — is thrown as `Forbidden` with `upstream_plan_required` and `retryable: false` under a message of the server's own, so it fails on its first request — no wait clears a plan gate. Every service-thrown entry carries `thrownBy: 'service'` — lint-only metadata that tells `error-contract-unthrown`, whose scan reads the handler body alone, to skip a reason produced a layer below it. Handler-local precondition throws stay inline and unmarked so the rule keeps checking them: `semantic_without_query`, `semantic_per_page_cap`, `semantic_with_cursor`, `page_without_semantic`, `sample_with_cursor`, `sample_page_without_seed`, `sample_page_too_deep`, `sample_with_semantic`, `sample_with_sort`, `seed_without_sample`, `slice_without_id`, `slice_field_not_array`, and `response_too_large` on `openalex_search_entities`; `reserved_filter_key`, the seed-lookup `entity_not_found`, and `response_too_large` on `openalex_get_citation_graph`; `filters_without_entity_type` on `openalex_resolve_name`. Recovery assertions belong on the contract path (`runToolContract`), where the fill applies — a direct `definition.handler(...)` or service throw carries only what the throw site wrote.
+
+The upstream error body `fetchWithTimeout` captures (`data.body` and `data.responseBody`, capped at 500 bytes) stays on the server: the service parses it and the failure log records it, but no client envelope carries it. OpenAlex's `error` and `message` fields reach the caller as `data.upstreamError` and `data.upstreamMessage`, and as the error message wherever the service does not write its own, so no call sets `exposeErrorBody`.
 
 **Fallback for ad-hoc throws:** error factories or plain `Error`.
 
@@ -215,12 +219,15 @@ See framework CLAUDE.md for the full auto-classification table and all available
 src/
   index.ts                              # createApp() entry point
   config/
+    env-file.ts                         # Loads ./.env before the definition modules read the server config (imported first by index.ts)
     server-config.ts                    # OpenAlex API access and input compatibility switches
   services/
     openalex/
       openalex-service.ts               # API client (init/accessor pattern)
       types.ts                          # Domain types
-      filter-values.ts                  # Native filter-string parsing and filter values: country/language codes, quoted phrases, `+` as AND
+      filter-values.ts                  # Native filter-string parsing and filter values: country/language codes, numeric ranges, quoted phrases, `+` as AND
+      groupable-fields.ts               # Filter fields OpenAlex accepts as group_by targets (describe-fields view, rejected-group_by suggestions)
+      arxiv-id.ts                       # arXiv ID grammar, its 10.48550 DOI and landing-page URLs, and the resolution notice
       iso-codes.json                    # ISO 3166-1 / 639-2 lookups (generated by scripts/generate-iso-codes.ts)
       provider-text.ts                  # Cleanup of provider text: entities, markup, MathType blobs
       html-entities.json                # WHATWG named-entity table provider-text.ts decodes against
@@ -235,6 +242,8 @@ src/
       render-budget.ts                  # The budget trailer line
       record-page.ts                    # Record pages: author-cap and slice windows, the 8,000,000-byte response_too_large ceiling
       page-size.ts                      # Count-input validation (per_page, sample, slice.limit) and disclosed clamping
+      filters-input.ts                  # The shared filters input: canonical record schema, native strings on search, record normalization and its notice
+      select-input.ts                   # The select input seam: field arrays or comma-joined strings, and the split/widening notices
     tools/definitions/
       search-entities.tool.ts           # openalex_search_entities
       analyze-trends.tool.ts            # openalex_analyze_trends
@@ -335,7 +344,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run lint:mcp` | Validate MCP tool/prompt definitions (rule catalog: `api-linter` skill) |
-| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity, `.mcpbignore` coverage, plugin manifests, README version badge (run by devcheck) |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity, `.mcpbignore` coverage, plugin manifests, README version badge, the published `skills/` tree (run by devcheck) |
 | `bun run list-skills` | List available skills |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
 | `bun run start:stdio` | Production mode (stdio, after `rebuild`) |

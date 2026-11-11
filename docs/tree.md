@@ -1,6 +1,6 @@
 # openalex-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 03:47:26
+Generated on: 2026-11-11 08:24:27
 
 ```text
 openalex-mcp-server/
@@ -153,6 +153,7 @@ openalex-mcp-server/
 │       └── SKILL.md
 ├── src/
 │   ├── config/
+│   │   ├── env-file.ts
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
@@ -167,16 +168,20 @@ openalex-mcp-server/
 │   │       │   ├── resolve-name.tool.ts
 │   │       │   └── search-entities.tool.ts
 │   │       ├── escape-markdown.ts
+│   │       ├── filters-input.ts
 │   │       ├── page-size.ts
 │   │       ├── record-page.ts
 │   │       ├── render-budget.ts
-│   │       └── render-entity-record.ts
+│   │       ├── render-entity-record.ts
+│   │       └── select-input.ts
 │   ├── services/
 │   │   └── openalex/
+│   │       ├── arxiv-id.ts
 │   │       ├── budget.ts
 │   │       ├── field-catalog.json
 │   │       ├── field-ranker.ts
 │   │       ├── filter-values.ts
+│   │       ├── groupable-fields.ts
 │   │       ├── html-entities.json
 │   │       ├── iso-codes.json
 │   │       ├── openalex-service.ts
@@ -186,6 +191,7 @@ openalex-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── config/
+│   │   ├── env-file.test.ts
 │   │   └── server-config.test.ts
 │   ├── helpers/
 │   │   ├── markdown.ts
@@ -203,13 +209,17 @@ openalex-mcp-server/
 │   │       │   ├── resolve-name.tool.test.ts
 │   │       │   └── search-entities.tool.test.ts
 │   │       ├── escape-markdown.test.ts
+│   │       ├── filters-input.test.ts
 │   │       ├── record-page.test.ts
 │   │       ├── render-budget.test.ts
-│   │       └── render-entity-record.test.ts
+│   │       ├── render-entity-record.test.ts
+│   │       └── select-input.test.ts
 │   └── services/
 │       └── openalex/
+│           ├── arxiv-id.test.ts
 │           ├── budget.test.ts
 │           ├── field-ranker.test.ts
+│           ├── groupable-fields.test.ts
 │           ├── openalex-service.test.ts
 │           ├── provider-text.test.ts
 │           ├── security.test.ts

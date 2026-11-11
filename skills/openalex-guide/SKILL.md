@@ -17,7 +17,7 @@ Not here: article full text (a work carries an abstract when OpenAlex has one, a
 
 | ID | Entity | Where it comes from |
 |:---|:-------|:--------------------|
-| `W…` | work | search results, the citation graph, `openalex_resolve_name` on a title, DOI, or PMID |
+| `W…` | work | search results, the citation graph, `openalex_resolve_name` on a title, DOI, PMID, PMCID, or arXiv ID (`id` on `openalex_search_entities` takes the identifiers directly) |
 | `A…` | author | `openalex_resolve_name` on a name or ORCID; a work's `author_list` or `authorships` |
 | `S…` | source | `openalex_resolve_name` on a name or ISSN; a work's `primary_location.source` |
 | `I…` | institution | `openalex_resolve_name` on a name or ROR; a work's `authorships` |
@@ -34,7 +34,7 @@ Not here: article full text (a work carries an abstract when OpenAlex has one, a
 
 Each pair returns a different population. Choose deliberately, and name the key in the answer.
 
-- **Topic or text.** `primary_topic.id` holds works whose main topic is T; `topics.id` holds works carrying T among any of their topics, a much larger set. `query` also matches full text where OpenAlex holds it, so it returns works that only mention a phrase; the `title_and_abstract.search` filter keeps to works about it.
+- **Topic or text.** `primary_topic.id` holds works whose main topic is T; `topics.id` holds works carrying T among any of their topics, a much larger set. `query` also matches full text where OpenAlex holds it, so it returns works that only mention a phrase; the `title_and_abstract.search` filter keeps to works about it. On works, a wildcard needs `search_mode: "exact"` or a `.search.exact` key.
 - **Institution or lineage.** `authorships.institutions.id` counts that exact institution; `authorships.institutions.lineage` adds its child institutions (affiliated hospitals, institutes). Rankings shift between the two.
 - **Venue.** `primary_location.source.id` is where a work was published. `locations.source.id` matches any copy, so a repository or preprint server counts every deposited version: arXiv holds more than twice as many works by `locations` as by `primary_location`.
 - **Funding.** On works, `funders.id` holds works that acknowledge a funder, and `awards.funder_id` the smaller set matched to one of its specific grants. The `awards` entity holds the grants themselves, with amounts, dates, and investigators. An agency and its sub-agencies are separate funders (NIH and each of its institutes has its own `F…` ID, and a work often lists both): OR the IDs when the question means the whole agency.
@@ -61,7 +61,7 @@ A seed reproduces a draw from the same filters, but OpenAlex updates its catalog
 ### Who leads a field, and how output moved
 
 1. Resolve the topic to `T…` (or take a field or subfield ID from its record for a broader cut).
-2. `openalex_analyze_trends` on works, `group_by` `authorships.institutions.id` (or `.lineage`), filtered by the topic and a `publication_year` range: the ranking.
+2. `openalex_analyze_trends` on works, `group_by` `authorships.institutions.id` (or `.lineage`), filtered by the topic and a `publication_year` range (`2020-2024`, or `2020..2024`): the ranking.
 3. For each leader, group by `publication_year` with the institution ID added to the same filters: its trend.
 
 ### Who cites a work, and where
