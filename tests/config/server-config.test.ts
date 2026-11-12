@@ -121,11 +121,15 @@ describe('OpenAlex environment configuration', () => {
     'treats unset host values (%s) as absent',
     async (value) => {
       vi.stubEnv('OPENALEX_API_KEY', value);
+      vi.stubEnv('OPENALEX_API_KEYS', value);
+      vi.stubEnv('OPENALEX_API_KEYS_FILE', value);
       vi.stubEnv('OPENALEX_MAILTO', value);
       vi.stubEnv('OPENALEX_BASE_URL', value);
       const { getServerConfig } = await import('@/config/server-config.js');
       expect(getServerConfig()).toEqual({
         apiKey: '',
+        apiKeys: '',
+        apiKeysFile: '',
         mailto: '',
         baseUrl: 'https://api.openalex.org',
         filterStringInput: true,
@@ -138,11 +142,15 @@ describe('OpenAlex environment configuration', () => {
 
   it('preserves supplied values, including embedded placeholder text', async () => {
     vi.stubEnv('OPENALEX_API_KEY', `key-\${suffix}`);
+    vi.stubEnv('OPENALEX_API_KEYS', 'key-b, key-c');
+    vi.stubEnv('OPENALEX_API_KEYS_FILE', 'C:/keys/openalex.txt');
     vi.stubEnv('OPENALEX_MAILTO', 'researcher@example.org');
     vi.stubEnv('OPENALEX_BASE_URL', 'https://example.org/api');
     const { getServerConfig } = await import('@/config/server-config.js');
     expect(getServerConfig()).toEqual({
       apiKey: `key-\${suffix}`,
+      apiKeys: 'key-b, key-c',
+      apiKeysFile: 'C:/keys/openalex.txt',
       mailto: 'researcher@example.org',
       baseUrl: 'https://example.org/api',
       filterStringInput: true,
