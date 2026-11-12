@@ -41,6 +41,7 @@ import fieldCatalog from './field-catalog.json' with { type: 'json' };
 import { rankFields } from './field-ranker.js';
 import { quoteCallerText, quotedCommaValue, upstreamFilterValue } from './filter-values.js';
 import { isGroupableField } from './groupable-fields.js';
+import { ApiKeyPool, collectApiKeys, type PooledKey } from './key-pool.js';
 import { normalizeProviderText, normalizeProviderValue } from './provider-text.js';
 import {
   type AnalyzeParams,
@@ -1751,13 +1752,14 @@ function arxivMissDetail(error: McpError): IdentifierResolution['arxivMiss'] {
 
 class OpenAlexService {
   private readonly baseUrl: string;
-  private readonly apiKey: string;
+  /** The configured API keys, used one at a time; empty for anonymous access. */
+  private readonly keys: ApiKeyPool;
   private readonly mailto: string;
 
   constructor() {
     const config = getServerConfig();
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
-    this.apiKey = config.apiKey;
+    this.keys = new ApiKeyPool(collectApiKeys(config));
     this.mailto = config.mailto;
   }
 
@@ -1765,12 +1767,65 @@ class OpenAlexService {
    * Execute an HTTP request against the OpenAlex API with retry on transient failures. With
    * `deadlineMs`, every attempt and backoff settles within that many milliseconds, after which
    * the request fails as `upstream_timeout`, the reason every tool's contract declares, in place
-   * of the retry ladder's own `retry_deadline_exceeded`.
+   * of the retry ladder's own `retry_deadline_exceeded`. With several API keys, a request whose
+   * key has spent its daily budget, or that OpenAlex refuses, goes out again with the next key
+   * within the same deadline; the caller sees the failure of the last key tried.
    */
-  private request(
+  private async request(
     path: string,
     params: Record<string, string>,
     ctx: Context,
+    deadlineMs?: number,
+  ): Promise<unknown> {
+    const startedAt = Date.now();
+    let lastError: unknown;
+    // At most one attempt per key: every failed attempt that moves on sets its key aside.
+    for (let attempt = 0; attempt < Math.max(1, this.keys.size); attempt++) {
+      const pooled = this.keys.current();
+      const remainingMs =
+        deadlineMs === undefined ? undefined : deadlineMs - (Date.now() - startedAt);
+      try {
+        return await this.requestWithKey(path, params, ctx, pooled?.key, remainingMs);
+      } catch (error) {
+        const reason = this.setKeyAside(error, pooled);
+        const outOfTime = deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs;
+        if (reason === undefined || outOfTime) throw error;
+        lastError = error;
+        ctx.log.info('OpenAlex API key set aside; sending the request again with the next key', {
+          path,
+          keyPosition: pooled?.position,
+          reason,
+          keysUsable: this.keys.usable(),
+        });
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Set the request's key aside when the error says its daily budget is spent or OpenAlex refused
+   * it, and return that reason; undefined when the error has another cause or no other key is
+   * usable, so the error stands. A single key is never set aside, which keeps its behaviour as it
+   * was before the pool.
+   */
+  private setKeyAside(error: unknown, pooled: PooledKey | undefined): string | undefined {
+    if (pooled === undefined || this.keys.size < 2 || !(error instanceof McpError)) return;
+    const reason = error.data?.reason;
+    if (reason === BUDGET_EXHAUSTED_REASON) {
+      return this.keys.setAsideUntilReset(pooled.key) ? reason : undefined;
+    }
+    if (reason === 'upstream_unauthorized') {
+      return this.keys.setAsideForGood(pooled.key) ? reason : undefined;
+    }
+    return;
+  }
+
+  /** One request with one API key (none for anonymous access), retried on transient failures. */
+  private requestWithKey(
+    path: string,
+    params: Record<string, string>,
+    ctx: Context,
+    apiKey: string | undefined,
     deadlineMs?: number,
   ): Promise<unknown> {
     const operation = `OpenAlex ${path}`;
@@ -1779,7 +1834,7 @@ class OpenAlexService {
     // `api_key=`. `mailto=` is now only a courtesy identifier (no budget/rate effect), sent
     // independently when OPENALEX_MAILTO is set. Both are stripped from any URL that surfaces
     // in an error by the url-redaction allowlist (neither is a caller-controlled param).
-    if (this.apiKey) url.searchParams.set('api_key', this.apiKey);
+    if (apiKey) url.searchParams.set('api_key', apiKey);
     if (this.mailto) url.searchParams.set('mailto', this.mailto);
     for (const [key, value] of Object.entries(params)) {
       if (value) url.searchParams.set(key, value);
@@ -1956,7 +2011,7 @@ class OpenAlexService {
       ...(reason === BUDGET_EXHAUSTED_REASON ? { retryable: false } : {}),
       // Only a keyless server can raise its budget with a key; an explicit hint wins over the
       // key-neutral one the framework fills from the contract.
-      ...(reason === BUDGET_EXHAUSTED_REASON && !this.apiKey
+      ...(reason === BUDGET_EXHAUSTED_REASON && this.keys.size === 0
         ? { recovery: { hint: BUDGET_EXHAUSTED_KEYLESS_HINT } }
         : {}),
       // A keyword search can answer while semantic search is down, which the contract's generic

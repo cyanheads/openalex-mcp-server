@@ -78,6 +78,8 @@ async function spyMetricsRecords() {
 
 const mockConfig = vi.hoisted(() => ({
   apiKey: 'test-key',
+  apiKeys: '',
+  apiKeysFile: '',
   baseUrl: 'https://api.openalex.org',
   mailto: '',
 }));
@@ -154,6 +156,8 @@ describe('OpenAlexService', () => {
 
   afterEach(() => {
     mockConfig.apiKey = 'test-key';
+    mockConfig.apiKeys = '';
+    mockConfig.apiKeysFile = '';
     mockConfig.mailto = '';
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -6611,6 +6615,156 @@ describe('OpenAlexService', () => {
 
       expect(getEnrichment(first).budget).toMatchObject({ costUsd: 0.001 });
       expect(getEnrichment(second).budget).toMatchObject({ costUsd: 0.001 });
+    });
+  });
+
+  // --- Several API keys: a spent or refused key hands the request to the next one ---
+
+  describe('several API keys', () => {
+    const spentBody = {
+      error: 'Rate limit exceeded',
+      message: 'Insufficient budget. Resets at midnight UTC.',
+    };
+    const work = () => jsonResponse({ id: 'https://openalex.org/W1', display_name: 'One' });
+
+    /** Answer each request by its `api_key`; a key the case did not list rejects. */
+    function answerByKey(answers: Record<string, () => Response>): void {
+      vi.mocked(globalThis.fetch).mockImplementation((input) => {
+        const key = new URL(String(input)).searchParams.get('api_key') ?? '';
+        const answer = answers[key];
+        return answer
+          ? Promise.resolve(answer())
+          : Promise.reject(new Error(`unexpected key: ${key}`));
+      });
+    }
+
+    /** The `api_key` of every request sent, in order. */
+    function keysSent(): (string | null)[] {
+      return vi
+        .mocked(globalThis.fetch)
+        .mock.calls.map(([input]) => new URL(String(input)).searchParams.get('api_key'));
+    }
+
+    /**
+     * One work lookup. The service is created at the first lookup of a case, after the case has
+     * set the keys, and reused by its later lookups, as the server keeps one service for its life.
+     */
+    let lookUp: (() => Promise<unknown>) | undefined;
+    beforeEach(() => {
+      lookUp = undefined;
+    });
+    async function lookUpWork(): Promise<unknown> {
+      if (lookUp === undefined) {
+        const service = await getService();
+        lookUp = () =>
+          service.search({ entityType: 'works', id: 'W1', select: ['id'] }, createMockContext());
+      }
+      return lookUp();
+    }
+
+    it('sends the request again with the next key when the first has spent its budget', async () => {
+      mockConfig.apiKey = 'key-a';
+      mockConfig.apiKeys = 'key-b, key-c';
+      answerByKey({ 'key-a': () => jsonResponse(spentBody, 429), 'key-b': work });
+
+      await expect(lookUpWork()).resolves.toBeDefined();
+      await expect(lookUpWork()).resolves.toBeDefined();
+
+      // The spent key is tried once, then skipped by the later request.
+      expect(keysSent()).toEqual(['key-a', 'key-b', 'key-b']);
+    });
+
+    it('sets aside a key OpenAlex refuses', async () => {
+      mockConfig.apiKey = 'key-a';
+      mockConfig.apiKeys = 'key-b';
+      answerByKey({
+        'key-a': () => jsonResponse({ error: 'Unauthorized' }, 401),
+        'key-b': work,
+      });
+
+      await expect(lookUpWork()).resolves.toBeDefined();
+      await expect(lookUpWork()).resolves.toBeDefined();
+
+      expect(keysSent()).toEqual(['key-a', 'key-b', 'key-b']);
+    });
+
+    it('fails with the budget error once every key has spent its budget', async () => {
+      mockConfig.apiKey = 'key-a';
+      mockConfig.apiKeys = 'key-b';
+      answerByKey({
+        'key-a': () => jsonResponse(spentBody, 429),
+        'key-b': () => jsonResponse(spentBody, 429),
+      });
+
+      await expect(lookUpWork()).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        data: { reason: 'upstream_budget_exhausted', retryable: false },
+      });
+      expect(keysSent()).toEqual(['key-a', 'key-b']);
+    });
+
+    it('does not move on for an error that has nothing to do with the key', async () => {
+      mockConfig.apiKey = 'key-a';
+      mockConfig.apiKeys = 'key-b';
+      answerByKey({ 'key-a': html404, 'key-b': work });
+
+      await expect(lookUpWork()).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound });
+      expect(keysSent()).toEqual(['key-a']);
+    });
+
+    it('goes back to the first key after the midnight-UTC refill', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-10T23:00:00Z'));
+      mockConfig.apiKey = 'key-a';
+      mockConfig.apiKeys = 'key-b';
+      let firstKeySpent = true;
+      answerByKey({
+        'key-a': () => (firstKeySpent ? jsonResponse(spentBody, 429) : work()),
+        'key-b': work,
+      });
+      const service = await getService();
+      const lookUp = () =>
+        service.search({ entityType: 'works', id: 'W1', select: ['id'] }, createMockContext());
+
+      await lookUp();
+      vi.setSystemTime(new Date('2026-11-11T00:00:01Z'));
+      firstKeySpent = false;
+      await lookUp();
+
+      expect(keysSent()).toEqual(['key-a', 'key-b', 'key-a']);
+    });
+
+    it('reads further keys from OPENALEX_API_KEYS_FILE', async () => {
+      const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const dir = mkdtempSync(join(tmpdir(), 'openalex-keys-'));
+      try {
+        const file = join(dir, 'keys.txt');
+        writeFileSync(file, '# OpenAlex keys, one per line\nkey-f1\nkey-f2 # second account\n');
+        mockConfig.apiKey = '';
+        mockConfig.apiKeysFile = file;
+        answerByKey({ 'key-f1': () => jsonResponse(spentBody, 429), 'key-f2': work });
+
+        await expect(lookUpWork()).resolves.toBeDefined();
+
+        expect(keysSent()).toEqual(['key-f1', 'key-f2']);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps the anonymous-budget hint for a server with no key at all', async () => {
+      mockConfig.apiKey = '';
+      vi.mocked(globalThis.fetch).mockResolvedValue(jsonResponse(spentBody, 429));
+
+      await expect(lookUpWork()).rejects.toMatchObject({
+        data: {
+          reason: 'upstream_budget_exhausted',
+          recovery: { hint: expect.stringContaining('OPENALEX_API_KEY') },
+        },
+      });
+      expect(keysSent()).toEqual([null]);
     });
   });
 

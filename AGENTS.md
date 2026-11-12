@@ -41,6 +41,8 @@ No hand-written resources — entity lookups need `select` for payload control, 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
 | `OPENALEX_API_KEY` | No | OpenAlex account API key, sent as `api_key=` (free from https://openalex.org/settings/api); omit for anonymous access |
+| `OPENALEX_API_KEYS` | No | Further keys (comma-, semicolon- or blank-separated), used in order after `OPENALEX_API_KEY`; a spent key (429 budget) waits for the midnight-UTC refill, a refused key (401) is set aside until restart (`src/services/openalex/key-pool.ts`) |
+| `OPENALEX_API_KEYS_FILE` | No | Text file of further keys, one per line (`#` starts a comment), used after the two variables above; an unreadable file stops the server at startup |
 | `OPENALEX_MAILTO` | No | Email sent as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key |
 | `OPENALEX_BASE_URL` | No | Default: `https://api.openalex.org` |
 | `OPENALEX_FILTER_STRING_INPUT` | No | Default: `true`; accept unambiguous native filter strings on `openalex_search_entities`; `false` restores record-only input. Strict boolean parsing rejects invalid values. |

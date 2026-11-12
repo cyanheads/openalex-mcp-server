@@ -213,6 +213,8 @@ An optional `OPENALEX_API_KEY` — a free [OpenAlex account key](https://openale
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend. | `in-memory` |
 | `OPENALEX_API_KEY` | OpenAlex account API key, sent upstream as `api_key=` (free from [openalex.org/settings/api](https://openalex.org/settings/api)). Without it, anonymous rate limits apply. | — |
+| `OPENALEX_API_KEYS` | Further API keys, separated by commas, semicolons or blanks, used in order after `OPENALEX_API_KEY`. A request whose key has spent its daily budget goes out again with the next key, and the spent key waits for the midnight-UTC refill; a key OpenAlex refuses (HTTP 401) is set aside until the server restarts. Each day starts again from the first key. | — |
+| `OPENALEX_API_KEYS_FILE` | Path to a text file of further API keys, one per line (`#` starts a comment), used after `OPENALEX_API_KEY` and `OPENALEX_API_KEYS`. A file that cannot be read stops the server at startup. | — |
 | `OPENALEX_MAILTO` | Email sent upstream as `mailto=` to identify yourself to OpenAlex (the "polite pool"); a courtesy identifier, separate from the API key. | — |
 | `OPENALEX_BASE_URL` | OpenAlex API base URL. | `https://api.openalex.org` |
 | `OPENALEX_FILTER_STRING_INPUT` | Accept unambiguous native filter strings on `openalex_search_entities`. Set `false` to require record objects; invalid boolean values fail startup. | `true` |
