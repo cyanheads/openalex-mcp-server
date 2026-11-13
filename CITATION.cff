@@ -9,6 +9,7 @@ authors:
     orcid: "https://orcid.org/0009-0009-3726-568X"
 repository-code: "https://github.com/cyanheads/openalex-mcp-server"
 license: Apache-2.0
+doi: 10.5281/zenodo.20355454
 keywords:
   - mcp
   - model-context-protocol
