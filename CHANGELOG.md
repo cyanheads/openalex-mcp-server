@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.11.2](changelog/0.11.x/0.11.2.md) — 2026-11-17
 
-Fixes openalex_resolve_name sending filter keys untranslated (year, cited_works, id), stops rewriting a keywords id filter to openalex, and refuses a negative number at the top level of a filters record instead of sending it as an open range.
+Fixes openalex_resolve_name sending filter keys untranslated (year, cited_works, id), stops rewriting a keywords id filter to openalex, and refuses a negative whole number at the top level of a filters record instead of sending it as an open range.
 
 ## [0.11.1](changelog/0.11.x/0.11.1.md) — 2026-11-11
 
