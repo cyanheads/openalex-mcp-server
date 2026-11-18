@@ -104,24 +104,26 @@ type ValueReading =
   | { kind: 'canonical' }
   | { kind: 'rejected'; why: string };
 
+/** Why a negative number is refused: `-` is OpenAlex's range separator. */
+const NEGATIVE_WHY =
+  'is negative, which OpenAlex reads as a range: "-5" means at most 5. Send a comparison or range as a string, such as "<=5" or "0..5".';
+
 function readValue(value: unknown, nested: boolean): ValueReading {
   if (typeof value === 'string') return { kind: 'text', text: value, repair: undefined };
   if (typeof value === 'boolean') return { kind: 'text', text: String(value), repair: 'boolean' };
   if (typeof value === 'number') {
     /**
-     * A top-level safe integer goes out as its decimal text, undisclosed, as the framework's own
-     * argument repair sends it. Read here, it also covers a JSON-stringified record: the framework
-     * unwraps the string and re-parses once, so its integers never reach that repair.
+     * A non-negative top-level safe integer goes out as its decimal text, undisclosed, as the
+     * framework's own argument repair sends it; `-0` is zero and goes out as `0`. Read here, it
+     * also covers a JSON-stringified record: the framework unwraps the string and re-parses once,
+     * so its integers never reach that repair. A negative one is refused below.
      */
-    if (!nested && Number.isSafeInteger(value)) {
+    if (!nested && Number.isSafeInteger(value) && value >= 0) {
       return { kind: 'text', text: String(value), repair: undefined };
     }
     const text = String(value);
     if (value < 0 || Object.is(value, -0)) {
-      return {
-        kind: 'rejected',
-        why: 'is negative, which OpenAlex reads as a range: "-5" means at most 5. Send a comparison or range as a string, such as "<=5" or "0..5".',
-      };
+      return { kind: 'rejected', why: NEGATIVE_WHY };
     }
     if (text.includes('e')) {
       return {
@@ -163,7 +165,7 @@ function readValue(value: unknown, nested: boolean): ValueReading {
  * becomes `"true"`/`"false"`; a non-negative number whose `String(n)` has no exponent becomes that
  * text; a nested object whose leaves all convert contributes dotted keys at every depth
  * (`authorships.author.id`); and a key wrapped in one matching pair of quotes becomes the key
- * inside it, at any depth. A top-level safe integer, negative included, becomes its decimal text
+ * inside it, at any depth. A top-level safe integer that is not negative becomes its decimal text
  * and is not disclosed, exactly as the framework's own argument repair would send it.
  *
  * Everything else is an issue at the caller's path, so the call fails before any request: a
@@ -303,6 +305,11 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * parsed as OpenAlex's native `key:value` syntax first (`OPENALEX_FILTER_STRING_INPUT`); a
  * JSON-stringified object is left to the framework's own repair. Issues name the caller's paths,
  * never the wrapper's.
+ *
+ * Under OPENALEX_FILTER_RECORD_REPAIR=false the record is validated as it is, except that a
+ * top-level negative safe integer is refused as negative by a `custom` issue: the framework's
+ * integer repair, which rewrites a type refusal and never a `custom` one, would otherwise send it
+ * as its decimal text, which OpenAlex reads as an open range.
  */
 export function filtersInput(options: { nativeString: boolean }) {
   return z
@@ -329,7 +336,20 @@ export function filtersInput(options: { nativeString: boolean }) {
         }
         const parsed = canonicalFilters.safeParse(filters);
         if (!parsed.success) {
-          for (const issue of parsed.error.issues) ctx.addIssue({ ...issue });
+          for (const issue of parsed.error.issues) {
+            const [key] = issue.path;
+            const value = isRecord(filters) && typeof key === 'string' ? filters[key] : undefined;
+            ctx.addIssue(
+              typeof value === 'number' && Number.isSafeInteger(value) && value < 0
+                ? {
+                    code: 'custom',
+                    path: issue.path,
+                    input: value,
+                    message: `Filter value ${NEGATIVE_WHY}`,
+                  }
+                : { ...issue },
+            );
+          }
           return z.NEVER;
         }
         return { value: parsed.data, fromNativeString, repairs: [] };

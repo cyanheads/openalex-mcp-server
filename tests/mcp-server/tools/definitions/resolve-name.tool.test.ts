@@ -1547,6 +1547,18 @@ describe('resolveNameTool', () => {
       expect(text).toContain(notice);
     });
 
+    it('translates filter keys on the fallback name search (gh #144)', async () => {
+      const { requests } = await useRealService();
+
+      const { ids } = await call({ query: 'P53', entity_type: 'works', filters: { year: '2017' } });
+
+      expect(ids).toEqual(['https://openalex.org/W1990130549']);
+      expect(requests()).toEqual([
+        '/publishers/P53',
+        '/autocomplete/works?q=P53&filter=publication_year%3A2017',
+      ]);
+    });
+
     it('runs no name search when filters come without entity_type, and says how to run one', async () => {
       const { requests } = await useRealService();
 
@@ -1913,6 +1925,49 @@ describe('resolveNameTool', () => {
           code: JsonRpcErrorCode.ValidationError,
           thrownBy: 'service',
         });
+      });
+    });
+
+    /**
+     * Filter keys go out as openalex_search_entities sends them. The translation table lives in
+     * the service suite; these prove the name search reaches it. (gh #144)
+     */
+    describe('filter keys (gh #144)', () => {
+      it.each([
+        [
+          'works',
+          { year: '>=2020', cited_works: 'W1', id: 'W2626778328' },
+          'publication_year%3A2020-%2Ccites%3AW1%2Copenalex%3AW2626778328',
+        ],
+        ['institutions', { year: '2017', cited_works: 'W1' }, 'year%3A2017%2Ccited_works%3AW1'],
+        ['keywords', { id: 'K1' }, 'id%3AK1'],
+      ] as const)('sends %s filters %j as filter=%s', async (entityType, filters, sent) => {
+        const { requests } = await routeToRealService((url) =>
+          url.pathname === `/autocomplete/${entityType}`
+            ? jsonResponse({ results: [] })
+            : undefined,
+        );
+
+        const result = await runToolContract(resolveNameTool, {
+          entity_type: entityType,
+          query: 'attention',
+          filters,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(requests()).toEqual([`/autocomplete/${entityType}?q=attention&filter=${sent}`]);
+      });
+
+      it('echoes the caller keys, not the sent ones, in the no-match notice', async () => {
+        const { result, sentFilter } = await run({ year: '2017' });
+
+        expect(result.isError).toBeFalsy();
+        expect(sentFilter()).toBe('filter=publication_year%3A2017');
+        const { notice } = result.structuredContent as { notice: string };
+        expect(notice).toBe(
+          'No matches for "groundwater recharge" among works with filters={"year":"2017"}. Loosen or drop filters first — they may exclude the match — then try a shorter name or alternate spelling.',
+        );
+        expect(textOf(result)).toContain(notice);
       });
     });
   });

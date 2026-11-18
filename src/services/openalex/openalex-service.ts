@@ -122,8 +122,6 @@ type FilterClause = [key: string, value: string];
  * OpenAlex's hyphen ranges, and a range it cannot read (a negative bound, a reversed range, a
  * negated comparison or open range) throws `invalid_range_in_filter_value`. Every throw runs
  * before any request.
- * `autocomplete()` sends its filters without `translateFilters()`, so the conversion lives here
- * rather than there.
  *
  * Exported for the timing suite, which runs it on caller-sized keys and values.
  */
@@ -1045,9 +1043,10 @@ function filterSegmentId(segment: string): string {
  * Detect a value the `id:` filter would carry — OpenAlex IDs, bare or in any URL spelling
  * `parseOpenAlexUrl()` reads, optionally pipe-joined for OR semantics. When matched, `id` is
  * rewritten to `openalex` (the canonical filter key) and the value is forwarded as written:
- * upstream accepts every one of those spellings, and the space around a `|`. Awards are the
- * exception (see `awardIdFilterValue`). Stricter than any value so a future generic upstream
- * `id:` filter wouldn't be shadowed — only values that read as OpenAlex IDs get redirected.
+ * upstream accepts every one of those spellings, and the space around a `|`. Awards and keywords
+ * are the exceptions (see `translateFilters`). Stricter than any value so a future generic
+ * upstream `id:` filter wouldn't be shadowed — only values that read as OpenAlex IDs get
+ * redirected.
  * Exported for the timing suite, which runs it on caller-sized values.
  */
 export function isOpenAlexFilterValue(value: string): boolean {
@@ -1086,8 +1085,9 @@ export function translateFilterKey(entityType: SearchParams['entityType'], key: 
 
 /**
  * Rewrite caller-supplied filter keys to the upstream OpenAlex names. Works-only key map plus
- * an `id` → `openalex` rewrite when the value looks like an OpenAlex ID, on every type but
- * awards, whose ID values stay under `id` in the URL form it matches (`awardIdFilterValue`).
+ * an `id` → `openalex` rewrite when the value looks like an OpenAlex ID, on every type but two
+ * that have no `openalex` filter: awards, whose ID values stay under `id` in the URL form it
+ * matches (`awardIdFilterValue`), and keywords, whose `id` filter takes the value as written.
  * Every other value passes through unchanged.
  *
  * Emits clauses rather than a record because an alias and its canonical name are two separate
@@ -1105,7 +1105,8 @@ function translateFilters(
   for (const [rawKey, rawValue] of Object.entries(filters)) {
     const aliased = translateFilterKey(entityType, rawKey);
     const openAlexIds = aliased === 'id' && isOpenAlexFilterValue(rawValue);
-    const finalKey = openAlexIds && entityType !== 'awards' ? 'openalex' : aliased;
+    const finalKey =
+      openAlexIds && entityType !== 'awards' && entityType !== 'keywords' ? 'openalex' : aliased;
     const value = openAlexIds && entityType === 'awards' ? awardIdFilterValue(rawValue) : rawValue;
     if (out.some(([key, existing]) => key === finalKey && existing === value)) continue;
     out.push([finalKey, value]);
@@ -1114,10 +1115,11 @@ function translateFilters(
 }
 
 /**
- * The `filter` parameter a search or group_by over `filters` sends: keys translated, then each
- * clause built by `buildFilterString()`, whose pre-flight throws (`comma_in_filter_value`,
- * `invalid_country_code`, `invalid_range_in_filter_value`, `mixed_and_or_in_filter_value`,
- * `quote_in_filter_value`, `unmatched_quote_in_filter_value`) it shares.
+ * The `filter` parameter a search, group_by, or name search over `filters` sends: keys
+ * translated, then each clause built by `buildFilterString()`, whose pre-flight throws
+ * (`comma_in_filter_value`, `invalid_country_code`, `invalid_range_in_filter_value`,
+ * `mixed_and_or_in_filter_value`, `quote_in_filter_value`, `unmatched_quote_in_filter_value`) it
+ * shares.
  * Exported so a tool that spends a request before its search — the citation graph's seed lookup —
  * can run those checks first and fail without one.
  */
@@ -2489,8 +2491,9 @@ class OpenAlexService {
       q: params.query,
     };
 
-    if (hasEntries(params.filters)) {
-      queryParams.filter = buildFilterString(Object.entries(params.filters));
+    // Filters come only with an entity type (`AutocompleteParams`), translated as a search's are.
+    if (params.entityType && hasEntries(params.filters)) {
+      queryParams.filter = buildSearchFilter(params.entityType, params.filters);
     }
 
     const data = (await this.request(path, queryParams, ctx, deadlineMs)) as {

@@ -19,6 +19,7 @@ import {
 import {
   AUTOCOMPLETE_ENTITY_TYPES,
   type AutocompleteEntityType,
+  type AutocompleteParams,
   type EntityType,
 } from '@/services/openalex/types.js';
 
@@ -342,7 +343,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     filters: filtersInput({ nativeString: false })
       .optional()
       .describe(
-        'Narrow autocomplete results with a filter record object, using the openalex_search_entities value syntax; native string input is unavailable here. On numeric fields, `>=N`, `<=N`, `a..b`, `a..`, and `..b` are inclusive ranges, sent as OpenAlex\'s hyphen ranges (`N-`, `-N`, `a-b`); a negative bound, a reversed range, or a `!` before a comparison or an open range is rejected. Boolean values, non-negative numbers, nested objects (`{"authorships":{"author":{"id":"A1"}}}` reads as `authorships.author.id`), and a key wrapped in quotes are read as string values under dotted keys and disclosed in `notice`, except that a whole number at the top level is sent as its decimal text without a notice. null, arrays, empty objects, negative or exponent numbers, and two keys naming one field are rejected. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
+        'Narrow autocomplete results with a filter record object, using the openalex_search_entities filter keys and value syntax (`year` and `cited_works` read as `publication_year` and `cites` on works); native string input is unavailable here. On numeric fields, `>=N`, `<=N`, `a..b`, `a..`, and `..b` are inclusive ranges, sent as OpenAlex\'s hyphen ranges (`N-`, `-N`, `a-b`); a negative bound, a reversed range, or a `!` before a comparison or an open range is rejected. Boolean values, non-negative numbers, nested objects (`{"authorships":{"author":{"id":"A1"}}}` reads as `authorships.author.id`), and a key wrapped in quotes are read as string values under dotted keys and disclosed in `notice`, except that a non-negative whole number at the top level is sent as its decimal text without a notice. null, arrays, empty objects, negative or exponent numbers, and two keys naming one field are rejected. Example: restrict to a specific country or publication year range. Country fields take ISO 3166-1 alpha-2 codes ({"country_code": "DE"} on institutions) and `language` takes ISO 639-1 codes ("en"); alpha-3, numeric, ISO 639-2, and English-name forms are converted — a multi-word name is one value, so "South Korea|Japan" ORs two countries — and a value that cannot be a country code is rejected. A multi-word value on a field matched as whole text (display_name, geo.city, geo.region, awards.funder_display_name) matches as one phrase ({"geo.city": "New York"} on institutions; a comma, as in "University of California, Berkeley", is part of it, and it cannot contain a double quote of its own), "!" and "|" included, but cannot be ANDed with "+" in the same field. A value sent unquoted must have paired double quotes; balanced search phrases remain valid. A value mixing "|" with an AND operator — a "+", or a space on a field where words mean AND — is rejected, since OpenAlex drops every "|" alternative that ANDs more than one value; put the AND in a second key instead. Requires entity_type — filter fields belong to one entity type, so a name search across every type takes none, and a name query passing filters without entity_type is rejected. Applies to name queries only — an identifier lookup returns the records it addresses regardless.',
       ),
   }),
   output: z.object({
@@ -442,11 +443,14 @@ export const resolveNameTool = tool('openalex_resolve_name', {
     // Autocomplete only ever matched identifiers by accident — it indexes the external-ID URL,
     // so the bare forms and several native OpenAlex IDs miss.
     const identifier = inferIdentifier(input.query, input.entity_type);
-    const nameSearch = {
-      entityType: input.entity_type,
-      query: input.query,
-      filters: input.filters,
-    };
+    // Filter fields belong to one entity type, so a name search takes filters only with
+    // entity_type: filters without one leave no name search to run.
+    const nameSearch: AutocompleteParams | undefined =
+      input.entity_type !== undefined
+        ? { entityType: input.entity_type, query: input.query, filters: input.filters }
+        : hasFilters(input)
+          ? undefined
+          : { entityType: input.entity_type, query: input.query };
     const query = noticeText(input.query);
 
     // Awards have no autocomplete, and an award record carries none of the activity stats a
@@ -468,7 +472,7 @@ export const resolveNameTool = tool('openalex_resolve_name', {
 
     if (!identifier || awardId !== undefined) {
       // Cross-entity autocomplete rejects `filter` outright, so this pair can only fail upstream.
-      if (hasFilters(input) && !input.entity_type) {
+      if (!nameSearch) {
         throw ctx.fail(
           'filters_without_entity_type',
           '`filters` applies to a name search only with entity_type — filter fields belong to one entity type, and a search across every type takes none.',
@@ -497,13 +501,11 @@ export const resolveNameTool = tool('openalex_resolve_name', {
 
     // A bare OpenAlex ID shape is also a short name's, so one that resolves nothing is searched
     // as a name next — unless filters came without entity_type, which no name search takes.
-    const canSearchByName =
-      identifier.mayBeName === true && (input.entity_type !== undefined || !hasFilters(input));
     const { arxiv, arxivMiss, results, failedEntityTypes, nameFallback } =
       await service.resolveIdentifier(
         identifier,
         ctx,
-        canSearchByName ? nameSearch : undefined,
+        identifier.mayBeName === true ? nameSearch : undefined,
         input.query,
       );
     ctx.log.info('Name resolved', {

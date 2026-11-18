@@ -193,11 +193,17 @@ export interface AnalyzeResult {
   };
 }
 
-export interface AutocompleteParams {
-  entityType?: AutocompleteEntityType | undefined;
-  filters?: Record<string, string> | undefined;
-  query: string;
-}
+/**
+ * A name search. Filter fields belong to one entity type, so `filters` comes only with
+ * `entityType`: a search across every type takes none.
+ */
+export type AutocompleteParams =
+  | { entityType?: undefined; filters?: undefined; query: string }
+  | {
+      entityType: AutocompleteEntityType;
+      filters?: Record<string, string> | undefined;
+      query: string;
+    };
 
 export interface AutocompleteResult {
   results: AutocompleteRecord[];

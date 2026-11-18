@@ -67,6 +67,10 @@ function issuesOf(result: z.ZodSafeParseResult<unknown>) {
   return (result.error?.issues ?? []).map(({ path, message }) => ({ path, message }));
 }
 
+/** The refusal a negative number gets: `-` is OpenAlex's range separator. (gh #142) */
+const NEGATIVE_MESSAGE =
+  'Filter value is negative, which OpenAlex reads as a range: "-5" means at most 5. Send a comparison or range as a string, such as "<=5" or "0..5".';
+
 describe('filtersInput normalization (gh #136)', () => {
   it.each([
     [{ is_oa: true }, { is_oa: 'true' }, [['boolean', 'is_oa']]],
@@ -121,6 +125,7 @@ describe('filtersInput normalization (gh #136)', () => {
     [{ "'is_oa": true }, { "'is_oa": 'true' }, [['boolean', "'is_oa"]]],
     [{ '\'is_oa"': 'true' }, { '\'is_oa"': 'true' }, []],
     [{ "''is_oa''": 'true' }, { "'is_oa'": 'true' }, [['quoted_key', "'is_oa'"]]],
+    [{ amount_usd: '-5', cited_by_count: '<=5' }, { amount_usd: '-5', cited_by_count: '<=5' }, []],
     [
       { type: 'article', 'title.search': 'graph' },
       { type: 'article', 'title.search': 'graph' },
@@ -172,6 +177,10 @@ describe('filtersInput normalization (gh #136)', () => {
   it.each([
     [{ summary_stats: { h_index: -5 } }, ['summary_stats', 'h_index'], 'is negative'],
     [{ summary_stats: { h_index: -0 } }, ['summary_stats', 'h_index'], 'is negative'],
+    [{ amount_usd: -5 }, ['amount_usd'], 'is negative'],
+    [{ type: -1 }, ['type'], 'is negative'],
+    [{ cited_by_count: -(2 ** 53 - 1) }, ['cited_by_count'], 'is negative'],
+    [{ cited_by_count: -(2 ** 53) }, ['cited_by_count'], 'is negative'],
     [{ fwci: -1.5 }, ['fwci'], 'is negative'],
     [{ fwci: 1e-7 }, ['fwci'], 'exponent (1e-7)'],
     [{ amount_usd: 1e21 }, ['amount_usd'], 'exponent (1e+21)'],
@@ -286,6 +295,44 @@ describe('filtersInput normalization (gh #136)', () => {
     expect(searchSchema.parse('type:article').fromNativeString).toBe(true);
   });
 
+  /**
+   * The framework's integer repair would send a top-level negative safe integer as its decimal
+   * text, an open range, once this parse fails; it never rewrites a `custom` issue. Every other
+   * value keeps the type refusal the repair reads, `-0` included, which it does not repair.
+   * (gh #142)
+   */
+  it('refuses a top-level negative safe integer as negative under OPENALEX_FILTER_RECORD_REPAIR=false', () => {
+    mockConfig.filterRecordRepair = false;
+    const parsed = recordSchema.safeParse({
+      amount_usd: -5,
+      is_oa: true,
+      cited_by_count: -(2 ** 53 - 1),
+      works_count: 5,
+      fwci: -1.5,
+      h_index: -0,
+      apc_usd: -(2 ** 53),
+    });
+    const typeRefusal = 'Invalid input: expected string, received';
+    expect(issuesOf(parsed)).toEqual([
+      { path: ['amount_usd'], message: NEGATIVE_MESSAGE },
+      { path: ['is_oa'], message: `${typeRefusal} boolean` },
+      { path: ['cited_by_count'], message: NEGATIVE_MESSAGE },
+      { path: ['works_count'], message: `${typeRefusal} number` },
+      { path: ['fwci'], message: `${typeRefusal} number` },
+      { path: ['h_index'], message: `${typeRefusal} number` },
+      { path: ['apc_usd'], message: `${typeRefusal} number` },
+    ]);
+    expect(parsed.error?.issues.map(({ code }) => code)).toEqual([
+      'custom',
+      'invalid_type',
+      'custom',
+      'invalid_type',
+      'invalid_type',
+      'invalid_type',
+      'invalid_type',
+    ]);
+  });
+
   it('advertises the canonical record in both JSON Schema modes', () => {
     for (const schema of [recordSchema, searchSchema]) {
       for (const io of ['input', 'output'] as const) {
@@ -365,7 +412,12 @@ type AnyTool = (typeof TOOLS)[number][1];
  * Run `tool` with `filters` through the framework and the real service, against an OpenAlex that
  * answers every list, group_by, autocomplete, and seed request with an empty page.
  */
-async function call(tool: AnyTool, base: object, filters: unknown) {
+async function call(
+  tool: AnyTool,
+  base: object,
+  filters: unknown,
+  key: 'filters' | 'filter' = 'filters',
+) {
   const fetchMock = vi.fn((input: unknown) => {
     const url = new URL(String(input));
     if (url.hostname !== 'api.openalex.org') {
@@ -383,7 +435,7 @@ async function call(tool: AnyTool, base: object, filters: unknown) {
     tool as typeof searchEntitiesTool,
     {
       ...(base as { entity_type: 'works' }),
-      filters,
+      [key]: filters,
     } as Parameters<typeof runToolContract<typeof searchEntitiesTool>>[1],
   );
   const filterSent = fetchMock.mock.calls
@@ -482,13 +534,9 @@ describe('every filter-taking tool reads the normalized record (gh #136)', () =>
           [{ type: 'article' }, 'type:article'],
           ['{"publication_year":"2020"}', 'publication_year:2020'],
           [{ publication_year: 2020 }, 'publication_year:2020'],
-          [{ publication_year: -5 }, 'publication_year:-5'],
           [
             { year: '2020', publication_year: '2024' },
-            // Autocomplete sends its filters without alias translation.
-            name === 'openalex_resolve_name'
-              ? 'year:2020,publication_year:2024'
-              : 'publication_year:2020,publication_year:2024',
+            'publication_year:2020,publication_year:2024',
           ],
         ] as const
       ).map(([filters, sent]) => [name, filters, tool, base, sent] as const),
@@ -514,6 +562,7 @@ describe('every filter-taking tool reads the normalized record (gh #136)', () =>
       (
         [
           [{ summary_stats: { h_index: -5 } }, 'filters.summary_stats.h_index', 'is negative'],
+          [{ publication_year: -5 }, 'filters.publication_year', 'is negative'],
           [{ fwci: 1e-7 }, 'filters.fwci', 'exponent (1e-7)'],
           [{ ids: ['W1', 'W2'] }, 'filters.ids', 'is an array'],
           [{ publication_year: { '>=': 2020 } }, 'filters.publication_year.>=', 'field path'],
@@ -533,6 +582,30 @@ describe('every filter-taking tool reads the normalized record (gh #136)', () =>
       expect(structured.error?.message).toContain(why);
       expect(structured.error?.data.recovery?.hint).toContain(why);
       expect(text).toContain(why);
+    },
+  );
+
+  /**
+   * With the switch off, the framework's integer repair would send a top-level negative integer
+   * as its decimal text, which OpenAlex reads as an open range. (gh #142)
+   */
+  it.each(TOOLS)(
+    '%s refuses a top-level negative integer under OPENALEX_FILTER_RECORD_REPAIR=false, through the `filter` alias too',
+    async (_name, tool, base) => {
+      mockConfig.filterRecordRepair = false;
+      for (const key of ['filters', 'filter'] as const) {
+        const { fetchMock, result, structured, text } = await call(
+          tool,
+          base,
+          { amount_usd: -5 },
+          key,
+        );
+        expect(result.isError).toBe(true);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(structured.error?.data.reason).toBe('invalid_arguments');
+        expect(structured.error?.message).toContain(`: filters.amount_usd: ${NEGATIVE_MESSAGE}`);
+        expect(text).toContain('Filter value is negative');
+      }
     },
   );
 
@@ -604,8 +677,9 @@ describe('every filter-taking tool reads the normalized record (gh #136)', () =>
 
 /**
  * The framework unwraps a JSON-stringified `filters` record, then re-parses once, so an integer
- * inside it never reaches the framework's integer repair: the normalization reads the top-level
- * safe integer itself, sending the decimal text that repair sends, with no disclosure.
+ * inside it never reaches the framework's integer repair: the normalization reads a non-negative
+ * top-level safe integer itself, sending the decimal text that repair sends, with no disclosure,
+ * and refuses a negative one as it refuses the bare record. (gh #142)
  */
 describe('a JSON-stringified filters record holding a whole number (gh #136)', () => {
   afterEach(() => {
@@ -628,18 +702,24 @@ describe('a JSON-stringified filters record holding a whole number (gh #136)', (
     },
   );
 
+  /**
+   * The unwrapped record fails its re-parse, so the framework rejects the call as first parsed:
+   * a string where a record belongs.
+   */
   it.each(TOOLS)(
-    '%s sends a stringified negative integer as the bare record does, and discloses a boolean beside it',
+    '%s refuses a stringified negative integer before any request, as it refuses the bare record',
     async (name, tool, base) => {
-      const { filterSent, result, structured } = await call(
+      const { fetchMock, result, structured } = await call(
         tool,
         base,
         '{"publication_year":-5,"is_oa":true}',
       );
-      expect(result.isError).toBeFalsy();
-      expect(filterSent.at(-1)).toBe(sentFor(name, 'publication_year:-5,is_oa:true'));
-      expect(structured.notice).toContain('booleans sent as "true"/"false" at `"is_oa"`');
-      expect(structured.notice).not.toContain('`"publication_year"`');
+      expect(result.isError).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(structured.error?.data.reason).toBe('invalid_arguments');
+      expect(structured.error?.message).toBe(
+        `Input validation error: Invalid arguments for tool ${name}: filters: Invalid input: expected record, received string`,
+      );
     },
   );
 
@@ -653,10 +733,15 @@ describe('a JSON-stringified filters record holding a whole number (gh #136)', (
     },
   );
 
-  it('reads the top-level safe integer at the seam as its decimal text, with no repair', () => {
-    for (const year of [2020, -5, 0]) {
+  it('reads a non-negative top-level safe integer at the seam as its decimal text, with no repair', () => {
+    for (const [year, text] of [
+      [2020, '2020'],
+      [0, '0'],
+      [-0, '0'],
+      [2 ** 53 - 1, '9007199254740991'],
+    ] as const) {
       expect(recordSchema.parse({ publication_year: year })).toStrictEqual({
-        value: { publication_year: String(year) },
+        value: { publication_year: text },
         fromNativeString: false,
         repairs: [],
       });

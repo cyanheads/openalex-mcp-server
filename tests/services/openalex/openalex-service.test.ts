@@ -2979,7 +2979,7 @@ describe('OpenAlexService', () => {
       expect(globalThis.fetch).not.toHaveBeenCalled();
     });
 
-    it('rewrites an autocomplete filter, which skips key translation', async () => {
+    it('rewrites a range on an autocomplete filter', async () => {
       routeFetch({ '/autocomplete/institutions': () => jsonResponse({ results: [] }) });
       const service = await getService();
       await service.autocomplete(
@@ -4819,6 +4819,34 @@ describe('OpenAlexService', () => {
       expect(filterParam()).toBe('openalex:A1234567890');
     });
 
+    /**
+     * Keywords have no `openalex` filter (`openalex:K1` is a 400), while `id:k1` matches the
+     * keyword `https://openalex.org/keywords/k1`, so a keyword `id` goes out as written. (gh #144)
+     */
+    it.each(['K1', 'k1', 'K1|K2', 'https://openalex.org/K1'])(
+      'keeps a keywords id filter %j under id, as written',
+      async (value) => {
+        const service = await getService();
+        await service.search(
+          { entityType: 'keywords', filters: { id: value } },
+          createMockContext(),
+        );
+        expect(filterParam()).toBe(`id:${value}`);
+      },
+    );
+
+    it('keeps a keywords id filter under id on the group_by path too', async () => {
+      vi.mocked(globalThis.fetch).mockResolvedValue(
+        jsonResponse({ meta: { count: 1, groups_count: 1 }, group_by: [] }),
+      );
+      const service = await getService();
+      await service.analyze(
+        { entityType: 'keywords', groupBy: 'works_count', filters: { id: 'K1' } },
+        createMockContext(),
+      );
+      expect(filterParam()).toBe('id:K1');
+    });
+
     it('does not rewrite id when the value is not an OpenAlex ID (fail-open)', async () => {
       const service = await getService();
       await service.search(
@@ -5006,6 +5034,56 @@ describe('OpenAlexService', () => {
       const filter = filterParam();
       expect(filter).toContain('publication_year:2024');
       expect(filter).toContain('openalex:W123');
+    });
+
+    /**
+     * Autocomplete reads its filters through the same translation search and group_by use: a key
+     * alias, an `id` of OpenAlex IDs, and a range checked on the translated key. (gh #144)
+     */
+    describe('on autocomplete() (gh #144)', () => {
+      it.each([
+        ['works', { year: '2017' }, 'publication_year:2017'],
+        ['works', { cited_works: 'W1' }, 'cites:W1'],
+        ['works', { id: 'W2626778328' }, 'openalex:W2626778328'],
+        ['works', { id: 'https://openalex.org/W1|w2' }, 'openalex:https://openalex.org/W1|w2'],
+        ['works', { id: 'foo' }, 'id:foo'],
+        ['works', { year: '>=2020' }, 'publication_year:2020-'],
+        [
+          'works',
+          { year: '2020', publication_year: '2024' },
+          'publication_year:2020,publication_year:2024',
+        ],
+        ['works', { cited_works: 'W1', cites: 'W1' }, 'cites:W1'],
+        ['authors', { year: '2017', cited_works: 'W1' }, 'year:2017,cited_works:W1'],
+        ['authors', { id: 'A1' }, 'openalex:A1'],
+        ['keywords', { id: 'K1' }, 'id:K1'],
+      ] as const)(
+        'sends %s filters %j as %j, as search() does',
+        async (entityType, filters, sent) => {
+          const service = await getService();
+          await service.autocomplete(
+            { entityType, query: 'attention', filters },
+            createMockContext(),
+          );
+          expect(lastFetchUrl().pathname).toBe(`/autocomplete/${entityType}`);
+          expect(filterParam()).toBe(sent);
+          await service.search({ entityType, filters }, createMockContext());
+          expect(filterParam()).toBe(sent);
+        },
+      );
+
+      it('refuses a reversed range on an aliased key before any request', async () => {
+        const service = await getService();
+        await expect(
+          service.autocomplete(
+            { entityType: 'works', query: 'attention', filters: { year: '2024..2020' } },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({
+          data: { reason: 'invalid_range_in_filter_value', filterKey: 'publication_year' },
+        });
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -8612,9 +8690,9 @@ describe('OpenAlexService', () => {
 
     /**
      * Suggestions rank against the entity type the request path reads: the first segment of
-     * `/<entity_type>` and `/<entity_type>/<id>`, the segment after `/autocomplete/` on a typed
-     * autocomplete, and none on cross-entity `/autocomplete`. Each body is cut at the framework's
-     * 500-byte capture, the only case that replaces the upstream list. (gh #139)
+     * `/<entity_type>` and `/<entity_type>/<id>`, and the segment after `/autocomplete/` on a typed
+     * autocomplete — cross-entity `/autocomplete` takes no filters. Each body is cut at the
+     * framework's 500-byte capture, the only case that replaces the upstream list. (gh #139)
      */
     describe('field suggestions per request path (gh #139)', () => {
       /** A truncated invalid-field 400 naming `field`, worded as OpenAlex words it. */
@@ -8700,21 +8778,6 @@ describe('OpenAlexService', () => {
           }
         },
       );
-
-      it('suggests nothing on cross-entity /autocomplete, which names no entity type', async () => {
-        mockTruncatedRejection('display_nam');
-        const service = await getService();
-
-        const error = await failure(
-          service.autocomplete({ query: 'x', filters: { display_nam: 'x' } }, createMockContext()),
-        );
-
-        expect(lastFetchUrl().pathname).toBe('/autocomplete');
-        expect(suggestionsIn(error.message)).toBeUndefined();
-        expect(error.message).toBe(
-          'display_nam is not a valid field. (list of valid fields omitted — was truncated upstream; see OpenAlex docs)',
-        );
-      });
 
       it('ranks a by-ID select rejection against the type before the ID', async () => {
         mockTruncatedRejection('author_names', 'select');
