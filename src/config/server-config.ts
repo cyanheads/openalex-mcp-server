@@ -13,6 +13,18 @@ const ServerConfigSchema = z.object({
     .describe(
       'OpenAlex account API key, sent upstream as api_key= — optional but required for keyed rate/budget under usage-based pricing (free from https://openalex.org/settings/api; omit for anonymous access)',
     ),
+  apiKeys: z
+    .string()
+    .default('')
+    .describe(
+      'Further OpenAlex API keys, separated by commas, semicolons or blanks, used in order after OPENALEX_API_KEY: a request whose key has spent its daily budget, or is refused, goes out again with the next key',
+    ),
+  apiKeysFile: z
+    .string()
+    .default('')
+    .describe(
+      'Path to a text file of further OpenAlex API keys, one per line (# starts a comment), used after OPENALEX_API_KEY and OPENALEX_API_KEYS',
+    ),
   mailto: z
     .string()
     .default('')
@@ -51,6 +63,8 @@ let _config: ServerConfig | undefined;
 export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     apiKey: 'OPENALEX_API_KEY',
+    apiKeys: 'OPENALEX_API_KEYS',
+    apiKeysFile: 'OPENALEX_API_KEYS_FILE',
     mailto: 'OPENALEX_MAILTO',
     baseUrl: 'OPENALEX_BASE_URL',
     filterStringInput: 'OPENALEX_FILTER_STRING_INPUT',

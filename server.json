@@ -56,6 +56,18 @@
           "isRequired": false
         },
         {
+          "name": "OPENALEX_API_KEYS",
+          "description": "Further OpenAlex API keys, separated by commas, semicolons or blanks - optional. They are used in order after OPENALEX_API_KEY: a request whose key has spent its daily budget goes out again with the next key, and a key OpenAlex refuses (401) is set aside until restart.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OPENALEX_API_KEYS_FILE",
+          "description": "Path to a text file of further OpenAlex API keys, one per line (# starts a comment) - optional. Used after OPENALEX_API_KEY and OPENALEX_API_KEYS; a file that cannot be read stops the server at startup.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
           "name": "OPENALEX_MAILTO",
           "description": "Optional email sent as mailto= to identify yourself to OpenAlex (the polite pool). Separate from the API key.",
           "format": "string",
@@ -124,6 +136,18 @@
         {
           "name": "OPENALEX_API_KEY",
           "description": "OpenAlex account API key, sent as api_key= - optional (free from https://openalex.org/settings/api). Without it, anonymous rate limits apply.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OPENALEX_API_KEYS",
+          "description": "Further OpenAlex API keys, separated by commas, semicolons or blanks - optional. They are used in order after OPENALEX_API_KEY: a request whose key has spent its daily budget goes out again with the next key, and a key OpenAlex refuses (401) is set aside until restart.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OPENALEX_API_KEYS_FILE",
+          "description": "Path to a text file of further OpenAlex API keys, one per line (# starts a comment) - optional. Used after OPENALEX_API_KEY and OPENALEX_API_KEYS; a file that cannot be read stops the server at startup.",
           "format": "string",
           "isRequired": false
         },
